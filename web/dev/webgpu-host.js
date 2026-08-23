@@ -1,7139 +1,2243 @@
-"use strict";
-
-(() => {
-  // Bump this marker with every host change so the console proves the live
-  // version (the dev server is no-store, but tabs can sit on a cached copy).
-  const MCWEB_BUILD = "2026-08-22-ios-streaming2"; // bump on every host change so the console proves the live version
-  // The generated loader is exact-patched by graalWebImage to accept an
-  // explicit Wasm URL. Bump this pair tag with every canonical image so an old
-  // Service Worker can never mix a cached JS loader with a freshly served Wasm.
-  const MCWEB_CACHE_TAG = "build-stream2";
-  globalThis.mcWebHostBuild = MCWEB_BUILD;
-  console.log("[mcweb-host] build " + MCWEB_BUILD);
-  const canvas = document.getElementById("minecraft-canvas");
-  const failure = document.getElementById("failure");
-
-  // --- Boot-progress surface -------------------------------------------------
-  // The lightweight launcher owns the visible boot experience. Keeping this
-  // small interface here lets the long synchronous Web Image boot report its
-  // real stages while the enchanting-glyph signal replaces the old spinner.
-  const launcherOverlay = globalThis.mcWebLauncher;
-  const markPhase = (phase, detail = "") => {
-    try { return globalThis.mcWebDevDiagnostics?.mark?.(phase, detail); }
-    catch { return null; }
-  };
-  // Loader instrumentation is deliberately best-effort: a diagnostics write
-  // must never become a new reason for the generated Java image to fail.
-  globalThis.mcWebStreamingPhase = (phase, detail = "") => {
-    try { markPhase(String(phase), detail); } catch { /* diagnostics are optional */ }
-  };
-  // On-page diagnostic verdict â€” visible in a screenshot, no console needed.
-  const probeVerdict = document.createElement("div");
-  probeVerdict.id = "mcweb-probe-verdict";
-  probeVerdict.style.cssText = "position:fixed;top:4px;left:4px;z-index:2147483647;background:rgba(180,0,0,0.92);color:#fff;font:12px/1.4 monospace;padding:6px 10px;max-width:520px;white-space:pre-wrap;pointer-events:none;border:1px solid #f44;border-radius:4px;";
-  probeVerdict.textContent = "PROBE: waitingâ€¦";
-  // Keep the diagnostic available without covering the real title UI during
-  // normal runs. Add ?mcweb_debug when screenshot-visible probe evidence is
-  // needed again.
-  if (new URLSearchParams(location.search).has("mcweb_debug")) {
-    document.body.appendChild(probeVerdict);
-  }
-  let mcbHidden = false;
-  globalThis.mcWebBootOverlay = {
-    status: (s) => { if (!mcbHidden) launcherOverlay?.status?.(s); },
-    stage: (s) => { if (!mcbHidden) launcherOverlay?.stage?.(s); },
-    note: (s) => { if (!mcbHidden) launcherOverlay?.note?.(s); },
-    hide: () => {
-      mcbHidden = true;
-      launcherOverlay?.revealGame?.();
-    },
-    get hidden() { return mcbHidden; }
-  };
-  // DIAG: probe buffers declared BEFORE the console.log wrapper below. The wrapper
-  // captures Java-side panorama/atlas/error lines into _javaErrBuf; declaring it here
-  // (not ~1100 lines down) guarantees no temporal-dead-zone ReferenceError if any log
-  // line emitted during early script evaluation matches the wrapper's filter.
-  const _animRing = [];   // animate_sprite atlas-assembly: target + matrices + sprite per draw
-  const _guiAtlasRing = []; // animate_sprite draws specifically targeting the GUI atlas
-  const _animTargetCounts = new Map();
-  const _javaErrBuf = []; // buffered [MC]/Exception/panorama/atlas log lines
-  let _probe2Dumped = false;
-  // DIAG: scatter probe (PROBE3). The previous animRing filled its 40 slots on the
-  // PARTICLES atlas (40 sprites) and never observed the GUI atlas assembly, so it
-  // could not localise the scattered shovel/globe/eye sprites. These two rings are
-  // immune to that: _asmBad records any animate_sprite assembly draw whose render
-  // target is NOT an atlas (a mis-targeted assembly writes sprites onto the screen
-  // AND leaves the atlas empty -- one cause, both symptoms); _scatterDraws records
-  // any draw onto the screen-sized main target that samples a per-sprite SOURCE
-  // texture (widget/* etc.) rather than the atlas or a standalone title image.
-  // ---- draw census (diagnostic, opt-in) --------------------------------
-  // location exists in the GPU Worker too (WorkerLocation), and pre.js passes
-  // the page's query string through when it starts the worker.
-  const _drawCensus = (() => {
-    try { return new URLSearchParams(location.search).has("mcweb_drawcensus"); }
-    catch { return false; }
-  })();
-  try {
-    console.log("[draw-census] enabled=" + _drawCensus
-      + " search=" + (typeof location === "undefined" ? "no-location" : location.search));
-  } catch {}
-  const _drawCensusCounts = new Map();
-  let _drawCensusAt = 0;
-  const _framePassTrace = [];
-  let _terrainVertsDumped = false;
-  let _terrainDepthDumped = false;
-  let _terrainUniformDumped = false;
-  let _uniformSnapshotDumped = false;
-  let _visibleSnapshotDumped = false;
-  let _writeProbeDumped = false;
-  const _depthStateLogged = new Set();
-  const _blendLogged = new Set();
-  function _noteDrawCensus(state, vertexCount, instanceCount) {
-    if (state._traceEntry) {
-      state._traceEntry.draws++;
-      // Which pipelines ran in this pass, in pass order. If the sky pass runs
-      // after the terrain pass and writes opaquely, terrain is painted over -
-      // which looks exactly like "terrain never drew".
-      const short = String((state.pipeline && state.pipeline.spec
-        && state.pipeline.spec.label) || "?").replace("minecraft:pipeline/", "");
-      state._traceEntry.pipes ||= new Set();
-      if (state._traceEntry.pipes.size < 6) state._traceEntry.pipes.add(short);
-      // A scissor that excludes the screen clips the draw away just as
-      // effectively as never issuing it. Record the rect in force at the
-      // first draw of the pass.
-      if (state._traceEntry.scissor === undefined) {
-        state._traceEntry.scissor = state._scissor ? state._scissor.join(",") : "none";
-        state._traceEntry.area = state.area ? state.area.join(",") : "none";
-      }
-    }
-    const label = state.pipeline && state.pipeline.spec
-      ? (state.pipeline.spec.label || "?") : "no-pipeline";
-    // tid, not just the label: two distinct render targets can share the name
-    // "Main / Color", and the composite can only blit one of them.
-    const key = (state._suppressed ? "SUPPRESSED " : "") + label
-      + " -> " + (state._targetLabel || "?") + " " + (state._targetWH || "")
-      + " tid=" + (state._targetTid ?? "?");
-    const entry = _drawCensusCounts.get(key) || { draws: 0, verts: 0 };
-    entry.draws++;
-    entry.verts += (vertexCount || 0) * Math.max(1, instanceCount || 1);
-    _drawCensusCounts.set(key, entry);
-    const now = Date.now();
-    if (now - _drawCensusAt < 10000) return;
-    _drawCensusAt = now;
-    const rows = [..._drawCensusCounts.entries()]
-      .sort((a, b) => b[1].draws - a[1].draws).slice(0, 14);
-    for (const [name, value] of rows) {
-      console.log("[draw-census] " + value.draws + "x " + value.verts + "v " + name);
-    }
-    console.log("[draw-census] distinct=" + _drawCensusCounts.size
-      + " presents=" + _presentCount
-      + " sinceLastPresent=" + (_lastPresentAt ? (now - _lastPresentAt) + "ms" : "never"));
-    _drawCensusCounts.clear();
-  }
-
-  const _scatterDraws = [];
-  const _asmBad = [];
-  let _probe3Dumped = false;
-  const _SCATTER_OK = /atlas\/|mojangstudios|title\/minecraft\.png|title\/edition\.png|menu_background|panorama_overlay/;
-  function _noteScatter(state) {
-    if (_scatterDraws.length >= 16 || !state._targetLabel) return;
-    const wh = state._targetWH || "";
-    const w = parseInt(wh, 10) || 0;
-    if (w <= 1500) return; // atlas / cube targets are <=1024; only the main target is wider
-    if (/\/atlas\//.test(state._targetLabel)) return; // assembly draws onto an atlas are NOT screen scatter (they were the 8 false positives that jammed the cap)
-    const sampled = [];
-    for (const [nm, r] of state.resources) if (r && r.kind === "texture" && r._texEntry) sampled.push(r._texEntry._label || "?");
-    if (!sampled.length) return;
-    const anomaly = sampled.filter((l) => !_SCATTER_OK.test(l));
-    if (!anomaly.length) return;
-    const fam = state.pipeline && state.pipeline.spec ? shaderFamily(state.pipeline.spec.vertexShader || "") : "?";
-    const u = state.resources.get("Projection"); let pm = null;
-    if (u && u.kind === "uniform") { const b = objects.get(u.bufferHandle); if (b && b._shadow) { const f = new Float32Array(b._shadow.buffer, (b._shadow.byteOffset || 0) + u.offset, 16); pm = [f[0], f[5]]; } }
-    _scatterDraws.push({ fam, tgt: state._targetLabel, tgtWH: wh, pm, anom: anomaly.map((l) => l.split("/").pop()) });
-  }
-  // Wrap console.log so the Java boot trace ([MC-INIT] / inline-task / [MC])
-  // drives the overlay as well as DevTools.
-  const originalConsoleLog = console.log.bind(console);
-  console.log = (...values) => {
-    originalConsoleLog(...values);
-    try {
-      const t = values.map((v) => (typeof v === "string" ? v : (v && v.message) ? v.message : JSON.stringify(v))).join(" ");
-    if (/panorama|atlas|Exception|Failed|cube|reload/i.test(t) && !/^\[(TEX-|GUI-DRAW|PANO-|ANIM-|PROBE|mcweb)/.test(t) && !/^SLF4J/.test(t) && _javaErrBuf.length < 30) _javaErrBuf.push(t.slice(0, 220));
-      if (mcbHidden) return;
-      const m = t.match(/^\[MC-INIT\]\s*(.*)$/);
-      if (m) { globalThis.mcWebBootOverlay.stage(m[1] || t); return; }
-      const it = t.match(/inline-task#(\d+):(\S+)/);
-      if (it) { globalThis.mcWebBootOverlay.status("Reloading assetsâ€¦ task #" + it[1]); globalThis.mcWebBootOverlay.note(it[2]); return; }
-      if (/^\[MC\]/.test(t) && !/^SLF4J/.test(t)) globalThis.mcWebBootOverlay.note(t.slice(0, 96));
-    } catch {}
-  };
-  const objects = new Map();
-  let nextHandle = 1;
-  let adapter;
-  let device;
-  let context;
-  const diagnostics = {lastCall: "host setup", calls: {}, stages: [], stageMs: [], reloadProbe: []};
-
-  // Canvas sizing. The backing store must track the CSS box, otherwise the
-  // browser simply scales a stale framebuffer to the new element size -- that
-  // is the "resizing stretches the image" symptom. Resizing it is only half the
-  // fix: Minecraft also has to hear about it, or GUI scale, projection and
-  // render targets all stay at the boot size. The dispatch goes through the
-  // same single input bridge the keyboard and mouse use.
-  globalThis.mcWebCanvas = {
-    pending: true,
-
-    targetSize() {
-      const ratio = Math.min(devicePixelRatio || 1, 2);
-      const rect = canvas.getBoundingClientRect();
-      const cssWidth = rect.width || innerWidth;
-      const cssHeight = rect.height || innerHeight;
-      return [
-        Math.max(1, Math.round(cssWidth * ratio)),
-        Math.max(1, Math.round(cssHeight * ratio))
-      ];
-    },
-
-    resizeBackingStore() {
-      const [width, height] = this.targetSize();
-      if (canvas.width === width && canvas.height === height) return false;
-      canvas.width = width;
-      canvas.height = height;
-      if (context && device) {
-        context.configure({
-          device,
-          format: "rgba8unorm",
-          usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
-          alphaMode: "opaque"
-        });
-      }
-      return true;
-    },
-
-    applyPendingResize() {
-      if (!this.pending) return;
-      const changed = this.resizeBackingStore();
-      const bridge = globalThis.mcWebInput && globalThis.mcWebInput.bridge;
-      if (!bridge) {
-        // Stay armed: before the bridge exists, Window still reads the size
-        // through glfwGetFramebufferSize, but a later resize must not be lost.
-        return;
-      }
-      this.pending = false;
-      if (changed) globalThis.mcWebInput.call("resize", canvas.width, canvas.height);
-    }
-  };
-
-  addEventListener("resize", () => { globalThis.mcWebCanvas.pending = true; });
-  if (globalThis.visualViewport) {
-    globalThis.visualViewport.addEventListener("resize", () => {
-      globalThis.mcWebCanvas.pending = true;
-    });
-  }
-
-  /** Durable `evt:` gameplay-packet counters. The 4000-entry stage ring is
-   *  evicted by the worldgen packet flood, so windowed counts read from the
-   *  ring undercount to zero. Counters never evict. */
-  const _evtCounts = new Map();
-
-  /**
-   * Markers emitted per packet, per frame or per tick. Everything else â€” boot
-   * stages, screen changes, one-shot diagnostics â€” keeps the console line and
-   * the on-page status text, which is what makes a stalled boot visible.
-   */
-  const _CHATTY_STAGE =
-    /^(evt:|packet:|terrain:|gameplay-state:|threads:|chunk:|pumpslow:|levelload:|server:tick)/;
-  const _logAllStages = new URLSearchParams(location.search).has("mcweb_log_all");
-
-  const recordStage = (stage) => {
-    const stages = diagnostics.stages;
-    stages.push(stage);
-    // Console delivery timestamps are useless for a blocking boot: every line
-    // emitted while the main thread is busy is delivered in one burst when it
-    // frees up, so a two-minute constructor looks instantaneous in DevTools.
-    // Stamping here is the only way to attribute that time to a stage.
-    diagnostics.stageMs.push(Math.round(performance.now()));
-    if (stages.length > 4000) {
-      stages.splice(0, stages.length - 4000);
-      diagnostics.stageMs.splice(0, diagnostics.stageMs.length - 4000);
-    }
-    if (typeof stage === "string" && stage.startsWith("evt:")) {
-      const row = _evtCounts.get(stage) || { n: 0, firstMs: 0, lastMs: 0, ts: [] };
-      row.n++;
-      const now = performance.now();
-      if (!row.firstMs) row.firstMs = now;
-      row.lastMs = now;
-      // Keep the last 32 individual timestamps: per-hit latency correlation
-      // needs each crossing's time, not just first/last.
-      row.ts.push(Math.round(now * 100) / 100);
-      if (row.ts.length > 32) row.ts.shift();
-      _evtCounts.set(stage, row);
-    }
-  };
-
-  const _recentCalls = [];
-  let _renderCommandReplayDepth = 0;
-
-  /** Call name plus only the args that locate a failure, kept short. */
-  const _summarise = (name, detail) => {
-    if (!detail) return name;
-    if (name === "createBuffer") {
-      return `createBuffer(${detail.label},sz=${detail.size},use=${detail.usage})`;
-    }
-    if (name === "writeBuffer") {
-      const transport = detail.packedChars == null
-        ? `b64=${detail.base64Length}`
-        : `bytes=${detail.byteLength},chars=${detail.packedChars}`;
-      return `writeBuffer(h=${detail.handle},@${detail.destinationOffset},${transport})`;
-    }
-    if (name === "writeBufferRaw") {
-      return `writeBufferRaw(h=${detail.handle},@${detail.destinationOffset},bytes=${detail.byteLength})`;
-    }
-    if (name === "writeTextureRaw") {
-      return `writeTextureRaw(h=${detail.handle},bytes=${detail.byteLength})`;
-    }
-    if (name === "reportProgress") return `reportProgress(${detail.stage ?? ""})`;
-    return name;
-  };
-
-  // The dataset mirror is display-only (nothing reads it programmatically â€”
-  // the failure ring and per-call counters live in _recentCalls/diagnostics
-  // and stay exact). Coalescing it to "only when the call name changes" was
-  // not enough: the render path alternates two call names per pass, so the
-  // name changed on every call. It is time-throttled instead, which keeps the
-  // on-page "what is the GPU doing" mirror useful during a stall.
-  let _lastMarkCallDom = null;
-  let _lastMarkCallDomMs = 0;
-  let _markCallDomPending = false;
-  const _perfNow = typeof performance !== "undefined"
-    ? () => performance.now() : () => Date.now();
-  const markCall = (name, detail = null) => {
-    // One outer rpCommandStream call represents the Java/JS boundary. Its
-    // internal operations must not perform thousands of diagnostic DOM writes
-    // or masquerade as additional bridge crossings.
-    if (_renderCommandReplayDepth !== 0) return;
-    // The bare call name brackets a failure to a region but cannot say where
-    // inside a loop it happened: a 128 MiB uber-buffer is seeded by ~170
-    // identical writeBuffer chunks, and "died during writeBuffer" is true
-    // whether it died on the first chunk (the big allocation) or the 90th (a
-    // transient spike). Keeping the size/offset args distinguishes those.
-    _recentCalls.push(_summarise(name, detail));
-    if (_recentCalls.length > 60) _recentCalls.shift();
-    diagnostics.lastCall = name;
-    diagnostics.lastDetail = detail;
-    diagnostics.calls[name] = (diagnostics.calls[name] || 0) + 1;
-    // The DOM mirror exists so a human or a probe can read the last call
-    // without a page evaluate; nothing consumes it at frame rate. Writing it
-    // on every change of `name` did: a real server frame alternates
-    // beginRenderPass with rpCommandStream ~84 times, so this wrote three
-    // dataset properties â€” one of them a JSON.stringify of a render-pass
-    // descriptor â€” about 12,700 times a second. Mirror on a timer instead and
-    // the ring above stays exact.
-    if (name !== _lastMarkCallDom) {
-      _lastMarkCallDom = name;
-      _markCallDomPending = true;
-    }
-    const now = _perfNow();
-    if (_markCallDomPending && now - _lastMarkCallDomMs >= 250) {
-      _lastMarkCallDomMs = now;
-      _markCallDomPending = false;
-      document.body.dataset.lastGpuCall = name;
-      document.body.dataset.lastGpuCallCount = String(diagnostics.calls[name]);
-      if (detail) document.body.dataset.lastGpuDetail = JSON.stringify(detail);
-    }
-  };
-
-  // Expose the durable evt counters for probes that need windowed counts the
-  // evicting ring cannot provide.
-  globalThis.mcWebEvtCounts = () => Object.fromEntries(_evtCounts);
-
-  const resolveBindingName = (value, kind) => {
-    // Older staged images still pass their pre-interning Java String object.
-    // Returning it untouched avoids the recursive Proxy string conversion that
-    // caused the WasmLM stack overflow. Numeric IDs must resolve exactly.
-    if (typeof value !== "number") return value;
-    const name = globalThis.mcWebGpu?._bindingNames?.[value];
-    if (typeof name !== "string") throw new Error(`unknown ${kind} binding name ${value}`);
-    return name;
-  };
-
-  const setText = (id, value) => {
-    const node = document.getElementById(id);
-    if (node) node.textContent = value;
-  };
-
-  const fail = (error) => {
-    const message = error?.stack || String(error);
-    failure.hidden = false;
-    failure.textContent = message;
-    if (error?.code) {
-      document.body.dataset.mcwebFailureCode = String(error.code);
-    }
-    setText("jar-status", "failed");
-    setText("gpu-status", error?.message || String(error));
-    markPhase("boot-failed", error?.code || "runtime-error");
-    console.error(error);
-  };
-
-  // Frames flowing means the client is healthy; from then on, console noise
-  // (notably headless-SwiftShader's "Instance dropped in popErrorScope") must
-  // not re-show the failure overlay and hide the rendered canvas.
-  let framesFlowing = false;
-  let firstRafRecorded = false;
-  let firstFrameReported = false;
-  const originalConsoleError = console.error.bind(console);
-  console.error = (...values) => {
-    originalConsoleError(...values);
-    if (framesFlowing) return;
-    // Benign startup warnings (e.g. SLF4J NOP) must not mask a healthy run.
-    const text = values.map((value) => String(value?.message ?? value)).join(" ");
-    if (text.startsWith("SLF4J")) return;
-    const firstError = values.find((value) => value instanceof Error);
-    const message = values.map((value) => value?.stack || String(value)).join("\n");
-    failure.hidden = false;
-    failure.textContent = firstError?.stack || message;
-    setText("jar-status", "runtime error");
-  };
-
-  const put = (object) => {
-    const handle = nextHandle++;
-    if (object && typeof object === "object") object._handle = handle;
-    objects.set(handle, object);
-    return handle;
-  };
-
-  // Java byte arrays cross the Web Image interop boundary as base64 text;
-  // BufferSource conversion rejects the raw interop proxy.
-  const base64ToBytes = (base64) => {
-    const binary = atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    return bytes;
-  };
-
-  // WasmGC has no exported linear memory. Pack two payload bytes into each
-  // UTF-16 code unit so Web Image's unavoidable Java-String conversion walks
-  // 3/8 as many characters as Base64, then reconstruct the exact byte view.
-  const packedTextToBytes = (text, byteLength) => {
-    if (typeof text !== "string" || !Number.isInteger(byteLength) || byteLength < 0
-        || text.length !== Math.ceil(byteLength / 2)) {
-      throw new Error(`invalid packed upload length chars=${text?.length} bytes=${byteLength}`);
-    }
-    const bytes = new Uint8Array(byteLength);
-    for (let i = 0; i < text.length; i++) {
-      const pair = text.charCodeAt(i);
-      const at = i * 2;
-      bytes[at] = pair & 0xff;
-      if (at + 1 < byteLength) bytes[at + 1] = pair >>> 8;
-    }
-    return bytes;
-  };
-
-  const get = (handle, kind) => {
-    const object = objects.get(handle);
-    if (!object) throw new Error(`Unknown ${kind} handle ${handle}`);
-    return object;
-  };
-
-  const minecraftTextureUsage = (usage) => {
-    let result = 0;
-    if (usage & 1) result |= GPUTextureUsage.COPY_DST;
-    if (usage & 2) result |= GPUTextureUsage.COPY_SRC;
-    if (usage & 4) result |= GPUTextureUsage.TEXTURE_BINDING;
-    if (usage & 8) result |= GPUTextureUsage.RENDER_ATTACHMENT;
-    return result;
-  };
-
-  const minecraftBufferUsage = (usage) => {
-    let result = 0;
-    if (usage & 8) result |= GPUBufferUsage.COPY_DST;
-    if (usage & 16) result |= GPUBufferUsage.COPY_SRC;
-    if (usage & 32) result |= GPUBufferUsage.VERTEX;
-    if (usage & 64) result |= GPUBufferUsage.INDEX;
-    if (usage & 128) result |= GPUBufferUsage.UNIFORM;
-    if (usage & 512) result |= GPUBufferUsage.INDIRECT;
-    // Mojang permits MAP_WRITE|UNIFORM. WebGPU does not, so Java maps a
-    // CPU shadow and flushes it into a COPY_DST buffer instead.
-    if (usage & 2) result |= GPUBufferUsage.COPY_DST;
-    if (usage & 1) result |= GPUBufferUsage.COPY_SRC;
-    if (usage & 256) {
-      // Mojang's USAGE_UNIFORM_TEXEL_BUFFER is a Vulkan concept with no WebGPU
-      // equivalent; the nearest is a read-only storage buffer. Throwing here
-      // aborted the whole render frame, and the throw only became reachable
-      // once the PNG fix let atlas stitching complete. Approximating is
-      // strictly better: if a shader really needs texel-buffer semantics its
-      // pipeline fails to build and is skipped (a degraded feature), instead
-      // of taking the entire frame -- and the client -- down with it.
-      result |= GPUBufferUsage.STORAGE;
-    }
-    if (!result) throw new Error(`Unsupported Minecraft buffer usage ${usage}`);
-    return result;
-  };
-
-  const minecraftFormat = (format) => {
-    const formats = {
-      RGBA8_UNORM: "rgba8unorm",
-      RGBA8_SNORM: "rgba8snorm",
-      RGBA8_UINT: "rgba8uint",
-      RGBA8_SINT: "rgba8sint",
-      BGRA8_UNORM: "bgra8unorm",
-      R8_UNORM: "r8unorm",
-      R8_SNORM: "r8snorm",
-      R8_UINT: "r8uint",
-      R8_SINT: "r8sint",
-      RG8_UNORM: "rg8unorm",
-      RG8_SNORM: "rg8snorm",
-      RG8_UINT: "rg8uint",
-      RG8_SINT: "rg8sint",
-      RGBA16_UNORM: "rgba16unorm",
-      RGBA16_SNORM: "rgba16snorm",
-      RGBA16_UINT: "rgba16uint",
-      RGBA16_SINT: "rgba16sint",
-      RGBA16_FLOAT: "rgba16float",
-      RGBA32_FLOAT: "rgba32float",
-      RG16_FLOAT: "rg16float",
-      RG32_FLOAT: "rg32float",
-      R16_FLOAT: "r16float",
-      R32_FLOAT: "r32float",
-      RG11B10_FLOAT: "rg11b10ufloat",
-      RGB10A2_UNORM: "rgb10a2unorm",
-      RGB10A2_UINT: "rgb10a2uint",
-      D32_FLOAT: "depth32float",
-      D32_FLOAT_S8_UINT: "depth32float-stencil8",
-      D24_UNORM_S8_UINT: "depth24plus-stencil8",
-      D16_UNORM: "depth16unorm"
-    };
-    const mapped = formats[format];
-    if (!mapped) throw new Error(`Minecraft texture format ${format} is not ported yet`);
-    return mapped;
-  };
-
-  // ---------------------------------------------------------------------------
-  // Pipelines: Mojang RenderPipeline spec -> GPURenderPipeline. Shaders are a
-  // hand-written WGSL family keyed by vanilla core shader ID; the boot set
-  // (title screen) is fully covered, unknown shaders yield invalid pipelines.
-  // ---------------------------------------------------------------------------
-
-  const UNIFORM_STRUCTS = {
-    DynamicTransforms: `{
-  ModelViewMat: mat4x4<f32>,
-  ColorModulator: vec4<f32>,
-  ModelOffset: vec3<f32>,
-  TextureMat: mat4x4<f32>,
-}`,
-    Projection: `{
-  ProjMat: mat4x4<f32>,
-}`,
-    // shaders/include/light.glsl. Mojang's std140 writer binds 28 bytes:
-    // vec3 @0, 4-byte alignment gap, vec3 @16. Scalars preserve those exact
-    // offsets without making WGSL round the required binding size to 32.
-    Lighting: `{
-  Light0X: f32,
-  Light0Y: f32,
-  Light0Z: f32,
-  _lightingPad0: f32,
-  Light1X: f32,
-  Light1Y: f32,
-  Light1Z: f32,
-}`,
-    // Mojang binds this block as its 40 bytes of member data. Keeping FogColor
-    // as a WGSL vec4 gives the struct 16-byte alignment and rounds its required
-    // binding size up to 48, invalidating every world render submit. Scalars
-    // preserve the vec4's offsets while keeping the shader-visible size at 40.
-    Fog: `{
-  FogColorR: f32,
-  FogColorG: f32,
-  FogColorB: f32,
-  FogColorA: f32,
-  FogEnvironmentalStart: f32,
-  FogEnvironmentalEnd: f32,
-  FogRenderDistanceStart: f32,
-  FogRenderDistanceEnd: f32,
-  FogSkyEnd: f32,
-  FogCloudsEnd: f32,
-}`,
-    // Per-section block for terrain (shaders/include/chunksection.glsl).
-    // Terrain is the only family that carries its model-view here rather than
-    // in DynamicTransforms, which is why the generic vertex fallback silently
-    // used an identity matrix and clipped every chunk.
-    ChunkSection: `{
-  ModelViewMat: mat4x4<f32>,
-  ChunkVisibility: f32,
-  TextureSize: vec2<i32>,
-  ChunkPosition: vec3<i32>,
-}`,
-    // core/rendertype_clouds.vsh: vec4 @0, vec3 @16, vec3 @32. As with
-    // Lighting, scalar members keep Mojang's unrounded 44-byte binding valid.
-    CloudInfo: `{
-  CloudColorR: f32,
-  CloudColorG: f32,
-  CloudColorB: f32,
-  CloudColorA: f32,
-  CloudOffsetX: f32,
-  CloudOffsetY: f32,
-  CloudOffsetZ: f32,
-  _cloudInfoPad0: f32,
-  CellSizeX: f32,
-  CellSizeY: f32,
-  CellSizeZ: f32,
-}`,
-    // Declared with scalar members ONLY, deliberately. A vec3 would give the
-    // struct 16-byte alignment, and WGSL rounds a struct's size up to its
-    // alignment: 56 -> 64. Mojang allocates this buffer at the un-rounded 56,
-    // and the bound range is capped at the buffer size, so a 64-byte shader
-    // struct can never be satisfied -- every submit fails with "bound with size
-    // 56 ... requires at least 64" and the screen freezes. All-scalar members
-    // give alignment 4 and size exactly 56, while landing on the same offsets
-    // std140 uses (ivec3 @0 +pad, vec3 @16 +pad, vec2 @32, then scalars).
-    Globals: `{
-  CameraBlockPosX: i32,
-  CameraBlockPosY: i32,
-  CameraBlockPosZ: i32,
-  _globalsPad0: i32,
-  CameraOffsetX: f32,
-  CameraOffsetY: f32,
-  CameraOffsetZ: f32,
-  _globalsPad1: f32,
-  ScreenSizeX: f32,
-  ScreenSizeY: f32,
-  GlintAlpha: f32,
-  GameTime: f32,
-  MenuBlurRadius: i32,
-  UseRgss: i32,
-}`,
-    // Post-chain uniform blocks (declared in the JAR's post/*.fsh; the sizes
-    // MUST match Mojang's std140 buffers or createBindGroup fails validation â€”
-    // a binding smaller than the shader-declared struct is rejected). Layouts
-    // verified against assets/minecraft/shaders/post/{box_blur,blit}.fsh.
-    SamplerInfo: `{
-  OutSize: vec2<f32>,
-  InSize: vec2<f32>,
-}`,
-    BlurConfig: `{
-  BlurDir: vec2<f32>,
-  Radius: f32,
-}`,
-    BlitConfig: `{
-  ColorModulate: vec4<f32>,
-}`,
-    // Sprite-atlas assembly (shaders/core/animate_sprite.vsh via
-    // animation_sprite.glsl). TextureAtlas packs every sprite's pixels into a
-    // big UBO, then draws each sprite into the atlas with this block: the
-    // SpriteMatrix maps the unit quad to the sprite's atlas region.
-    SpriteAnimationInfo: `{
-  ProjectionMatrix: mat4x4<f32>,
-  SpriteMatrix: mat4x4<f32>,
-  UPadding: f32,
-  VPadding: f32,
-  MipMapLevel: i32,
-}`
-  };
-
-  const VERTEX_GPU_FORMATS = {
-    R32_FLOAT: {gpu: "float32", dim: 1, kind: "f"},
-    RG32_FLOAT: {gpu: "float32x2", dim: 2, kind: "f"},
-    RGB32_FLOAT: {gpu: "float32x4", dim: 4, kind: "f"},
-    RGBA32_FLOAT: {gpu: "float32x4", dim: 4, kind: "f"},
-    R16_FLOAT: {gpu: "float16x2", dim: 2, kind: "f"},
-    RG16_FLOAT: {gpu: "float16x2", dim: 2, kind: "f"},
-    RGB16_FLOAT: {gpu: "float16x4", dim: 4, kind: "f"},
-    RGBA16_FLOAT: {gpu: "float16x4", dim: 4, kind: "f"},
-    R8_UNORM: {gpu: "unorm8x2", dim: 2, kind: "f"},
-    RG8_UNORM: {gpu: "unorm8x2", dim: 2, kind: "f"},
-    RGB8_UNORM: {gpu: "unorm8x4", dim: 4, kind: "f"},
-    RGBA8_UNORM: {gpu: "unorm8x4", dim: 4, kind: "f"},
-    R8_SNORM: {gpu: "snorm8x2", dim: 2, kind: "f"},
-    RG8_SNORM: {gpu: "snorm8x2", dim: 2, kind: "f"},
-    RGB8_SNORM: {gpu: "snorm8x4", dim: 4, kind: "f"},
-    RGBA8_SNORM: {gpu: "snorm8x4", dim: 4, kind: "f"},
-    R8_UINT: {gpu: "uint8x2", dim: 2, kind: "u"},
-    RG8_UINT: {gpu: "uint8x2", dim: 2, kind: "u"},
-    RGBA8_UINT: {gpu: "uint8x4", dim: 4, kind: "u"},
-    R16_UINT: {gpu: "uint16x2", dim: 2, kind: "u"},
-    RG16_UINT: {gpu: "uint16x2", dim: 2, kind: "u"},
-    RGBA16_UINT: {gpu: "uint16x4", dim: 4, kind: "u"},
-    R32_UINT: {gpu: "uint32", dim: 1, kind: "u"},
-    RG32_UINT: {gpu: "uint32x2", dim: 2, kind: "u"},
-    RGBA32_UINT: {gpu: "uint32x4", dim: 4, kind: "u"},
-    R8_SINT: {gpu: "sint8x2", dim: 2, kind: "i"},
-    RG8_SINT: {gpu: "sint8x2", dim: 2, kind: "i"},
-    RGBA8_SINT: {gpu: "sint8x4", dim: 4, kind: "i"},
-    R16_SINT: {gpu: "sint16x2", dim: 2, kind: "i"},
-    RG16_SINT: {gpu: "sint16x2", dim: 2, kind: "i"},
-    RGBA16_SINT: {gpu: "sint16x4", dim: 4, kind: "i"},
-    R32_SINT: {gpu: "sint32", dim: 1, kind: "i"},
-    RG32_SINT: {gpu: "sint32x2", dim: 2, kind: "i"},
-    RGBA32_SINT: {gpu: "sint32x4", dim: 4, kind: "i"}
-  };
-
-  const wgslScalar = (kind) => (kind === "u" ? "u32" : kind === "i" ? "i32" : "f32");
-  const wgslVecType = (fmt) => {
-    const info = VERTEX_GPU_FORMATS[fmt];
-    if (!info) return null;
-    if (info.dim === 1) return wgslScalar(info.kind);
-    return `vec${info.dim}<${wgslScalar(info.kind)}>`;
-  };
-
-  const TOPOLOGY = {
-    TRIANGLES: "triangle-list",
-    QUADS: "triangle-list",
-    TRIANGLE_FAN: "triangle-list",
-    TRIANGLE_STRIP: "triangle-strip",
-    LINES: "line-list",
-    DEBUG_LINES: "line-list",
-    DEBUG_LINE_STRIP: "line-strip",
-    POINTS: "point-list"
-  };
-
-  const BLEND_FACTOR = {
-    ZERO: "zero",
-    ONE: "one",
-    SRC_COLOR: "src",
-    ONE_MINUS_SRC_COLOR: "one-minus-src",
-    DST_COLOR: "dst",
-    ONE_MINUS_DST_COLOR: "one-minus-dst",
-    SRC_ALPHA: "src-alpha",
-    ONE_MINUS_SRC_ALPHA: "one-minus-src-alpha",
-    DST_ALPHA: "dst-alpha",
-    ONE_MINUS_DST_ALPHA: "one-minus-dst-alpha",
-    CONSTANT_COLOR: "constant",
-    ONE_MINUS_CONSTANT_COLOR: "one-minus-constant",
-    CONSTANT_ALPHA: "constant-alpha",
-    ONE_MINUS_CONSTANT_ALPHA: "one-minus-constant-alpha",
-    SRC_ALPHA_SATURATE: "src-alpha-saturated"
-  };
-
-  const BLEND_OP = {
-    ADD: "add",
-    SUBTRACT: "subtract",
-    REVERSE_SUBTRACT: "reverse-subtract",
-    MIN: "min",
-    MAX: "max"
-  };
-
-  const _forceDepthAlways = (typeof location !== "undefined")
-    && new URLSearchParams(location.search).get("mcweb_diag") === "depthalways";
-
-  const COMPARE_OP = {
-    ALWAYS_PASS: "always",
-    LESS_THAN: "less",
-    LESS_THAN_OR_EQUAL: "less-equal",
-    EQUAL: "equal",
-    NOT_EQUAL: "not-equal",
-    GREATER_THAN_OR_EQUAL: "greater-equal",
-    GREATER_THAN: "greater",
-    NEVER_PASS: "never"
-  };
-
-  const shaderFamily = (id) => {
-    const tail = id.replace(/^minecraft:/, "").replace(/^core\//, "");
-    return tail;
-  };
-
-  // Attribute usage per family: which vertex element names the shader reads.
-  const buildVs = (family, spec, groups, groupRemap) => {
-    const format = spec.vertexFormats[0];
-    if (!format) return null;
-    // Shared with buildPipeline so the WGSL @locations and the GPU
-    // shaderLocations line up (split RGB* elements consume two locations).
-    const vlayout = compileVertexLayout(format);
-    const byName = vlayout.byName;
-    const inputMembers = vlayout.inputMembers;
-
-    const get = (name, swizzle) => {
-      const attr = byName.get(name);
-      if (!attr) throw new Error(`shader ${family} needs missing attribute ${name}`);
-      // A split 3-component element is read as vec2 + scalar; rebuild the vec3.
-      const base = attr.split3
-        ? `vec3<${attr.scalar}>(input.${attr.hiName}, input.${attr.loName})`
-        : `input.${attr.name}`;
-      if (!swizzle) return base;
-      if (!attr.split3 && attr.dim === 1) return base;
-      return `${base}.${swizzle}`;
-    };
-
-    const uniformLoc = new Map();
-    groups.forEach((g, gi) => g.uniforms.forEach((u, ui) => {
-      if (!uniformLoc.has(u.name)) uniformLoc.set(u.name, { g: groupRemap[gi].ng, b: groupRemap[gi].baseU + ui });
-    }));
-    // The @group/@binding (remapped) live on the module-scope declaration in
-    // uniformDecl; the body just references that variable by name.
-    const uniform = (name, member) => `${sanitizeName(name)}.${member}`;
-    const hasUniform = (name) => uniformLoc.has(name);
-
-    // Chrome's Tint rejects the diagonal-splat `mat4x4<f32>(1.0)` constructor,
-    // so spell the identity out (only used when the pipeline lacks the block).
-    const IDENTITY4 = "mat4x4<f32>(1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0)";
-    const mv = hasUniform("DynamicTransforms") ? uniform("DynamicTransforms", "ModelViewMat") : IDENTITY4;
-    const proj = hasUniform("Projection") ? uniform("Projection", "ProjMat") : IDENTITY4;
-
-    let varyings = "";
-    let body = "";
-    // Families whose clip position is not simply proj * mv * Position set this.
-    let positionExpr = null;
-    // Some dedicated atlas assembly shaders need an explicit clip-space
-    // correction. Do not apply this to model rendering: item vertices and
-    // their per-slot scissors are already expressed in the same top-left
-    // target coordinates after the projection transform.
-    let flipClipY = false;
-    // Extra world-space translation folded into worldPos (terrain's chunk offset).
-    let terrainOffsetExpr = "";
-    switch (family) {
-      case "position_color":
-      case "text_background":
-      case "gui":
-        varyings = "  @location(0) vertexColor: vec4<f32>,\n";
-        body = `  output.vertexColor = ${get("Color")};`;
-        break;
-      case "position_tex":
-        varyings = "  @location(0) texCoord0: vec2<f32>,\n";
-        body = `  output.texCoord0 = ${get("UV0", "xy")};`;
-        break;
-      case "position_tex_color":
-        varyings = "  @location(0) texCoord0: vec2<f32>,\n  @location(1) vertexColor: vec4<f32>,\n";
-        body = `  output.texCoord0 = ${get("UV0", "xy")};\n  output.vertexColor = ${get("Color")};`;
-        break;
-      case "text": {
-        varyings = "  @location(0) vertexColor: vec4<f32>,\n  @location(1) texCoord0: vec2<f32>,\n";
-        body = `  output.vertexColor = ${get("Color")};\n  output.texCoord0 = ${get("UV0", "xy")};`;
-        break;
-      }
-      case "terrain": {
-        // shaders/core/terrain.vsh:
-        //   pos = Position + (ChunkPosition - CameraBlockPos) + CameraOffset
-        //   gl_Position = ProjMat * ModelViewMat * vec4(pos, 1)
-        // The chunk translation is what the generic fallback dropped. Lighting
-        // is deferred to the fragment stage: the vertex shader would otherwise
-        // need Sampler2 bound with VERTEX visibility, which this port's bind
-        // group layouts do not grant.
-        const cs = hasUniform("ChunkSection") ? "ChunkSection" : null;
-        const gl = hasUniform("Globals") ? "Globals" : null;
-        const mvTerrain = cs ? `${cs}.ModelViewMat` : IDENTITY4;
-        const offset = (cs && gl)
-          ? `vec3<f32>(${cs}.ChunkPosition - vec3<i32>(${gl}.CameraBlockPosX, `
-            + `${gl}.CameraBlockPosY, ${gl}.CameraBlockPosZ)) `
-            + `+ vec3<f32>(${gl}.CameraOffsetX, ${gl}.CameraOffsetY, ${gl}.CameraOffsetZ)`
-          : "vec3<f32>(0.0)";
-        varyings = "  @location(0) texCoord0: vec2<f32>,\n"
-          + "  @location(1) vertexColor: vec4<f32>,\n"
-          + "  @location(2) lightCoord: vec2<f32>,\n"
-          + "  @location(3) sphericalVertexDistance: f32,\n"
-          + "  @location(4) cylindricalVertexDistance: f32,\n";
-        terrainOffsetExpr = ` + ${offset}`;
-        positionExpr = `${proj} * ${mvTerrain} * vec4<f32>(worldPos, 1.0)`;
-        body = `  output.texCoord0 = ${get("UV0", "xy")};
-  output.vertexColor = ${get("Color")};
-  output.lightCoord = clamp(
-    vec2<f32>(${get("UV2", "xy")}) / 256.0 + vec2<f32>(0.03125),
-    vec2<f32>(0.03125), vec2<f32>(0.96875));
-  output.sphericalVertexDistance = length(worldPos);
-  output.cylindricalVertexDistance = max(length(worldPos.xz), abs(worldPos.y));`;
-        break;
-      }
-      case "block":
-      case "particle":
-      case "item":
-      case "entity": {
-        // Direct translations of core/{block,particle,item,entity}.vsh. Keep
-        // texture sampling in the fragment stage because WebGPU bind-group
-        // layouts expose Mojang's samplers there; carrying the integer texture
-        // coordinates as varyings is equivalent and avoids widening every
-        // sampler binding to VERTEX visibility.
-        const isBlock = family === "block";
-        const hasOverlay = (family === "item" || family === "entity") && byName.has("UV1");
-        // entity.vsh has three lighting branches the port previously skipped
-        // for entities (only items were shaded), leaving mobs uniformly
-        // fullbright against AO-shaded terrain:
-        //  - PER_FACE_LIGHTING: front/back colors from the normal, picked by
-        //    gl_FrontFacing in the fragment stage (unculled translucent skins);
-        //  - NO_CARDINAL_LIGHTING: plain Color (breeze wind);
-        //  - default: minecraft_mix_light per vertex. Items always mix_light.
-        const vsDefines = new Set();
-        for (const raw of spec.defines || []) {
-          const s = String(raw);
-          const eq = s.indexOf("=");
-          vsDefines.add(eq < 0 ? s : s.slice(0, eq));
-        }
-        const lightingInput = hasUniform("Lighting") && byName.has("Normal");
-        const perFaceLighting = family === "entity"
-          && vsDefines.has("PER_FACE_LIGHTING") && lightingInput;
-        const cardinalLighting = (family === "item" && lightingInput)
-          || (family === "entity" && lightingInput
-            && !vsDefines.has("PER_FACE_LIGHTING")
-            && !vsDefines.has("NO_CARDINAL_LIGHTING"));
-        const parts = [
-          "  @location(0) texCoord0: vec2<f32>,\n",
-          "  @location(1) vertexColor: vec4<f32>,\n",
-          "  @location(2) lightCoord: vec2<f32>,\n",
-          "  @location(3) sphericalVertexDistance: f32,\n",
-          "  @location(4) cylindricalVertexDistance: f32,\n"
-        ];
-        if (perFaceLighting) {
-          parts.push("  @location(5) vertexColorBack: vec4<f32>,\n");
-        }
-        if (hasOverlay) {
-          parts.push(`  @location(${perFaceLighting ? 6 : 5}) overlayCoord: vec2<f32>,\n`);
-        }
-        varyings = parts.join("");
-        if (isBlock && hasUniform("DynamicTransforms")) {
-          terrainOffsetExpr = ` + ${uniform("DynamicTransforms", "ModelOffset")}`;
-        }
-        const pieces = [
-          `  output.texCoord0 = ${get("UV0", "xy")};`
-        ];
-        if (perFaceLighting) {
-          pieces.push(`  let normal = normalize(${get("Normal", "xyz")});
-  let lightX = dot(
-    vec3<f32>(Lighting.Light0X, Lighting.Light0Y, Lighting.Light0Z), normal);
-  let lightY = dot(
-    vec3<f32>(Lighting.Light1X, Lighting.Light1Y, Lighting.Light1Z), normal);
-  let rawVertexColor = ${get("Color")};
-  let frontAccum = min(1.0, (max(lightX, 0.0) + max(lightY, 0.0)) * 0.6 + 0.4);
-  let backAccum = min(1.0, (max(-lightX, 0.0) + max(-lightY, 0.0)) * 0.6 + 0.4);
-  output.vertexColor = vec4<f32>(rawVertexColor.rgb * frontAccum, rawVertexColor.a);
-  output.vertexColorBack = vec4<f32>(rawVertexColor.rgb * backAccum, rawVertexColor.a);`);
-        } else if (cardinalLighting) {
-          pieces.push(`  let normal = normalize(${get("Normal", "xyz")});
-  let light0 = max(dot(
-    vec3<f32>(Lighting.Light0X, Lighting.Light0Y, Lighting.Light0Z), normal), 0.0);
-  let light1 = max(dot(
-    vec3<f32>(Lighting.Light1X, Lighting.Light1Y, Lighting.Light1Z), normal), 0.0);
-  let lightAccum = min(1.0, (light0 + light1) * 0.6 + 0.4);
-  let rawVertexColor = ${get("Color")};
-  output.vertexColor = vec4<f32>(rawVertexColor.rgb * lightAccum, rawVertexColor.a);`);
-        } else {
-          pieces.push(`  output.vertexColor = ${get("Color")};`);
-        }
-        pieces.push(
-          byName.has("UV2")
-            ? `  output.lightCoord = clamp(
-    vec2<f32>(${get("UV2", "xy")}) / 256.0 + vec2<f32>(0.03125),
-    vec2<f32>(0.03125), vec2<f32>(0.96875));`
-            : "  output.lightCoord = vec2<f32>(0.5);",
-          "  output.sphericalVertexDistance = length(worldPos);",
-          "  output.cylindricalVertexDistance = max(length(worldPos.xz), abs(worldPos.y));"
-        );
-        if (hasOverlay) {
-          pieces.push(`  output.overlayCoord = vec2<f32>(${get("UV1", "xy")});`);
-        }
-        body = pieces.join("\n");
-        break;
-      }
-      case "panorama":
-        varyings = "  @location(0) texCoord0: vec3<f32>,\n";
-        body = `  output.texCoord0 = ${get("Position", "xyz")};`;
-        break;
-      case "position":
-      case "sky":
-      case "stars":
-        varyings = "  @location(0) sphericalVertexDistance: f32,\n  @location(1) cylindricalVertexDistance: f32,\n";
-        body = `  let modelPos = ${get("Position", "xyz")};
-  output.sphericalVertexDistance = length(modelPos);
-  output.cylindricalVertexDistance = max(length(modelPos.xz), abs(modelPos.y));`;
-        break;
-      default: {
-        // Generic fallback so every registered pipeline compiles: Mojang's
-        // startup precompile gate requires ALL pipelines to load, while the
-        // title screen only draws a handful of families. All attributes are
-        // declared (the vertex layout must match the buffer), Position is
-        // transformed normally, and UV0/Color pass through when present.
-        const parts = [];
-        const pieces = [];
-        if (byName.has("UV0")) {
-          parts.push("  @location(0) texCoord0: vec2<f32>,\n");
-          pieces.push(`  output.texCoord0 = ${get("UV0", "xy")};`);
-        }
-        if (byName.has("Color")) {
-          parts.push(`  @location(${parts.length}) vertexColor: vec4<f32>,\n`);
-          pieces.push(`  output.vertexColor = ${get("Color")};`);
-        }
-        varyings = parts.join("");
-        body = pieces.join("\n");
-        break;
-      }
-    }
-
-    return `struct VsInput {
-${inputMembers}
-};
-
-struct VsOutput {
-  @builtin(position) position: vec4<f32>,
-${varyings}};
-
-@vertex
-fn vs_main(input: VsInput) -> VsOutput {
-  var output: VsOutput;
-  let worldPos = ${get("Position", "xyz")}${terrainOffsetExpr};
-  output.position = ${positionExpr || `${proj} * ${mv} * vec4<f32>(worldPos, 1.0)`};
-${flipClipY ? "  output.position.y = -output.position.y;" : ""}
-${body}
-  return output;
-}`;
-  };
-
-  const buildFs = (family, spec, groups, groupRemap, samplerMap) => {
-    // ShaderDefines carries both flags ("IS_GUI") and values
-    // ("ALPHA_CUTOUT=0.1"). Treating the serialized strings as a Set made
-    // every value-bearing define look absent, most visibly turning transparent
-    // foliage texels into opaque black pixels.
-    const defines = new Map();
-    for (const raw of spec.defines || []) {
-      const split = String(raw).indexOf("=");
-      if (split < 0) {
-        defines.set(String(raw), true);
-      } else {
-        defines.set(String(raw).slice(0, split), String(raw).slice(split + 1));
-      }
-    }
-    const hasDefine = (name) => defines.has(name);
-    const numericDefine = (name, fallback) => {
-      if (!defines.has(name)) return null;
-      const parsed = Number.parseFloat(defines.get(name));
-      return Number.isFinite(parsed) ? parsed : fallback;
-    };
-    const hasUniform = (name) => groups.some((g) => g.uniforms.some((u) => u.name === name));
-    const hasSampler = (name) => groups.some((g) => g.samplers.includes(name));
-    const colorMod = hasUniform("DynamicTransforms") ? "DynamicTransforms.ColorModulator" : "vec4<f32>(1.0)";
-
-    // Sampler/texture @group/@binding come from the merged remap so they match
-    // the pipeline layout after group folding.
-    const samplerDecl = (name, cube) => {
-      const loc = samplerMap.get(name);
-      return `@group(${loc.g}) @binding(${loc.b}) var ${sanitizeName(name)}_s: sampler;
-@group(${loc.g}) @binding(${loc.b + 1}) var ${sanitizeName(name)}: ${cube ? "texture_cube" : "texture_2d"}<f32>;`;
-    };
-
-    let samplers = "";
-    for (const g of groups) {
-      for (const s of g.samplers) {
-        samplers += samplerDecl(s, family === "panorama") + "\n";
-      }
-    }
-
-    // Must gate on the same inputs buildVs checks (Lighting uniform + Normal
-    // attribute): a per-face FS expecting vertexColorBack while the VS did not
-    // emit it fails WGSL interface validation at pipeline creation. Declared
-    // before the switch because the entity case below selects face color on it.
-    const surfacePerFace = family === "entity" && hasDefine("PER_FACE_LIGHTING")
-      && hasUniform("Lighting")
-      && (spec.vertexFormats[0]?.elements || []).some((e) => e.name === "Normal");
-    let main = null;
-    let genericVaryings = null;
-    switch (family) {
-      case "position_color":
-      case "gui":
-        main = `  var color = input.vertexColor;
-  if (color.a == 0.0) {
-    discard;
-  }
-  return color * ${colorMod};`;
-        break;
-      case "terrain": {
-        // shaders/core/terrain.fsh. Mojang deliberately does not use a plain
-        // filtered textureSample here: its derivative-aware sampleNearest
-        // keeps nearby block texels crisp while still selecting mip levels for
-        // distant faces. The generic sample was the source of the heavy blur.
-        //   color = atlasSample * vertexColor * lightmap
-        //   color = mix(FogColor * vec4(1,1,1,color.a), color, ChunkVisibility)
-        //   discard when color.a < cutout, then apply distance fog.
-        const atlas = hasSampler("Sampler0") ? sanitizeName("Sampler0") : null;
-        const light = hasSampler("Sampler2") ? sanitizeName("Sampler2") : null;
-        const cutout = numericDefine("ALPHA_CUTOUT", 0.1);
-        const vis = hasUniform("ChunkSection") ? "ChunkSection.ChunkVisibility" : "1.0";
-        const fogColor = hasUniform("Fog")
-          ? "vec4<f32>(Fog.FogColorR, Fog.FogColorG, Fog.FogColorB, Fog.FogColorA)"
-          : "vec4<f32>(1.0)";
-        const lines = [];
-        lines.push(atlas
-          ? `  var color = sampleNearest(
-    ${atlas}, ${atlas}_s, input.texCoord0,
-    vec2<f32>(1.0) / max(vec2<f32>(ChunkSection.TextureSize), vec2<f32>(1.0))) * input.vertexColor;`
-          : "  var color = input.vertexColor;");
-        if (light) {
-          lines.push(`  color = color * textureSample(${light}, ${light}_s, input.lightCoord);`);
-        }
-        lines.push(`  let fogColor = ${fogColor};`);
-        lines.push(`  color = mix(fogColor * vec4<f32>(1.0, 1.0, 1.0, color.a), color, ${vis});`);
-        if (cutout !== null) {
-          lines.push(`  if (color.a < ${cutout.toFixed(2)}) {\n    discard;\n  }`);
-        }
-        if (hasUniform("Fog")) {
-          lines.push(`  let fogFactor = clamp(
-    (input.sphericalVertexDistance - Fog.FogRenderDistanceStart)
-      / max(Fog.FogRenderDistanceEnd - Fog.FogRenderDistanceStart, 0.0001),
-    0.0, 1.0);
-  color = vec4<f32>(mix(color.rgb, fogColor.rgb, fogFactor * fogColor.a), color.a);`);
-        }
-        lines.push("  return color;");
-        main = lines.join("\n");
-        break;
-      }
-      case "block":
-      case "particle":
-      case "item":
-      case "entity": {
-        const atlas = hasSampler("Sampler0") ? sanitizeName("Sampler0") : null;
-        const light = hasSampler("Sampler2") ? sanitizeName("Sampler2") : null;
-        const overlay = hasSampler("Sampler1") && (family === "item" || family === "entity")
-          ? sanitizeName("Sampler1") : null;
-        const cutout = family === "particle"
-          ? 0.1
-          : numericDefine("ALPHA_CUTOUT", 0.1);
-        const fogColor = hasUniform("Fog")
-          ? "vec4<f32>(Fog.FogColorR, Fog.FogColorG, Fog.FogColorB, Fog.FogColorA)"
-          : "vec4<f32>(1.0)";
-        const lines = [];
-        lines.push(atlas
-          ? `  var color = textureSample(${atlas}, ${atlas}_s, input.texCoord0);`
-          : "  var color = vec4<f32>(1.0);");
-        if (cutout !== null) {
-          lines.push(`  if (color.a < ${cutout.toFixed(4)}) {\n    discard;\n  }`);
-        }
-        lines.push(surfacePerFace
-          ? `  let faceVertexColor = select(input.vertexColorBack, input.vertexColor, input.frontFacing);
-  color = color * faceVertexColor * ${colorMod};`
-          : `  color = color * input.vertexColor * ${colorMod};`);
-        if (overlay) {
-          lines.push(`  let overlayColor = textureLoad(
-    ${overlay}, vec2<i32>(round(input.overlayCoord)), 0);
-  color = vec4<f32>(mix(overlayColor.rgb, color.rgb, overlayColor.a), color.a);`);
-        }
-        if (light) {
-          lines.push(`  color = color * textureSample(${light}, ${light}_s, input.lightCoord);`);
-        }
-        if (hasUniform("Fog")) {
-          lines.push(`  let fogColor = ${fogColor};
-  let fogFactor = clamp(
-    (input.sphericalVertexDistance - Fog.FogRenderDistanceStart)
-      / max(Fog.FogRenderDistanceEnd - Fog.FogRenderDistanceStart, 0.0001),
-    0.0, 1.0);
-  color = vec4<f32>(mix(color.rgb, fogColor.rgb, fogFactor * fogColor.a), color.a);`);
-        }
-        lines.push("  return color;");
-        main = lines.join("\n");
-        break;
-      }
-      case "text_background":
-        main = `  var color = input.vertexColor * ${colorMod};
-  if (color.a < 0.1) {
-    discard;
-  }
-  return color;`;
-        break;
-      case "position_tex":
-        main = `  var color = textureSample(Sampler0, Sampler0_s, input.texCoord0);
-  if (color.a == 0.0) {
-    discard;
-  }
-  return color * ${colorMod};`;
-        break;
-      case "position_tex_color":
-        // GuiItemAtlas.SlotView deliberately publishes OpenGL-style V
-        // coordinates (row zero is v=1). The atlas itself is rendered into a
-        // WebGPU target where row zero is physically at the top, so only this
-        // premultiplied-alpha atlas blit needs V inverted while sampling.
-        // Flipping the item model's clip Y instead mirrors each model away
-        // from its slot scissor and leaves every row except the middle blank.
-        const sampleCoord = /gui_textured_premultiplied_alpha/.test(spec.label || "")
-          ? "vec2<f32>(input.texCoord0.x, 1.0 - input.texCoord0.y)"
-          : "input.texCoord0";
-        main = `  var color = textureSample(Sampler0, Sampler0_s, ${sampleCoord}) * input.vertexColor;
-  if (color.a == 0.0) {
-    discard;
-  }
-  return color * ${colorMod};`;
-        break;
-      case "text": {
-        const gui = hasDefine("IS_GUI") || hasDefine("IS_SEE_THROUGH");
-        const grayscale = hasDefine("IS_GRAYSCALE");
-        const forceSolid = typeof location !== "undefined"
-          && new URLSearchParams(location.search).has("mcweb_textsolid");
-        const sample = grayscale
-          ? "textureSample(Sampler0, Sampler0_s, input.texCoord0).rrrr"
-          : "textureSample(Sampler0, Sampler0_s, input.texCoord0)";
-        if (forceSolid) {
-          // DIAG: distinguish rejected text geometry/depth from glyph texture
-          // sampling/alpha. Enabled only by ?mcweb_textsolid.
-          main = `  return vec4<f32>(1.0, 0.0, 1.0, 1.0);`;
-        } else if (gui) {
-          main = `  let texColor = ${sample};
-  var color = texColor * input.vertexColor;
-  if (color.a < 0.1) {
-    discard;
-  }
-  return color;`;
-        } else {
-          main = `  let texColor = ${sample};
-  var color = texColor * input.vertexColor * ${colorMod};
-  if (color.a < 0.1) {
-    discard;
-  }
-  return color;`;
-        }
-        break;
-      }
-      case "panorama":
-        main = `  return textureSample(Sampler0, Sampler0_s, input.texCoord0);`;
-        break;
-      case "position":
-      case "sky":
-      case "stars":
-        main = `  return ${colorMod};`;
-        break;
-      case "screenquad":
-        main = `  return textureSample(InSampler, InSampler_s, input.position.xy / 1.0);`;
-        break;
-      default: {
-        // Generic fallback (see buildVs): sample the first bound texture with
-        // UV0 when the format has it, modulate by vertex Color and
-        // ColorModulator; flat color otherwise. Varyings mirror buildVs's
-        // generic branch exactly.
-        const names = new Set((spec.vertexFormats[0]?.elements || []).map((e) => e.name));
-        const parts = [];
-        if (names.has("UV0")) parts.push("  @location(0) texCoord0: vec2<f32>,\n");
-        if (names.has("Color")) parts.push(`  @location(${parts.length}) vertexColor: vec4<f32>,\n`);
-        genericVaryings = parts.join("");
-        let firstSampler = null;
-        for (const g of groups) {
-          if (g.samplers.length) {
-            firstSampler = sanitizeName(g.samplers[0]);
-            break;
-          }
-        }
-        if (names.has("UV0") && firstSampler) {
-          main = `  var color = textureSample(${firstSampler}, ${firstSampler}_s, input.texCoord0);${
-            names.has("Color") ? "\n  color *= input.vertexColor;" : ""
-          }
-  return color * ${colorMod};`;
-        } else if (names.has("Color")) {
-          main = `  return input.vertexColor * ${colorMod};`;
-        } else {
-          main = `  return ${colorMod};`;
-        }
-        break;
-      }
-    }
-
-    const isSurface = family === "block" || family === "particle"
-      || family === "item" || family === "entity";
-    const surfaceHasOverlay = (family === "item" || family === "entity")
-      && (spec.vertexFormats[0]?.elements || []).some((e) => e.name === "UV1");
-    const varyingMembers = genericVaryings !== null
-      ? genericVaryings
-      : family === "terrain"
-      // Must mirror buildVs's terrain varyings exactly, in order.
-      ? "  @location(0) texCoord0: vec2<f32>,\n"
-        + "  @location(1) vertexColor: vec4<f32>,\n"
-        + "  @location(2) lightCoord: vec2<f32>,\n"
-        + "  @location(3) sphericalVertexDistance: f32,\n"
-        + "  @location(4) cylindricalVertexDistance: f32,\n"
-      : isSurface
-        ? "  @location(0) texCoord0: vec2<f32>,\n"
-          + "  @location(1) vertexColor: vec4<f32>,\n"
-          + "  @location(2) lightCoord: vec2<f32>,\n"
-          + "  @location(3) sphericalVertexDistance: f32,\n"
-          + "  @location(4) cylindricalVertexDistance: f32,\n"
-          + (surfacePerFace ? "  @location(5) vertexColorBack: vec4<f32>,\n" : "")
-          + (surfaceHasOverlay
-            ? `  @location(${surfacePerFace ? 6 : 5}) overlayCoord: vec2<f32>,\n`
-            : "")
-      : family === "position_tex" || family === "position_tex_color"
-        ? "  @location(0) texCoord0: vec2<f32>,\n" +
-          (family === "position_tex_color" ? "  @location(1) vertexColor: vec4<f32>,\n" : "")
-        : family === "panorama"
-          ? "  @location(0) texCoord0: vec3<f32>,\n"
-          : family === "position" || family === "sky" || family === "stars"
-            ? "  @location(0) sphericalVertexDistance: f32,\n  @location(1) cylindricalVertexDistance: f32,\n"
-            : family === "text"
-              ? "  @location(0) vertexColor: vec4<f32>,\n  @location(1) texCoord0: vec2<f32>,\n"
-              : "  @location(0) vertexColor: vec4<f32>,\n";
-
-    const terrainHelpers = family === "terrain" ? `
-fn sampleNearest(
-  source: texture_2d<f32>,
-  sourceSampler: sampler,
-  uvIn: vec2<f32>,
-  pixelSize: vec2<f32>
-) -> vec4<f32> {
-  let du = dpdx(uvIn);
-  let dv = dpdy(uvIn);
-  let texelScreenSize = max(sqrt(du * du + dv * dv), vec2<f32>(0.0000001));
-  let uvTexelCoords = uvIn / pixelSize;
-  let texelCenter = round(uvTexelCoords) - vec2<f32>(0.5);
-  var texelOffset = uvTexelCoords - texelCenter;
-  texelOffset = (texelOffset - vec2<f32>(0.5)) * pixelSize / texelScreenSize
-    + vec2<f32>(0.5);
-  texelOffset = clamp(texelOffset, vec2<f32>(0.0), vec2<f32>(1.0));
-  let uv = (texelCenter + texelOffset) * pixelSize;
-  return textureSampleGrad(source, sourceSampler, uv, du, dv);
-}
-` : "";
-
-    return `struct FsInput {
-  @builtin(position) position: vec4<f32>,
-${surfacePerFace ? "  @builtin(front_facing) frontFacing: bool,\n" : ""}${varyingMembers}};
-
-${samplers}
-${terrainHelpers}
-@fragment
-fn fs_main(input: FsInput) -> @location(0) vec4<f32> {
-${main}
-}`;
-  };
-
-  const sanitizeName = (name) => name.replace(/[^a-zA-Z0-9_]/g, "_");
-  // GLSL exposes color and depth attachments through sampler2D, but WebGPU
-  // requires a depth32float view to use the distinct `depth` sample type.
-  const isDepthSamplerName = (name) => /Depth(?:Sampler)?$/i.test(String(name));
-
-  // WebGPU has NO 3-component vertex format (only x1/x2/x4). A 3-component
-  // element (RGB*) whose buffer is tightly packed at a 3-wide stride overruns
-  // when read with the 4-wide GPU format ("Attribute offset + format size >
-  // stride") â€” exactly what kills sky/stars/panorama/end_gateway (and, via the
-  // ShaderManager precompile gate, hangs the whole client). The data-preserving
-  // fix: split the element into a 2-wide + 1-wide attribute pair (both within
-  // the stride) and reconstruct the vec3 in the shader. Shared by buildVs
-  // (WGSL decls + get()) and buildPipeline (GPU attributes) so the
-  // shaderLocations stay identical on both sides.
-  const SPLIT3_RGB = {
-    RGB32_FLOAT: {hi: "float32x2", lo: "float32", hiBytes: 8, scalar: "f32", kind: "f"},
-    RGB16_FLOAT: {hi: "float16x2", lo: "float16", hiBytes: 4, scalar: "f32", kind: "f"},
-    RGB8_UNORM:  {hi: "unorm8x2",  lo: "unorm8",  hiBytes: 2, scalar: "f32", kind: "f"},
-    RGB8_SNORM:  {hi: "snorm8x2",  lo: "snorm8",  hiBytes: 2, scalar: "f32", kind: "f"}
-  };
-  const compileVertexLayout = (vf) => {
-    const members = [];     // WGSL `  @location(L) name: type,`
-    const gpuAttrs = [];    // {shaderLocation, offset, format}
-    const byName = new Map(); // rawName -> {split3, ...}
-    let loc = 0;
-    for (const element of vf.elements) {
-      const sp = SPLIT3_RGB[element.format];
-      if (sp) {
-        const hiName = sanitizeName(element.name) + "_hi";
-        const loName = sanitizeName(element.name) + "_lo";
-        members.push(`  @location(${loc}) ${hiName}: vec2<${sp.scalar}>,`);
-        members.push(`  @location(${loc + 1}) ${loName}: ${sp.scalar},`);
-        gpuAttrs.push({shaderLocation: loc, offset: element.offset, format: sp.hi});
-        gpuAttrs.push({shaderLocation: loc + 1, offset: element.offset + sp.hiBytes, format: sp.lo});
-        byName.set(element.name, {split3: true, scalar: sp.scalar, hiName, loName, kind: sp.kind, dim: 3});
-        loc += 2;
-      } else {
-        const info = VERTEX_GPU_FORMATS[element.format];
-        if (!info) throw new Error(`vertex format ${element.format} is not ported`);
-        const nm = sanitizeName(element.name);
-        members.push(`  @location(${loc}) ${nm}: ${wgslVecType(element.format)},`);
-        gpuAttrs.push({shaderLocation: loc, offset: element.offset, format: info.gpu});
-        byName.set(element.name, {split3: false, name: nm, kind: info.kind, dim: info.dim});
-        loc += 1;
-      }
-    }
-    return {members, gpuAttrs, byName, inputMembers: members.join("\n")};
-  };
-
-  // Some WebGPU backends (this ANGLE/SwiftShader path) cap maxBindGroups at 4,
-  // but Mojang's entity/item/terrain/text pipelines use 5-6 groups. Merge every
-  // group >= K-1 into group K-1 (K = maxBindGroups) with collision-free binding
-  // renumbering, and apply the SAME remap to the WGSL, the pipeline layout, and
-  // the host bind calls so they stay consistent. Groups < K-1 are untouched.
-  const GROUP_CAP = Math.max(1, Math.min(8, device?.limits?.maxBindGroups || 4));
-  const computeBindGroupRemap = (groups) => {
-    const K = Math.min(GROUP_CAP, groups.length || 1);
-    const map = groups.map((g, gi) => {
-      const ng = gi < K - 1 ? gi : K - 1;
-      return { ng, baseU: 0, baseS: 0, nuniforms: g.uniforms.length, nsamplers: g.samplers.length };
-    });
-    if (K === groups.length) return { map, K, merged: false };
-    // Pack each MERGED group globally: every original group that folds into the
-    // same merged group shares one binding space, so we must lay out ALL of
-    // their uniforms first (contiguous baseU), then ALL of their sampler pairs
-    // (contiguous baseS AFTER the uniforms). The previous per-group running
-    // count reset baseS relative to only the same original group's uniforms, so
-    // when two original groups folded together (e.g. the blur post-chain's
-    // SamplerInfo/BlurConfig group and its InSampler group) the sampler landed
-    // on binding 0 â€” colliding with the other group's uniform at binding 0
-    // ("binding index (0) was specified by a previous entry") and invalidating
-    // the whole pipeline (and thus the title-screen render). Deriving every
-    // binding from this single map keeps the WGSL uniform decls, the WGSL
-    // sampler decls (via samplerMap), the bind-group layout, and ensureBindGroups
-    // perfectly consistent and collision-free.
-    const uCursor = new Array(K).fill(0);
-    for (let gi = 0; gi < groups.length; gi++) {
-      map[gi].baseU = uCursor[map[gi].ng];
-      uCursor[map[gi].ng] += groups[gi].uniforms.length;
-    }
-    const sCursor = uCursor.slice(); // samplers start after all merged-group uniforms
-    for (let gi = 0; gi < groups.length; gi++) {
-      map[gi].baseS = sCursor[map[gi].ng];
-      sCursor[map[gi].ng] += groups[gi].samplers.length * 2;
-    }
-    return { map, K, merged: true };
-  };
-
-  const buildPipeline = (spec, depthFormat) => {
-    // depthFormat === undefined â‡’ caller (the precompile gate) didn't specify a
-    // pass depth, so use the historical default. An EXPLICIT null means "the
-    // pass has no depth attachment" and must NOT synthesize depth state.
-    if (depthFormat === undefined) depthFormat = "depth32float";
-    // Strictly "does the pass we are building for have a depth attachment".
-    // This previously also OR'd in !!spec.depthStencil, which made it true for
-    // the NO-depth variant (depthFormat === null) of any depth-declaring
-    // family and synthesized `format: null` -- the exact failure the guard on
-    // the spec branch below exists to prevent. A pipeline bound in a pass with
-    // no depth attachment must carry no depth state, whatever its spec says.
-    const depthRequested = depthFormat != null;
-    // Open a validation scope for the whole build so the FIRST failing GPU
-    // object (bind-group layout / pipeline layout / pipeline) is logged with
-    // its real message, instead of only the downstream "invalid due to a
-    // previous error" cascade.
-    const _scopeOpen = typeof device.pushErrorScope === "function";
-    if (_scopeOpen) device.pushErrorScope("validation");
-    const _popScope = () => {
-      if (_scopeOpen) device.popErrorScope().then((err) => {
-        if (err && !(buildPipeline._loggedBuild || (buildPipeline._loggedBuild = new Set())).has(spec.label)) {
-          buildPipeline._loggedBuild.add(spec.label);
-          console.error(`[build validation error] ${spec.label}: ${err.message}`);
-        }
-      }).catch(() => {});
-    };
-    const family = shaderFamily(spec.vertexShader);
-    const groups = spec.bindGroups || [];
-    const { map: groupRemap, K: groupCount, merged: groupsMerged } = computeBindGroupRemap(groups);
-    // Per-sampler remapped (group, binding) so the WGSL sampler/texture decls
-    // match the merged layout.
-    // Mojang numbers a group's UNIFORMS and SAMPLERS in *separate* binding
-    // spaces (both from 0) â€” valid for GL/Vulkan descriptor sets but illegal in
-    // WebGPU, where bindings must be unique within a bind group. The blur chain
-    // exposes this directly (group 1 = SamplerInfo@0, BlurConfig@1, InSampler@0
-    // â†’ duplicate binding 0). So we lay each original group's samplers AFTER its
-    // uniforms. When groups are merged, samplers must also clear every folded
-    // group's uniforms in the same merged group, hence max(baseS, merged-group
-    // uniform count). baseS already equals the merged-group uniform count when
-    // groups fold (computeBindGroupRemap), and equals 0 otherwise, so this is a
-    // safe no-op for non-overlapping / merged cases and fixes the overlap.
-    const mergedUniformCount = new Array(groupCount).fill(0);
-    groups.forEach((g, gi) => { mergedUniformCount[groupRemap[gi].ng] += g.uniforms.length; });
-    const samplerBase = (gi) => Math.max(groupRemap[gi].baseS, mergedUniformCount[groupRemap[gi].ng]);
-    const samplerMap = new Map();
-    groups.forEach((g, gi) => g.samplers.forEach((s, si) =>
-      samplerMap.set(s, { g: groupRemap[gi].ng, b: samplerBase(gi) + si * 2 })));
-    if (/blur/.test(spec.label) && (typeof location !== "undefined") && new URLSearchParams(location.search).has("mcweb_debug") && !(buildPipeline._dbgBlur)) {
-      buildPipeline._dbgBlur = true;
-      console.log("[BLIT-REMAP-DBG]", spec.label,
-        "groups=", JSON.stringify(groups.map((g, gi) => ({ gi, ng: groupRemap[gi].ng, baseU: groupRemap[gi].baseU, baseS: groupRemap[gi].baseS, nu: g.uniforms.length, ns: g.samplers.length, uniforms: g.uniforms.map((u) => u.name), samplers: g.samplers }))),
-        "K=", groupCount, "merged=", groupsMerged,
-        "samplerMap=", JSON.stringify([...samplerMap.entries()]));
-    }
-
-    // Uniform declarations shared by both stages. TEXEL_BUFFER entries get a
-    // layout slot but no WGSL declaration: Mojang binds them as buffers via
-    // setUniform (GL/Vulkan buffer textures have no WebGPU equivalent), and a
-    // bind group layout may carry entries the shader never references.
-    let uniformDecl = "";
-    const declaredUniforms = new Set();
-    groups.forEach((group, groupIndex) => {
-      const r = groupRemap[groupIndex];
-      group.uniforms.forEach((uniformDesc, uniformIndex) => {
-        if (uniformDesc.type === "TEXEL_BUFFER") {
-          // WebGPU has storage buffers but no formatted texel-buffer view. Keep
-          // the underlying bytes packed in u32 storage words and let the one
-          // shader that consumes R8_SINT (CloudFaces) perform the exact signed
-          // byte extraction below. Mojang writes three BYTES per cloud quad;
-          // treating those as three i32s skipped packed values and read past
-          // the buffer for most vertices, producing valid draws with no pixels.
-          const storageScalar = /R8_(?:SINT|UINT)/.test(uniformDesc.format || "")
-            ? "u32"
-            : "i32";
-          uniformDecl += `@group(${r.ng}) @binding(${r.baseU + uniformIndex}) var<storage, read> ${sanitizeName(uniformDesc.name)}: array<${storageScalar}>;\n`;
-          declaredUniforms.add(uniformDesc.name);
-          return;
-        }
-        const struct = UNIFORM_STRUCTS[uniformDesc.name];
-        if (!struct) {
-          // Unknown uniform block: expose raw storage so unused uniforms still
-          // bind; shaders in the boot family only read the known blocks.
-          uniformDecl += `struct ${sanitizeName(uniformDesc.name)}_t { data: array<vec4<f32>, 16> };\n`;
-        } else {
-          uniformDecl += `struct ${sanitizeName(uniformDesc.name)}_t ${struct};\n`;
-        }
-        uniformDecl += `@group(${r.ng}) @binding(${r.baseU + uniformIndex}) var<uniform> ${sanitizeName(uniformDesc.name)}: ${sanitizeName(uniformDesc.name)}_t;\n`;
-        declaredUniforms.add(uniformDesc.name);
-      });
-    });
-
-    let vs = null;
-    let fs = null;
-    // Sprite-atlas assembly (animate_sprite family): TextureAtlas packs every
-    // sprite's pixels into a big UBO, then blits each sprite into the atlas in
-    // a render pass driven by the SpriteAnimationInfo uniform â€” SpriteMatrix
-    // maps the unit quad onto the sprite's atlas region, the vertex shader
-    // builds the quad from vertex_index (translated from core/animate_sprite.vsh
-    // + animation_sprite.glsl). This is HOW the gui/widgets/blocks atlases get
-    // populated; the generic fullscreen blit that used to catch this family
-    // wrote garbage into the atlas and left every GUI texture black.
-    const isAnimateSprite = family === "animate_sprite";
-    if (isAnimateSprite) {
-      vs = `const ANIMATE_POSITIONS = array<vec2<f32>, 6>(
-  vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
-  vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0));
-
-struct VsOutput {
-  @builtin(position) position: vec4<f32>,
-  @location(0) texCoord0: vec2<f32>,
-  @location(1) fAnimationProgress: f32,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> VsOutput {
-  // The GLSL reads a 6-entry position table with (vertex_id & 7); indices 6-7
-  // are undefined there (the driver clamps). Clamp explicitly in WGSL.
-  let index = min(vertexIndex & 7u, 5u);
-  let frameProgress = f32(vertexIndex >> 3u) / 1000.0;
-  let padding = vec2<f32>(SpriteAnimationInfo.UPadding, SpriteAnimationInfo.VPadding);
-  let uv = ANIMATE_POSITIONS[index];
-  let direction = uv * vec2<f32>(2.0) - vec2<f32>(1.0, 1.0);
-  var output: VsOutput;
-  var atlasPosition = SpriteAnimationInfo.ProjectionMatrix * SpriteAnimationInfo.SpriteMatrix * vec4<f32>(uv, 0.0, 1.0);
-  // Mojang's atlas projection is authored for the OpenGL framebuffer
-  // convention, while WebGPU's render-target Y direction is inverted. Without
-  // this correction, logical atlas row 0 lands at the bottom: GUI sprites
-  // packed into rows 0..599 appear in physical rows 425..1023, so every widget
-  // samples an unrelated sprite or transparency at its expected UV.
-  atlasPosition.y = -atlasPosition.y;
-  output.position = atlasPosition;
-  output.texCoord0 = uv + padding * direction;
-  output.fAnimationProgress = frameProgress;
-  return output;
-}`;
-      // Two fragment variants share the vertex stage: animate_sprite_blit
-      // (copy one sprite frame) and animate_sprite_interpolate (blend current
-      // + next frame by the per-vertex progress).
-      const interpolate = /interpolate/.test((spec.fragmentShader || "") + " " + spec.label);
-      const orderedSamplerLocs = [];
-      groups.forEach((g) => g.samplers.forEach((s) => {
-        const loc = samplerMap.get(s);
-        if (loc) orderedSamplerLocs.push({name: s, ...loc});
-      }));
-      const locOf = (name, order) => samplerMap.get(name) || orderedSamplerLocs[order] || {g: 0, b: 0};
-      const fsInput = `struct FsInput {
-  @builtin(position) position: vec4<f32>,
-  @location(0) texCoord0: vec2<f32>,
-  @location(1) fAnimationProgress: f32,
-};`;
-      if (interpolate) {
-        const cur = locOf("CurrentSprite", 0);
-        const nxt = locOf("NextSprite", 1);
-        fs = `${fsInput}
-
-@group(${cur.g}) @binding(${cur.b}) var CurrentSprite_s: sampler;
-@group(${cur.g}) @binding(${cur.b + 1}) var CurrentSprite: texture_2d<f32>;
-@group(${nxt.g}) @binding(${nxt.b}) var NextSprite_s: sampler;
-@group(${nxt.g}) @binding(${nxt.b + 1}) var NextSprite: texture_2d<f32>;
-
-@fragment
-fn fs_main(input: FsInput) -> @location(0) vec4<f32> {
-  let mip = f32(SpriteAnimationInfo.MipMapLevel);
-  let currentColor = textureSampleLevel(CurrentSprite, CurrentSprite_s, input.texCoord0, mip);
-  let nextColor = textureSampleLevel(NextSprite, NextSprite_s, input.texCoord0, mip);
-  return mix(currentColor, nextColor, vec4<f32>(input.fAnimationProgress));
-}`;
-      } else {
-        const spr = locOf("Sprite", 0);
-        fs = `${fsInput}
-
-@group(${spr.g}) @binding(${spr.b}) var Sprite_s: sampler;
-@group(${spr.g}) @binding(${spr.b + 1}) var Sprite: texture_2d<f32>;
-
-@fragment
-fn fs_main(input: FsInput) -> @location(0) vec4<f32> {
-  return textureSampleLevel(Sprite, Sprite_s, input.texCoord0, f32(SpriteAnimationInfo.MipMapLevel));
-}`;
-      }
-    }
-    // assets/minecraft/shaders/core/rendertype_end_portal.{vsh,fsh}.
-    // The portal block entity and LevelLoadingScreen.Reason.END_PORTAL share
-    // this exact vanilla pipeline. Its POSITION-only vertex format has neither
-    // UV nor Color, so the generic shader fallback returned ColorModulator
-    // (opaque white) even though both Mojang textures were bound and uploaded.
-    // Keep Minecraft's projected, animated 15/16-layer shader semantics here;
-    // only the source language changes from GLSL to WGSL.
-    const isEndPortal = family === "rendertype_end_portal";
-    if (isEndPortal) {
-      const portalLayout = compileVertexLayout(spec.vertexFormats[0]);
-      const positionAttribute = portalLayout.byName.get("Position");
-      if (!positionAttribute) throw new Error("rendertype_end_portal needs Position");
-      const portalPosition = positionAttribute.split3
-        ? `vec3<f32>(input.${positionAttribute.hiName}, input.${positionAttribute.loName})`
-        : `input.${positionAttribute.name}.xyz`;
-      const sampler0 = samplerMap.get("Sampler0");
-      const sampler1 = samplerMap.get("Sampler1");
-      if (!sampler0 || !sampler1) {
-        throw new Error("rendertype_end_portal needs Sampler0 and Sampler1");
-      }
-      const portalLayers = Math.max(1, Math.min(16,
-        Number.parseInt(String((spec.defines || [])
-          .find((value) => String(value).startsWith("PORTAL_LAYERS=")) || "=15")
-          .split("=")[1], 10) || 15));
-      vs = `struct VsInput {
-${portalLayout.inputMembers}
-};
-
-struct VsOutput {
-  @builtin(position) position: vec4<f32>,
-  @location(0) texProj0: vec4<f32>,
-  @location(1) sphericalVertexDistance: f32,
-  @location(2) cylindricalVertexDistance: f32,
-};
-
-@vertex
-fn vs_main(input: VsInput) -> VsOutput {
-  let modelPosition = ${portalPosition};
-  let clipPosition = Projection.ProjMat * DynamicTransforms.ModelViewMat
-    * vec4<f32>(modelPosition, 1.0);
-  var projected = clipPosition * 0.5;
-  projected.x = projected.x + clipPosition.w;
-  projected.y = projected.y + clipPosition.w;
-  projected.z = clipPosition.z;
-  projected.w = clipPosition.w;
-  var output: VsOutput;
-  output.position = clipPosition;
-  output.texProj0 = projected;
-  output.sphericalVertexDistance = length(modelPosition);
-  output.cylindricalVertexDistance = max(length(modelPosition.xz), abs(modelPosition.y));
-  return output;
-}`;
-      fs = `const PORTAL_COLORS = array<vec3<f32>, 16>(
-  vec3<f32>(0.022087, 0.098399, 0.110818),
-  vec3<f32>(0.011892, 0.095924, 0.089485),
-  vec3<f32>(0.027636, 0.101689, 0.100326),
-  vec3<f32>(0.046564, 0.109883, 0.114838),
-  vec3<f32>(0.064901, 0.117696, 0.097189),
-  vec3<f32>(0.063761, 0.086895, 0.123646),
-  vec3<f32>(0.084817, 0.111994, 0.166380),
-  vec3<f32>(0.097489, 0.154120, 0.091064),
-  vec3<f32>(0.106152, 0.131144, 0.195191),
-  vec3<f32>(0.097721, 0.110188, 0.187229),
-  vec3<f32>(0.133516, 0.138278, 0.148582),
-  vec3<f32>(0.070006, 0.243332, 0.235792),
-  vec3<f32>(0.196766, 0.142899, 0.214696),
-  vec3<f32>(0.047281, 0.315338, 0.321970),
-  vec3<f32>(0.204675, 0.390010, 0.302066),
-  vec3<f32>(0.080955, 0.314821, 0.661491));
-
-const PORTAL_SCALE_TRANSLATE = mat4x4<f32>(
-  0.5, 0.0, 0.0, 0.25,
-  0.0, 0.5, 0.0, 0.25,
-  0.0, 0.0, 1.0, 0.0,
-  0.0, 0.0, 0.0, 1.0);
-
-@group(${sampler0.g}) @binding(${sampler0.b}) var Sampler0_s: sampler;
-@group(${sampler0.g}) @binding(${sampler0.b + 1}) var Sampler0: texture_2d<f32>;
-@group(${sampler1.g}) @binding(${sampler1.b}) var Sampler1_s: sampler;
-@group(${sampler1.g}) @binding(${sampler1.b + 1}) var Sampler1: texture_2d<f32>;
-
-struct FsInput {
-  @builtin(position) position: vec4<f32>,
-  @location(0) texProj0: vec4<f32>,
-  @location(1) sphericalVertexDistance: f32,
-  @location(2) cylindricalVertexDistance: f32,
-};
-
-fn endPortalLayer(layer: f32) -> mat4x4<f32> {
-  let translatedY = (2.0 + layer / 1.5) * (Globals.GameTime * 1.5);
-  let translation = mat4x4<f32>(
-    1.0, 0.0, 0.0, 17.0 / layer,
-    0.0, 1.0, 0.0, translatedY,
-    0.0, 0.0, 1.0, 0.0,
-    0.0, 0.0, 0.0, 1.0);
-  let angle = radians((layer * layer * 4321.0 + layer * 9.0) * 2.0);
-  let rotation = mat2x2<f32>(cos(angle), -sin(angle), sin(angle), cos(angle));
-  let scaleValue = (4.5 - layer / 4.0) * 2.0;
-  let scale = mat2x2<f32>(scaleValue, 0.0, 0.0, scaleValue);
-  let scaledRotation = scale * rotation;
-  let layerTransform = mat4x4<f32>(
-    scaledRotation[0].x, scaledRotation[0].y, 0.0, 0.0,
-    scaledRotation[1].x, scaledRotation[1].y, 0.0, 0.0,
-    0.0, 0.0, 1.0, 0.0,
-    0.0, 0.0, 0.0, 1.0);
-  return layerTransform * translation * PORTAL_SCALE_TRANSLATE;
-}
-
-fn projectedUv(position: vec4<f32>) -> vec2<f32> {
-  return position.xy / max(abs(position.w), 0.000001) * sign(position.w);
-}
-
-fn linearFogValue(distance: f32, start: f32, end: f32) -> f32 {
-  return clamp((distance - start) / max(end - start, 0.0001), 0.0, 1.0);
-}
-
-@fragment
-fn fs_main(input: FsInput) -> @location(0) vec4<f32> {
-  var color = textureSample(Sampler0, Sampler0_s, projectedUv(input.texProj0)).rgb
-    * PORTAL_COLORS[0];
-  for (var i = 0; i < ${portalLayers}; i = i + 1) {
-    let projected = input.texProj0 * endPortalLayer(f32(i + 1));
-    color = color + textureSample(Sampler1, Sampler1_s, projectedUv(projected)).rgb
-      * PORTAL_COLORS[i];
-  }
-  let environmentalFog = linearFogValue(input.sphericalVertexDistance,
-    Fog.FogEnvironmentalStart, Fog.FogEnvironmentalEnd);
-  let renderFog = linearFogValue(input.cylindricalVertexDistance,
-    Fog.FogRenderDistanceStart, Fog.FogRenderDistanceEnd);
-  let fogValue = max(environmentalFog, renderFog);
-  let fogColor = vec3<f32>(Fog.FogColorR, Fog.FogColorG, Fog.FogColorB);
-  return vec4<f32>(mix(color, fogColor, fogValue * Fog.FogColorA), 1.0);
-}`;
-    }
-    // core/rendertype_clouds.{vsh,fsh}. Clouds have no vertex buffer: Mojang
-    // expands one quad per three CloudFaces integers using gl_VertexID. The old
-    // no-input fallback mistook that for a fullscreen blit and painted the
-    // entire world opaque white.
-    const isClouds = family === "rendertype_clouds";
-    if (isClouds) {
-      vs = `const CLOUD_VERTICES = array<vec3<f32>, 24>(
-  vec3<f32>(1.0,0.0,0.0), vec3<f32>(1.0,0.0,1.0), vec3<f32>(0.0,0.0,1.0), vec3<f32>(0.0,0.0,0.0),
-  vec3<f32>(0.0,1.0,0.0), vec3<f32>(0.0,1.0,1.0), vec3<f32>(1.0,1.0,1.0), vec3<f32>(1.0,1.0,0.0),
-  vec3<f32>(0.0,0.0,0.0), vec3<f32>(0.0,1.0,0.0), vec3<f32>(1.0,1.0,0.0), vec3<f32>(1.0,0.0,0.0),
-  vec3<f32>(1.0,0.0,1.0), vec3<f32>(1.0,1.0,1.0), vec3<f32>(0.0,1.0,1.0), vec3<f32>(0.0,0.0,1.0),
-  vec3<f32>(0.0,0.0,1.0), vec3<f32>(0.0,1.0,1.0), vec3<f32>(0.0,1.0,0.0), vec3<f32>(0.0,0.0,0.0),
-  vec3<f32>(1.0,0.0,0.0), vec3<f32>(1.0,1.0,0.0), vec3<f32>(1.0,1.0,1.0), vec3<f32>(1.0,0.0,1.0));
-const CLOUD_FACE_SHADE = array<f32, 6>(0.7, 1.0, 0.8, 0.8, 0.9, 0.9);
-
-// CloudFaces is an R8_SINT texel buffer. WebGPU cannot bind a formatted buffer
-// view, so its physical (four-byte padded) bytes arrive as packed u32 storage
-// words. Select and sign-extend the same byte texelFetch would have returned.
-fn cloudFaceAt(index: i32) -> i32 {
-  let byteIndex = u32(index);
-  let word = CloudFaces[byteIndex >> 2u];
-  let raw = (word >> ((byteIndex & 3u) * 8u)) & 255u;
-  return select(i32(raw), i32(raw) - 256, raw >= 128u);
-}
-
-struct VsOutput {
-  @builtin(position) position: vec4<f32>,
-  @location(0) vertexDistance: f32,
-  @location(1) vertexColor: vec4<f32>,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> VsOutput {
-  let quadVertex = i32(vertexIndex % 4u);
-  let faceIndex = i32(vertexIndex / 4u) * 3;
-  var cellX = cloudFaceAt(faceIndex);
-  var cellZ = cloudFaceAt(faceIndex + 1);
-  let flags = cloudFaceAt(faceIndex + 2);
-  let direction = flags & 7;
-  let inside = (flags & 16) == 16;
-  let useTopColor = (flags & 32) == 32;
-  cellX = (cellX << 1) | ((flags & 128) >> 7);
-  cellZ = (cellZ << 1) | ((flags & 64) >> 6);
-  let localVertex = select(quadVertex, 3 - quadVertex, inside);
-  let faceVertex = CLOUD_VERTICES[direction * 4 + localVertex];
-  let cellSize = vec3<f32>(CloudInfo.CellSizeX, CloudInfo.CellSizeY, CloudInfo.CellSizeZ);
-  let cloudOffset = vec3<f32>(
-    CloudInfo.CloudOffsetX, CloudInfo.CloudOffsetY, CloudInfo.CloudOffsetZ);
-  let pos = faceVertex * cellSize + vec3<f32>(f32(cellX), 0.0, f32(cellZ)) * cellSize + cloudOffset;
-  let shade = select(CLOUD_FACE_SHADE[direction], CLOUD_FACE_SHADE[1], useTopColor);
-  let cloudColor = vec4<f32>(
-    CloudInfo.CloudColorR, CloudInfo.CloudColorG, CloudInfo.CloudColorB, CloudInfo.CloudColorA);
-  var output: VsOutput;
-  output.position = Projection.ProjMat * DynamicTransforms.ModelViewMat * vec4<f32>(pos, 1.0);
-  output.vertexDistance = length(pos);
-  output.vertexColor = vec4<f32>(vec3<f32>(shade), 1.0) * cloudColor;
-  return output;
-}`;
-      fs = `struct FsInput {
-  @builtin(position) position: vec4<f32>,
-  @location(0) vertexDistance: f32,
-  @location(1) vertexColor: vec4<f32>,
-};
-
-@fragment
-fn fs_main(input: FsInput) -> @location(0) vec4<f32> {
-  let fogValue = clamp(input.vertexDistance / max(Fog.FogCloudsEnd, 0.0001), 0.0, 1.0);
-  return vec4<f32>(input.vertexColor.rgb, input.vertexColor.a * (1.0 - fogValue));
-}`;
-    }
-    // assets/minecraft/shaders/post/transparency.fsh. Improved transparency
-    // renders the main scene plus five premultiplied translucent layers into
-    // separate color/depth targets, sorts them by depth per pixel, and blends
-    // them back-to-front. The old generic no-vertex fallback sampled only the
-    // first color target and declared every depth view as an ordinary float
-    // texture; WebGPU rejected that bind group and Main remained black.
-    const isTransparencyPost = /(?:^|\/)post\/transparency$/i.test(
-      String(spec.fragmentShader || "").replace(/^minecraft:/, "")
-    );
-    if (isTransparencyPost) {
-      const samplerNames = [...samplerMap.keys()];
-      const findSampler = (stem, depth) => samplerNames.find((name) => {
-        const normalized = String(name).replace(/Sampler$/i, "");
-        return normalized.toLowerCase()
-          === `${stem}${depth ? "Depth" : ""}`.toLowerCase();
-      });
-      const layers = ["Main", "Translucent", "ItemEntity", "Particles", "Weather", "Clouds"]
-        .map((stem) => ({
-          stem,
-          color: findSampler(stem, false),
-          depth: findSampler(stem, true),
-        }));
-      if (layers.every((layer) => layer.color && layer.depth)) {
-        const decls = layers.flatMap((layer) => [layer.color, layer.depth])
-          .map((name) => {
-            const loc = samplerMap.get(name);
-            const textureType = isDepthSamplerName(name)
-              ? "texture_depth_2d" : "texture_2d<f32>";
-            return `@group(${loc.g}) @binding(${loc.b + 1}) var ${sanitizeName(name)}: ${textureType};`;
-          }).join("\n");
-        const load = (name) => {
-          const n = sanitizeName(name);
-          return `textureLoad(${n}, clamp(vec2<i32>(input.position.xy), vec2<i32>(0), vec2<i32>(textureDimensions(${n}, 0)) - vec2<i32>(1)), 0)`;
-        };
-        const colorInitializers = layers.map((layer, index) =>
-          `  colors[${index}] = ${load(layer.color)};`).join("\n");
-        const depthInitializers = layers.map((layer, index) =>
-          `  depths[${index}] = ${load(layer.depth)};`).join("\n");
-        vs = `struct VsOutput {
-  @builtin(position) position: vec4<f32>,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> VsOutput {
-  let uv = vec2<f32>(f32((vertexIndex << 1u) & 2u), f32(vertexIndex & 2u));
-  var output: VsOutput;
-  output.position = vec4<f32>(uv * vec2<f32>(2.0, 2.0) + vec2<f32>(-1.0, -1.0), 0.0, 1.0);
-  return output;
-}`;
-        fs = `${decls}
-
-struct FsInput {
-  @builtin(position) position: vec4<f32>,
-};
-
-@fragment
-fn fs_main(input: FsInput) -> @location(0) vec4<f32> {
-  var colors: array<vec4<f32>, 6>;
-  var depths: array<f32, 6>;
-${colorInitializers}
-${depthInitializers}
-  // Transparent clears have alpha zero. Put those entries behind the active
-  // [0,1] depth range so they cannot displace the opaque Main base.
-  for (var i = 1; i < 6; i = i + 1) {
-    if (colors[i].a == 0.0) {
-      depths[i] = 2.0;
-    }
-  }
-  for (var i = 1; i < 6; i = i + 1) {
-    var j = i;
-    loop {
-      if (j <= 0 || depths[j] >= depths[j - 1]) { break; }
-      let depthSwap = depths[j - 1];
-      depths[j - 1] = depths[j];
-      depths[j] = depthSwap;
-      let colorSwap = colors[j - 1];
-      colors[j - 1] = colors[j];
-      colors[j] = colorSwap;
-      j = j - 1;
-    }
-  }
-  var accumulated = vec3<f32>(0.0);
-  for (var i = 0; i < 6; i = i + 1) {
-    accumulated = accumulated * (1.0 - colors[i].a) + colors[i].rgb;
-  }
-  return vec4<f32>(accumulated, 1.0);
-}`;
-      }
-    }
-    // Fullscreen-blit shape: explicit screenquad family, or any pipeline with
-    // no vertex input (animate_sprite_blit/interpolate, lightmap): synthesize
-    // a fullscreen triangle from vertex_index and sample the first sampler.
-    const isBlit = !isAnimateSprite && !isEndPortal && !isClouds && !isTransparencyPost
-      && (family === "screenquad" || !spec.vertexFormats || !spec.vertexFormats.length);
-    if (isBlit) {
-      vs = `@vertex
-fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> VsOutput {
-  var uv = vec2<f32>(f32((vertexIndex << 1u) & 2u), f32(vertexIndex & 2u));
-  var output: VsOutput;
-  output.position = vec4<f32>(uv * vec2<f32>(2.0, 2.0) + vec2<f32>(-1.0, -1.0), 0.0, 1.0);
-  return output;
-}
-struct VsOutput {
-  @builtin(position) position: vec4<f32>,
-};`;
-      const samplerGroup = groups.findIndex((g) => g.samplers.length > 0);
-      if (samplerGroup < 0) {
-        // No texture input (clouds read a texel buffer; lightmap computes
-        // procedurally): emit a valid constant-color fragment so the pipeline
-        // compiles â€” none of these draw on the title screen.
-        fs = `struct FsInput {
-  @builtin(position) position: vec4<f32>,
-};
-
-@fragment
-fn fs_main(input: FsInput) -> @location(0) vec4<f32> {
-  return vec4<f32>(1.0, 1.0, 1.0, 1.0);
-}`;
-      } else {
-      const g = groups[samplerGroup];
-      const blitName = sanitizeName(g.samplers[0]);
-      // Use the REMAPPED (group, binding) from samplerMap â€” NOT the raw group
-      // index / g.uniforms.length. When groups are folded into the K-1 merged
-      // group (this device caps maxBindGroups at 4, the blur post-chain has
-      // more), the raw binding collides with a uniform's binding in the merged
-      // layout ("binding index (0) was specified by a previous entry") and the
-      // whole blur pipeline â€” and thus the title-screen render â€” fails.
-      const sloc = samplerMap.get(g.samplers[0]) || { g: samplerGroup, b: g.uniforms.length };
-      fs = `struct FsInput {
-  @builtin(position) position: vec4<f32>,
-};
-
-@group(${sloc.g}) @binding(${sloc.b}) var ${blitName}_s: sampler;
-@group(${sloc.g}) @binding(${sloc.b + 1}) var ${blitName}: texture_2d<f32>;
-
-@fragment
-fn fs_main(input: FsInput) -> @location(0) vec4<f32> {
-  let size = textureDimensions(${blitName}, 0);
-  let uv = (input.position.xy + vec2<f32>(0.5, 0.5)) / vec2<f32>(f32(size.x), f32(size.y));
-  return textureSample(${blitName}, ${blitName}_s, uv);
-}`;
-      }
-    } else if (!isAnimateSprite && !isEndPortal && !isClouds && !isTransparencyPost) {
-      // (isAnimateSprite already assigned vs/fs above; falling into buildVs
-      //  here would clobber them with null, since animate_sprite has no vertex
-      //  format and buildVs returns null on an empty format -> pipeline-skipped.)
-      vs = buildVs(family, spec, groups, groupRemap);
-      fs = buildFs(family, spec, groups, groupRemap, samplerMap);
-    }
-    if (!vs || !fs) { _popScope(); return null; }
-
-    const wgslCode = `${uniformDecl}\n${vs}\n${fs}\n`;
-    if (/terrain/.test(spec.label || "") || /terrain/.test(family)
-        || /^(block|particle|item|entity|rendertype_clouds|rendertype_end_portal)$/.test(family)) {
-      (globalThis.mcWebGpu._wgsl ||= {})[spec.label || family] = wgslCode;
-    }
-    const module = device.createShaderModule({
-      label: `minecraft:${family}`,
-      code: wgslCode
-    });
-    // Surface shader compile errors (the real-GPU driver may reject WGSL that
-    // headless SwiftShader accepts). Logged once per family to avoid spam.
-    if (module.getCompilationInfo && !buildPipeline._loggedCompile) buildPipeline._loggedCompile = new Set();
-    if (module.getCompilationInfo && !buildPipeline._loggedCompile.has(family)) {
-      module.getCompilationInfo().then((info) => {
-        const errs = (info?.messages || []).filter((m) => m.type === "error");
-        if (errs.length) {
-          buildPipeline._loggedCompile.add(family);
-          console.error(`[WGSL compile error] ${spec.label} (family=${family}):`,
-            errs.map((m) => `${m.message} @${m.lineNum}:${m.linePos}`).join(" | "),
-            "\n---WGSL---\n" + wgslCode);
-        }
-      }).catch(() => {});
-    }
-
-    // One layout per *merged* group. When groups were folded, each merged
-    // layout aggregates the entries of all original groups that map to it, at
-    // their remapped bindings (matching the WGSL + the host bind calls).
-    const bindGroupLayouts = [];
-    for (let ng = 0; ng < groupCount; ng++) {
-      const entries = [];
-      groups.forEach((group, gi) => {
-        const r = groupRemap[gi];
-        if (r.ng !== ng) return;
-        group.uniforms.forEach((uniformDesc, ui) => {
-          entries.push({
-            binding: r.baseU + ui,
-            visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
-            buffer: {type: uniformDesc.type === "TEXEL_BUFFER" ? "read-only-storage" : "uniform"}
-          });
-        });
-        group.samplers.forEach((samplerName, si) => {
-          const base = samplerBase(gi) + si * 2;
-          entries.push({binding: base, visibility: GPUShaderStage.FRAGMENT, sampler: {type: "filtering"}});
-          entries.push({binding: base + 1, visibility: GPUShaderStage.FRAGMENT,
-            texture: {
-              sampleType: isDepthSamplerName(samplerName) ? "depth" : "float",
-              viewDimension: family === "panorama" ? "cube" : "2d"
-            }});
-        });
-      });
-      bindGroupLayouts.push(device.createBindGroupLayout({label: `${spec.label}:group${ng}`, entries}));
-    }
-
-    const format0 = spec.vertexFormats[0];
-    // DIAG: terrain renders saturated white (255,255,255), not FogColor, so the
-    // ChunkVisibility mix is fine and one multiplier in
-    //   atlasSample * Color * sample_lightmap(Sampler2, UV2)
-    // is ~255x too large. A unorm8 colour decoded as raw uint8 does exactly
-    // that, so record the declared vs mapped attribute formats.
-    if (/terrain|entity_solid/.test(spec.label || "")) {
-      (globalThis.mcWebGpu._vertexLayouts ||= {})[spec.label] =
-        spec.vertexFormats.map((vf) => ({
-          stride: vf.stride,
-          elements: (vf.elements || []).map((e) => ({
-            name: e.name,
-            declared: e.format,
-            mapped: (VERTEX_GPU_FORMATS[e.format] || {}).gpu ?? "UNMAPPED",
-            offset: e.offset
-          }))
-        }));
-    }
-    let vertex = undefined;
-    if (family !== "screenquad" && family !== "animate_sprite" && format0) {
-      vertex = {
-        module,
-        entryPoint: "vs_main",
-        buffers: spec.vertexFormats.map((vf) => ({
-          arrayStride: vf.stride,
-          stepMode: vf.stepRate > 1 ? "instance" : "vertex",
-          attributes: compileVertexLayout(vf).gpuAttrs
-        }))
-      };
-    }
-
-    const targets = [];
-    const colorTargets = spec.colorTargets && spec.colorTargets.length
-      ? spec.colorTargets
-      : [null];
-    for (const target of colorTargets) {
-      if (!target) {
-        targets.push(undefined);
-        continue;
-      }
-      const entry = {format: minecraftFormat(target.format)};
-      if (target.writeMask !== undefined && target.writeMask !== 15) {
-        entry.writeMask = target.writeMask;
-      }
-      if (target.blend) {
-        entry.blend = {
-          color: {
-            srcFactor: BLEND_FACTOR[target.blend.colorSrc],
-            dstFactor: BLEND_FACTOR[target.blend.colorDst],
-            operation: BLEND_OP[target.blend.colorOp]
-          },
-          alpha: {
-            srcFactor: BLEND_FACTOR[target.blend.alphaSrc],
-            dstFactor: BLEND_FACTOR[target.blend.alphaDst],
-            operation: BLEND_OP[target.blend.alphaOp]
-          }
-        };
-      }
-      if (_drawCensus && !_blendLogged.has(spec.label)) {
-        _blendLogged.add(spec.label);
-        // A colour write mask of 0, or a blend that resolves to "keep the
-        // destination", makes a draw invisible while every other state looks
-        // correct - the same symptom as never drawing at all.
-        console.log("[draw-census] target " + spec.label
-          + " writeMask=" + (target.writeMask === undefined ? 15 : target.writeMask)
-          + " blend=" + (entry.blend
-            ? entry.blend.color.srcFactor + "/" + entry.blend.color.dstFactor
-              + " a:" + entry.blend.alpha.srcFactor + "/" + entry.blend.alpha.dstFactor
-            : "none")
-          + " fmt=" + entry.format);
-      }
-      targets.push(entry);
-    }
-
-    const descriptor = {
-      label: spec.label,
-      layout: device.createPipelineLayout({
-        label: `${spec.label}:layout`,
-        bindGroupLayouts
-      }),
-      vertex: vertex || {module, entryPoint: "vs_main"},
-      fragment: {
-        module,
-        entryPoint: "fs_main",
-        targets: targets.map((t) => t || {format: "rgba8unorm"})
-      },
-      primitive: {
-        topology: TOPOLOGY[spec.topology] || "triangle-list",
-        // Sprite blits are two-dimensional copies, so culling has no useful
-        // effect there.
-        // ?mcweb_nocull=1 disables backface culling everywhere. Terrain is the
-        // only family that culls and the only one that renders nothing, with
-        // every input (vertices, indices, uniforms, transform, textures)
-        // verified correct and no validation errors -- so reversed winding is
-        // the remaining candidate, and this separates it in one run.
-        cullMode: (_forceNoCull || family === "animate_sprite")
-          ? "none"
-          : (spec.cull ? "back" : "none"),
-        frontFace: "ccw"
-      }
-    };
-    if (spec.depthStencil && depthFormat != null) {
-      descriptor.depthStencil = {
-        // Derived from the render pass's depth attachment (see rpSetPipeline
-        // variant handling); the precompile default assumes the main target.
-        //
-        // The depthFormat != null guard matters: createPipeline also builds a
-        // NO-depth variant (depthFormat === null) of every family, including
-        // those whose spec DOES declare depth state. Without the guard that
-        // variant emitted `format: null` and WebGPU rejected the pipeline with
-        // "Failed to read the 'format' property from 'GPUDepthStencilState'",
-        // losing the no-depth variant for solid_terrain and cutout_terrain.
-        // A spec-declared depth state simply cannot apply to a pass that has
-        // no depth attachment, so the variant must be depth-less instead.
-        format: depthFormat,
-        depthWriteEnabled: spec.depthStencil.writeDepth,
-        // ?mcweb_diag=depthalways -> terrain ignores the depth test. Splits
-        // "the depth state rejects every terrain fragment" from "the geometry
-        // or its uniforms are wrong": if blocks appear under this flag, depth
-        // is the fault; if the frame is unchanged, depth is exonerated.
-        depthCompare: (_forceDepthAlways && /terrain/.test(spec.label))
-          ? "always"
-          : (COMPARE_OP[spec.depthStencil.depthTest] || "less-equal"),
-        depthBias: Math.round(spec.depthStencil.biasConstant || 0),
-        depthBiasSlopeScale: spec.depthStencil.biasScale || 0
-      };
-      if (_drawCensus && !_depthStateLogged.has(spec.label)) {
-        _depthStateLogged.add(spec.label);
-        console.log("[draw-census] depthstate " + spec.label
-          + " compare=" + descriptor.depthStencil.depthCompare
-          + " write=" + descriptor.depthStencil.depthWriteEnabled
-          + " declared=" + spec.depthStencil.depthTest);
-      }
-    } else if (depthRequested) {
-      // The spec declared no depth state, but the pass we are being built for
-      // HAS a depth attachment (panorama/sky AND the fullscreen blits are all
-      // drawn into the depth-bearing main pass at some point). WebGPU requires
-      // the pipeline's attachment state to match the pass regardless of family,
-      // so synthesize a depth state that never disturbs the buffer. Guarded by
-      // depthRequested so the NO-depth variant (depthFormat === null) stays
-      // depth-less â€” otherwise a pipeline built for a no-depth pass would itself
-      // fail validation. createPipeline pre-builds both variants into byDepth.
-      if (_drawCensus && !_depthStateLogged.has(spec.label)) {
-        _depthStateLogged.add(spec.label);
-        console.log("[draw-census] depthstate " + spec.label
-          + " compare=always write=false declared=SYNTHESIZED");
-      }
-      descriptor.depthStencil = {
-        format: depthFormat,
-        depthWriteEnabled: false,
-        depthCompare: "always",
-        // depthBias MUST be 0 for line-list topologies (rendertype_lines); since
-        // this is a synthesized never-write/always-pass state, zero bias is also
-        // the correct no-op for every other topology.
-        depthBias: 0,
-        depthBiasSlopeScale: 0
-      };
-    }
-    // WebGPU forbids non-zero depth bias on line topologies ("depthBias must be
-    // 0 when using PrimitiveTopology::LineList"). Mojang's lines render type
-    // sets a bias, which would fail pipeline creation (and the precompile gate);
-    // clamp it for any line topology regardless of whether the depth state came
-    // from the spec or was synthesized above.
-    if (descriptor.depthStencil && /^line/.test(TOPOLOGY[spec.topology] || "")) {
-      descriptor.depthStencil.depthBias = 0;
-      descriptor.depthStencil.depthBiasSlopeScale = 0;
-    }
-    if (/lines/.test(spec.label) && _DBG) {
-      console.log("[lines-dbg] label=", spec.label, "spec.topology=", JSON.stringify(spec.topology),
-        "mapped=", TOPOLOGY[spec.topology], "hadDepthStencil=", !!spec.depthStencil,
-        "depthBias=", descriptor.depthStencil && descriptor.depthStencil.depthBias);
-    }
-
-    if (typeof device.pushErrorScope === "function") device.pushErrorScope("validation");
-    const pipeline = device.createRenderPipeline(descriptor);
-    if (typeof device.popErrorScope === "function") {
-      device.popErrorScope().then((err) => {
-        if (err && !(buildPipeline._loggedCreate || (buildPipeline._loggedCreate = new Set())).has(spec.label)) {
-          buildPipeline._loggedCreate.add(spec.label);
-          console.error(`[pipeline create error] ${spec.label} (family=${family}): ${err.message}`,
-            "\nvertexFormats=" + JSON.stringify((spec.vertexFormats || []).map((vf) => vf.elements?.map((e) => e.name + ":" + e.format))),
-            "\n---WGSL---\n" + wgslCode);
-        }
-      }).catch(() => {});
-    }
-    _popScope();
-    return {pipeline, spec, family, depthFormat, groupRemap, groupCount,
-      samplerBases: groups.map((g, gi) => samplerBase(gi))};
-  };
-
-  // ---------------------------------------------------------------------------
-  // Non-indexed topology lowering (QUADS / TRIANGLE_FAN): synthesize index
-  // buffers on demand, then drawIndexed.
-  // ---------------------------------------------------------------------------
-
-  const loweringIndexBuffers = new Map();
-  const loweredIndices = (topology, vertexCount) => {
-    const key = `${topology}:${vertexCount}`;
-    let entry = loweringIndexBuffers.get(key);
-    if (entry) return entry;
-    let indices;
-    if (topology === "QUADS") {
-      const quads = Math.floor(vertexCount / 4);
-      indices = new Uint32Array(quads * 6);
-      for (let i = 0; i < quads; i++) {
-        const base = i * 4;
-        const out = i * 6;
-        indices[out] = base;
-        indices[out + 1] = base + 1;
-        indices[out + 2] = base + 2;
-        indices[out + 3] = base;
-        indices[out + 4] = base + 2;
-        indices[out + 5] = base + 3;
-      }
-    } else if (topology === "TRIANGLE_FAN") {
-      const triangles = Math.max(0, vertexCount - 2);
-      indices = new Uint32Array(triangles * 3);
-      for (let i = 0; i < triangles; i++) {
-        indices[i * 3] = 0;
-        indices[i * 3 + 1] = i + 1;
-        indices[i * 3 + 2] = i + 2;
-      }
-    } else {
-      return null;
-    }
-    const buffer = device.createBuffer({
-      label: `lowered ${topology} ${vertexCount}`,
-      size: Math.max(4, indices.byteLength),
-      usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST
-    });
-    device.queue.writeBuffer(buffer, 0, indices);
-    entry = {buffer, count: indices.length};
-    loweringIndexBuffers.set(key, entry);
-    return entry;
-  };
-
-  // ---------------------------------------------------------------------------
-  // Host-side present composite: Mojang's 26.2 presenter renders the scene to
-  // an offscreen main target but never blits it to the swap-chain canvas (its
-  // blitFromTexture/copyTexture path is not exercised here), so the canvas
-  // would stay empty. We track the last scene color target and, when a render
-  // pass is opened against the canvas, draw that texture into it with a
-  // dedicated fullscreen-triangle blit pipeline.
-  let compositeSource = null;
-  let _compositeLogAt = 0;
-  let _lastPresentAt = 0;
-  let _presentEnterAt = 0;
-  let _presentExitAt = 0;
-  let _presentCount = 0;
-  let _rpDbgN = 0; // bounded rpSetPipeline debug trace counter (module scope)
-  // DIAG: textures actually sampled (bound into a bind group) this frame, and
-  // the last auto/forced texture-readback snapshot (see mcWebGpu._texDiag).
-  let _sampledThisFrame = new Set();
-  let _lastFrameSampled = new Set(); // DIAG: sampled set of the most recent frame
-  const _sampledEntries = new Set(); // DIAG: every texture entry ever bound for sampling
-  let _texDiagSnapshot = null;
-  let _texDiagDone = false;
-  let _texDiagLateDone = false; // DIAG: late lifetime-upload dump fired once
-  let _animDbgDone = false; // DIAG: one-shot animate_sprite UBO dump
-  let _texDrawDbgN = 0; // DIAG: count of textured GUI draw dumps emitted (cap 8)
-  // DIAG: ring buffer of the ACTUAL decoded vertex/index bytes for the first few
-  // textured GUI draws. The older _maybeTexDrawDiag reads VBO offset 0 (not the
-  // batched draw's baseVertex) and never stored the index-buffer handle, so it
-  // could not show why atlas-sampled GUI quads scatter while the standalone logo
-  // (same family) renders correctly. This captures, per draw, the decoded
-  // Position/UV0/Color at baseVertex+index, the index values, the draw params,
-  // and the DynamicTransforms block (incl. TextureMat), then dumps once.
-  const _guiDrawRing = [];
-  // Item models are rendered into a dedicated offscreen atlas with the
-  // block/item/entity pipelines, so the early GUI-only ring above never sees
-  // the draws that populate missing inventory icons. Keep a separate bounded
-  // trace with the exact slot transform and scissor used for each atlas draw.
-  const _itemAtlasDrawRing = [];
-  // DIAG: title-frame text draws are normally reached after the early GUI ring
-  // has filled with the Mojang splash/logo. Keep them in a separate bounded
-  // ring so font debugging can prove whether glyph quads and a glyph texture
-  // actually reach the host.
-  const _fontDrawRing = [];
-  const _fontPassStats = new Map();
-  let _guiRingDumped = false;
-  // DIAG: panorama cube-fill + draw probe (consolidated single-line dump at frame 2).
-  const _panoProbe = { created: [], uploads: [], pipeBegin: [], pipeOk: [], pipeSkip: [], pipeFail: [], set: 0 };
-  let _panoDumped = false;
-  // DIAG: global upload history by label [count, bytes], and a creation registry
-  // (every texture instance), so we can spot a label that WAS uploaded but whose
-  // sampled instance wasn't (stale/duplicate handle).
-  const _uploadByLabel = new Map();
-  const _recentCreated = [];
-  // Verbose per-frame/pipeline diagnostics; off by default (set ?mcweb_debug).
-  const _DBG = (typeof location !== "undefined") && new URLSearchParams(location.search).has("mcweb_debug");
-  let compositePipeline = null;
-  let compositePipelineH = 0;
-  let compositeSampler = null;
-  // Region clears cannot use attachment loadOp=clear: WebGPU applies that to
-  // the entire subresource, regardless of render area or scissor. Minecraft's
-  // GUI item cache clears one atlas tile before drawing each item, so turning
-  // those into full clears erased every previously rendered inventory icon.
-  // Cache tiny draw-based clear pipelines by attachment formats + values.
-  const regionClearPipelines = new Map();
-  // Dummy resources used to fill bind-group slots whose real resource isn't
-  // bound yet, so a group is ALWAYS complete and setBindGroup never gets
-  // skipped (skipping it leaves the group unbound â†’ "No bind group at group
-  // index N" validation â†’ Mojang's Java throws â†’ the frame pump dies).
-  let dummyUniform = null, dummyStorage = null, dummySampler = null;
-  let dummyTexView = null, dummyDepthView = null;
-  // Fence-based deferred GPU-resource destruction. Mojang deletes a uniform/
-  // vertex buffer (e.g. SpriteAnimationInfo) while a command buffer that
-  // references it is still in flight; native GL retains the buffer until the GPU
-  // is done, but WebGPU rejects the submit ("used in submit while destroyed") and
-  // the frame aborts, killing the pump. So on destroy we only drop the live
-  // registry entry and park the GPU object in a pending list; after each submit
-  // we snapshot that list and hold it until queue.onSubmittedWorkDone() resolves
-  // (= every submit issued up to that point has completed on the GPU), which is
-  // the exact moment no in-flight command buffer can reference it. A frame-count
-  // grace is too fragile because a buffer destroyed AFTER a submit is still in
-  // flight for that submit.
-  const _deferredDestroy = globalThis.mcWebTextureLifetime.createDeferredDestroyQueue({
-    getQueue: () => device?.queue ?? null,
-    fallbackBatches: 4,
-  });
-  const deferDestroyBuffer = _deferredDestroy.deferDestroyBuffer;
-  const deferDestroyTexture = _deferredDestroy.deferDestroyTexture;
-  const flushGraveyard = _deferredDestroy.flush;
-  const _textureLifetime = globalThis.mcWebTextureLifetime.createTextureLifetime({
-    deferDestroyTexture,
-    recentCalls: () => _recentCalls,
-    rpcBatch: () => globalThis.mcWebGpu?._rpcLastBatch ?? null,
-  });
-  let diagChecker = null;
-  // Per-target draw accounting to identify the real scene target by data.
-  let texSeq = 0;
-  const texInventory = [];
-  let frameDraws = new Map();   // tid -> draw calls this frame
-  let lastFrameDraws = new Map();
-  let drawSeq = 0;              // monotonic per-pass draw-order stamp
-  let frameDrawSeq = new Map(); // tid -> last drawSeq that drew into it this frame
-  let lastFrameDrawSeq = new Map();
-  // Absolute last-drawn target this frame (incl. the canvas, _tid -1) so we can
-  // tell "Mojang drew the final image to the canvas" (splash â‡’ don't composite)
-  // from "Mojang's final image is offscreen" (title â‡’ composite it).
-  let frameLastTid = 0;
-  let frameLastIsCanvas = false;
-  let lastFrameIsCanvas = false;
-  const ensureDiagChecker = () => {
-    if (diagChecker) return diagChecker;
-    const S = 16;
-    const data = new Uint8Array(S * S * 4);
-    for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
-      const i = (y * S + x) * 4, on = (x + y) & 1;
-      data[i] = on ? 255 : 40; data[i+1] = on ? 150 : 40; data[i+2] = on ? 0 : 200; data[i+3] = 255;
-    }
-    const t = device.createTexture({size: [S, S], format: "rgba8unorm",
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST});
-    device.queue.writeTexture({texture: t}, data, {bytesPerRow: S * 4}, {width: S, height: S});
-    diagChecker = t;
-    return t;
-  };
-  const ensureComposite = (h) => {
-    if (!compositeSampler) {
-      compositeSampler = device.createSampler({magFilter: "linear", minFilter: "linear"});
-    }
-    if (compositePipeline && compositePipelineH === h) return compositePipeline;
-    const mod = device.createShaderModule({label: "mcweb-composite", code: `
-struct VsOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> };
-@vertex fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
-  var p = array<vec2<f32>,3>(vec2<f32>(-1.0,-1.0), vec2<f32>(3.0,-1.0), vec2<f32>(-1.0,3.0));
-  var u = array<vec2<f32>,3>(vec2<f32>(0.0,1.0), vec2<f32>(2.0,1.0), vec2<f32>(0.0,-1.0));
-  var o: VsOut; o.position = vec4<f32>(p[i], 0.0, 1.0); o.uv = u[i]; return o;
-}
-@group(0) @binding(0) var S_s: sampler;
-@group(0) @binding(1) var S: texture_2d<f32>;
-@fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> { return textureSample(S, S_s, in.uv); }
-`});
-    const layout = device.createPipelineLayout({bindGroupLayouts: [device.createBindGroupLayout({
-      entries: [
-        {binding: 0, visibility: GPUShaderStage.FRAGMENT, sampler: {type: "filtering"}},
-        {binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: {sampleType: "float", viewDimension: "2d"}}
-      ]
-    })]});
-    compositePipeline = device.createRenderPipeline({
-      label: "mcweb-composite", layout, vertex: {module: mod, entryPoint: "vs_main"},
-      fragment: {module: mod, entryPoint: "fs_main", targets: [{format: "rgba8unorm"}]},
-      primitive: {topology: "triangle-list"}
-    });
-    compositePipelineH = h;
-    return compositePipeline;
-  };
-
-  // Render pass state
-  // ---------------------------------------------------------------------------
-
-  const passState = (passHandle) => get(passHandle, "render pass");
-  // DIAG: one-shot dump of the first textured GUI draw (vertex bytes + matrices + target).
-  // Called from both rpDraw and rpDrawIndexed because Mojang's BufferBuilder emits
-  // indexed geometry for quads (logo, buttons, widgets all go through rpDrawIndexed).
-  const _maybeTexDrawDiag = (state, drawKind) => {
-    if (_texDrawDbgN >= 8 || !state.pipeline || !state.pipeline.spec) return;
-    const vsId = state.pipeline.spec.vertexShader || "";
-    const fam = shaderFamily(vsId);
-    if (!/^(position_tex|gui_textured|text|position_tex_color|gui_text)$/.test(fam)) return;
-    _texDrawDbgN++;
-    const vf = state.pipeline.spec.vertexFormats && state.pipeline.spec.vertexFormats[0];
-    const vb = state.vertexBuffers[0];
-    let vbytes = "no vb0";
-    if (vb && vb._handle) {
-      const be = objects.get(vb._handle);
-      if (be && be._shadow) {
-        const base = vb.offset;
-        const n = Math.min(64, be._shadow.length - base);
-        const f32 = new Float32Array(be._shadow.buffer, base, Math.floor(n / 4));
-        vbytes = JSON.stringify({off: vb.offset, sz: vb.size, f: Array.from(f32)});
-      } else { vbytes = "vb0#" + vb._handle + " noshadow"; }
-    }
-    let ibytes = "no ib";
-    if (state.indexBuffer && state.indexBuffer._handle) {
-      const be = objects.get(state.indexBuffer._handle);
-      if (be && be._shadow) {
-        const u = state.indexBuffer.format === "uint16" ? new Uint16Array(be._shadow.buffer, 0, Math.min(12, be._shadow.length >> 1)) : new Uint32Array(be._shadow.buffer, 0, Math.min(12, be._shadow.length >> 2));
-        ibytes = JSON.stringify({fmt: state.indexBuffer.format, idx: Array.from(u)});
-      }
-    }
-    const grabMat = (uname) => {
-      const u = state.resources.get(uname);
-      if (!(u && u.kind === "uniform")) return "not-bound";
-      const be = objects.get(u.bufferHandle);
-      if (!(be && be._shadow)) return "noshadow";
-      return Array.from(new Float32Array(be._shadow.buffer, u.offset, 16));
-    };
-    const sampled = [];
-    for (const [nm, r] of state.resources) if (r && r.kind === "texture" && r._texEntry) sampled.push(nm + "=" + (r._texEntry._label || "?"));
-    const layout = vf ? vf.elements.map((e) => e.name + "@" + e.offset + ":" + e.format) : "no-vf";
-    console.log("[TEX-DRAW-DIAG #" + _texDrawDbgN + "] " + drawKind + " fam=" + fam + " tgt=" + state._targetLabel + " " + state._targetWH + " h=" + state.height
-      + " | sampled=" + JSON.stringify(sampled)
-      + " | Proj=" + JSON.stringify(grabMat("Projection"))
-      + " | MV=" + JSON.stringify(grabMat("DynamicTransforms"))
-      + " | layout=" + JSON.stringify(layout)
-      + " | vb0=" + vbytes + " | ib=" + ibytes);
-  };
-  const _decodeGuiDraw = (state, kind, p) => {
-  try {
-    if (!state.pipeline || !state.pipeline.spec) return;
-    const fam = shaderFamily(state.pipeline.spec.vertexShader || "");
-    const isFontDraw = fam === "text" || /(?:^|[/_])text(?:$|[/_])/.test(state.pipeline.spec.label || "");
-    const isItemAtlasDraw = /^UI items atlas(?:\s|$)/.test(state._targetLabel || "");
-    const drawRing = isItemAtlasDraw ? _itemAtlasDrawRing : (isFontDraw ? _fontDrawRing : _guiDrawRing);
-    const ringLimit = isItemAtlasDraw ? 160 : (isFontDraw ? 40 : 12);
-    if (drawRing.length >= ringLimit) return;
-    if (!isItemAtlasDraw && !/position_tex_color|position_tex|^text$|^gui$|gui_text/.test(fam)) return;
-    const vf = state.pipeline.spec.vertexFormats && state.pipeline.spec.vertexFormats[0];
-    const vb = state.vertexBuffers[0];
-    if (!vb || !vb._handle) return;
-    const be = objects.get(vb._handle);
-    if (!be || !be._shadow) return;
-    const stride = vf ? vf.stride : 32;
-    const elOff = (n, d) => vf ? ((vf.elements.find((e) => e.name === n) || {}).offset ?? d) : d;
-    const posOff = elOff("Position", 0), uvOff = elOff("UV0", 12), colOff = elOff("Color", 20);
-    const dv = new DataView(be._shadow.buffer, be._shadow.byteOffset || 0);
-    const readVert = (v) => {
-      const base = vb.offset + v * stride;
-      if (base < 0 || base + colOff + 4 > be._shadow.length) return null;
-      return {
-        pos: [dv.getFloat32(base + posOff, true), dv.getFloat32(base + posOff + 4, true), dv.getFloat32(base + posOff + 8, true)],
-        uv: [dv.getFloat32(base + uvOff, true), dv.getFloat32(base + uvOff + 4, true)],
-        col: [dv.getUint8(base + colOff), dv.getUint8(base + colOff + 1), dv.getUint8(base + colOff + 2), dv.getUint8(base + colOff + 3)]
-      };
-    };
-    let idxs = null;
-    const ib = state.indexBuffer;
-    if (ib && ib._handle) {
-      const ibe = objects.get(ib._handle);
-      if (ibe && ibe._shadow) {
-        const idv = new DataView(ibe._shadow.buffer, ibe._shadow.byteOffset || 0);
-        const w = ib.format === "uint16" ? 2 : 4;
-        idxs = [];
-        for (let k = 0; k < Math.min(p.indexCount || 0, 6); k++) {
-          const bo = (p.firstIndex + k) * w;
-          idxs.push(w === 2 ? idv.getUint16(bo, true) : idv.getUint32(bo, true));
-        }
-      }
-    }
-    const verts = [];
-    const n = idxs ? idxs.length : Math.min(p.vertexCount || 0, 6);
-    for (let k = 0; k < n; k++) {
-      const v = (p.baseVertex || 0) + (idxs ? idxs[k] : (p.firstVertex || 0) + k);
-      verts.push(readVert(v));
-    }
-    const grab = (u) => {
-      const r = state.resources.get(u);
-      if (!(r && r.kind === "uniform")) return null;
-      const b = objects.get(r.bufferHandle);
-      if (!(b && b._shadow)) return null;
-      const byteOffset = (b._shadow.byteOffset || 0) + r.offset;
-      const available = Math.max(0, b._shadow.byteLength - r.offset);
-      return Array.from(new Float32Array(b._shadow.buffer, byteOffset, Math.min(32, available >> 2)));
-    };
-    const sampled = []; for (const [nm, r] of state.resources) if (r && r.kind === "texture" && r._texEntry) sampled.push((r._texEntry._label || "?").split("/").pop());
-    drawRing.push({ kind, pipe: state.pipeline.spec.label, fam, tgt: state._targetLabel, topo: state.pipeline.spec.topology, sampled, scissor: state._scissor || null, vbOff: vb.offset, vbSize: vb.size, stride, baseVertex: p.baseVertex || 0, firstIndex: p.firstIndex || 0, indexCount: p.indexCount || 0, firstVertex: p.firstVertex, idxs, verts, DT: grab("DynamicTransforms"), P: grab("Projection") });
-  } catch (_e) { /* never let a decode error skip a real draw */ }
-  };
-  const _noteFontDraw = (state, kind, params = null) => {
-    if (!state.pipeline || !state.pipeline.spec) return;
-    const label = state.pipeline.spec.label || "";
-    const fam = shaderFamily(state.pipeline.spec.vertexShader || "");
-    if (fam !== "text" && !/(?:^|[/_])text(?:$|[/_])/.test(label)) return;
-    const sampled = [];
-    for (const [name, resource] of state.resources) {
-      if (resource && resource.kind === "texture" && resource._texEntry) {
-        sampled.push(name + "=" + (resource._texEntry._label || "?"));
-      }
-    }
-    const key = kind + "|" + label + "|" + sampled.join(",");
-    const old = _fontPassStats.get(key);
-    _fontPassStats.set(key, {
-      kind,
-      pipe: label,
-      fam,
-      tgt: state._targetLabel,
-      sampled,
-      params,
-      vertexSlots: state.vertexBuffers.map((slot, index) => slot ? {
-        index,
-        handle: slot._handle,
-        offset: slot.offset,
-        size: slot.size,
-        shadow: Boolean(objects.get(slot._handle)?._shadow)
-      } : null).filter(Boolean),
-      index: state.indexBuffer ? {
-        handle: state.indexBuffer._handle,
-        format: state.indexBuffer.format,
-        shadow: Boolean(objects.get(state.indexBuffer._handle)?._shadow)
-      } : null,
-      count: (old?.count || 0) + 1
-    });
-  };
-
-  const ensureDummies = () => {
-    if (dummyUniform) return;
-    // Must be >= every uniform block the layout may reference (Mojang's Globals
-    // is large); a too-small dummy makes createBindGroup throw, which aborts
-    // ensureBindGroups before setBindGroup and leaves the group unbound.
-    const ubSize = Math.min(device.limits?.maxUniformBufferBindingSize || 65536, 65536);
-    dummyUniform = device.createBuffer({label: "mcweb-dummy-uniform", size: ubSize,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST});
-    dummyStorage = device.createBuffer({label: "mcweb-dummy-storage", size: 16,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST});
-    dummySampler = device.createSampler({magFilter: "linear", minFilter: "linear"});
-    const t = device.createTexture({label: "mcweb-dummy-tex", size: [1, 1, 1],
-      format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST});
-    dummyTexView = t.createView();
-    const depth = device.createTexture({label: "mcweb-dummy-depth", size: [1, 1, 1],
-      format: "depth32float",
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT});
-    dummyDepthView = depth.createView();
-  };
-  const dummyFor = (entry) => {
-    if (entry.buffer) return {resource: {buffer: dummyUniform}};
-    if (entry.sampler) return {resource: dummySampler};
-    // sampled texture OR storage texture (storageTexture) â†’ a texture view
-    return {resource: dummyTexView};
-  };
-
-  // Bind groups are cached for the lifetime of the device, not the render pass.
-  // The signature below names every resource a group binds by *handle*, and
-  // handles come from a monotonic counter that never reuses a number, so an
-  // entry can only ever describe the resources it was built from. A per-pass
-  // Map looked equivalent but was not: this port issues ~84 render passes per
-  // frame on a real server, so every pass started with an empty cache and
-  // re-created every group it bound â€” measured at 9.0% of frame time on
-  // hoplite.gg, 3.4% of it inside createBindGroup itself.
-  //
-  // Keyed by pipeline as well as by signature: two pipelines can want the same
-  // resources under incompatible layouts, and getBindGroupLayout(ng) is a
-  // property of the pipeline. (The per-pass `boundGroups` early-out stays as
-  // it is â€” setPipeline already clears it.)
-  const _bindGroupCache = new Map();
-  const _bindGroupStats = {hit: 0, miss: 0, clears: 0};
-  const _pipelineIds = new WeakMap();
-  let _pipelineIdSeq = 0;
-  const pipelineId = (pipeline) => {
-    let id = _pipelineIds.get(pipeline);
-    if (id === undefined) {
-      id = ++_pipelineIdSeq;
-      _pipelineIds.set(pipeline, id);
-    }
-    return id;
-  };
-  // Destroyed resources keep their (never-reissued) handles, so a stale entry
-  // is unreachable rather than wrong; the only cost is retention. Cap it â€”
-  // but well above the live working set, which is larger than it looks: a UBO
-  // ring cycles 256 slot offsets and each offset is its own signature, so a
-  // handful of pipelines reach several thousand entries. At 8192 the cache
-  // cleared 8 times in a 24 s window and re-created what it had just evicted.
-  const BIND_GROUP_CACHE_LIMIT = 32768;
-  // Bisect control, matching mcweb_mesh_pace / mcweb_uncapped: `pass` restores
-  // the old per-render-pass cache lifetime for an A/B against this one.
-  const _bindGroupCacheScope =
-    new URLSearchParams(location.search).get("mcweb_bindgroup_cache") === "pass"
-      ? "pass" : "device";
-
-  // What remains of this function's cost is building the per-draw signature
-  // string, ~5% of frame time at ~525 draws/frame. An early-out keyed on "did
-  // any binding actually change since the last draw" was tried and measured no
-  // difference (4.67% -> 4.99%): Minecraft sets a uniform offset from its UBO
-  // ring on essentially every draw, so the early-out never fires. The cost is
-  // Minecraft's rebinding rate, not bookkeeping here.
-  const ensureBindGroups = (state) => {
-    ensureDummies();
-    const spec = state.pipeline.spec;
-    const groups = spec.bindGroups || [];
-    const groupRemap = state.pipeline.groupRemap || groups.map((g, i) => ({ng: i, baseU: 0, baseS: 0}));
-    const groupCount = state.pipeline.groupCount || groups.length;
-    // Per-original-group sampler binding base (samplers laid after the group's
-    // uniforms; see buildPipeline). Fallback recomputes the same offset if the
-    // pipeline predates the field.
-    const samplerBases = state.pipeline.samplerBases || groups.map((g, gi) => {
-      let nu = 0; groups.forEach((gg, ggi) => { if (groupRemap[ggi].ng === groupRemap[gi].ng) nu += gg.uniforms.length; });
-      return Math.max(groupRemap[gi].baseS, nu);
-    });
-    const layout = state.pipeline.pipeline;
-    // Drive binding from the SPEC + remap (the authoritative set of bindings â€”
-    // the same data that built the pipeline layout and the WGSL). We do NOT rely
-    // on getBindGroupLayout(n).entries, which is empty/unavailable on some
-    // Chromium builds and previously caused every group to be skipped â†’ "No bind
-    // group at group index 0" validation â†’ Mojang's Java throws â†’ pump dies.
-    // For each merged group we emit EVERY binding the layout expects; a slot
-    // whose real resource isn't bound yet gets a type-matched dummy so the group
-    // is always complete and ALWAYS bound.
-    // Texture binds Mojang issued this draw that did NOT match any spec sampler
-    // name â€” used as a positional fallback (bind order â†’ sampler-slot order) so
-    // textured draws sample the real atlas even when the bind name differs from
-    // the spec's sampler name (which would otherwise yield the black dummy).
-    const matchedTex = new Set();
-    for (const g of groups) for (const s of g.samplers) {
-      const b = state.resources.get(s);
-      if (b && b.kind === "texture") matchedTex.add(b);
-    }
-    const unmatchedTex = state.drawTexBinds.filter((t) => !matchedTex.has(t));
-    let unmatchedCursor = 0;
-    for (let ng = 0; ng < groupCount; ng++) {
-      const entries = [];
-      const signatureParts = [];
-      let hasAny = false;
-      groups.forEach((group, gi) => {
-        const r = groupRemap[gi];
-        if (r.ng !== ng) return;
-        group.uniforms.forEach((uniformDesc, ui) => {
-          hasAny = true;
-          const binding = r.baseU + ui;
-          const bound = state.resources.get(uniformDesc.name);
-          if (bound && bound.kind === "uniform") {
-            // WebGPU enforces the std140 rule that a uniform struct's bound
-            // range be >= its shader-declared size (padded to a multiple of
-            // the struct's base alignment: 16 with a mat4). Mojang's
-            // Std140SizeCalculator returns AND allocates at the UN-rounded
-            // size (SpriteAnimationInfo slice = 140 vs the 144 the shader
-            // needs; Globals buffer = 56 vs 64). So:
-            //   * a slice too small for the shader  -> "bound with size 140
-            //     ... too small ... requires 144" (atlas blits dropped);
-            //   * rounding the range to 16 overruns the un-rounded BUFFER
-            //     (Globals 56->64 > 56) -> createBindGroup fails -> the whole
-            //     submit cascades as "Invalid BindGroup ... invalid due to a
-            //     previous error" and the screen goes black.
-            // The one boundary that is ALWAYS safe is the per-slot packing
-            // stride: Mojang lays UBO slots out at
-            // roundToward(size, minUniformOffsetAlignment=256), so every slot
-            // (and, for the last, the run to the buffer end) has >=256 B of
-            // room, which always covers the WGSL-aligned struct (<=144) and
-            // never reads past real data (std140 member offsets are < the
-            // un-rounded size). Round the bound range up to 256, capped at the
-            // buffer so we can never exceed it.
-            const ubound = Math.min((bound.size + 255) & ~255, bound.bufferSize - bound.offset);
-            entries.push({binding, resource: {buffer: bound.buffer, offset: bound.offset, size: ubound}});
-            signatureParts.push(`${binding}:u:${bound.bufferHandle}:${bound.offset}:${ubound}`);
-          } else {
-            const dummy = uniformDesc.type === "TEXEL_BUFFER" ? dummyStorage : dummyUniform;
-            entries.push({binding, resource: {buffer: dummy}});
-            signatureParts.push(`${binding}:${uniformDesc.type === "TEXEL_BUFFER" ? "sD" : "uD"}`);
-          }
-        });
-        group.samplers.forEach((samplerName, si) => {
-          hasAny = true;
-          const base = samplerBases[gi] + si * 2;
-          let bound = state.resources.get(samplerName);
-          if (!(bound && bound.kind === "texture") && unmatchedCursor < unmatchedTex.length) {
-            // Name miss â†’ fall back to the next bind-order texture that no spec
-            // sampler claimed by name.
-            bound = unmatchedTex[unmatchedCursor++];
-            if (!buildPipeline._loggedTexFallback) {
-              buildPipeline._loggedTexFallback = new Set();
-            }
-            const fk = `${spec.label}|${samplerName}`;
-            if (!buildPipeline._loggedTexFallback.has(fk)) {
-              buildPipeline._loggedTexFallback.add(fk);
-              console.warn(`[tex-fallback] ${spec.label}: sampler "${samplerName}" not in resources by name; used positional bind (drawTexBinds). Bind names this draw may differ from spec sampler names.`);
-            }
-          }
-          if (bound && bound.kind === "texture") {
-            entries.push({binding: base, resource: bound.sampler});
-            entries.push({binding: base + 1, resource: bound.view});
-            signatureParts.push(`${base}:s:${bound.samplerHandle}`, `${base + 1}:t:${bound.viewHandle}`);
-            if (bound._texEntry) { _sampledThisFrame.add(bound._texEntry); _sampledEntries.add(bound._texEntry); } // DIAG
-          } else {
-            entries.push({binding: base, resource: dummySampler});
-            entries.push({binding: base + 1,
-              resource: isDepthSamplerName(samplerName) ? dummyDepthView : dummyTexView});
-            signatureParts.push(`${base}:sD`, `${base + 1}:tD`);
-          }
-        });
-      });
-      if (!hasAny) continue; // genuinely empty group (e.g. a globals-only remap target with nothing) â†’ no layout entry â†’ nothing to bind
-      const signature = `${pipelineId(layout)}|${ng}|${signatureParts.join(",")}`;
-      if (state.boundGroups[ng] === signature) continue;
-      const cache = _bindGroupCacheScope === "pass"
-        ? (state.bindGroupCache ||= new Map()) : _bindGroupCache;
-      let bindGroup = cache.get(signature);
-      if (!bindGroup) {
-        _bindGroupStats.miss++;
-        bindGroup = device.createBindGroup({
-          label: `${spec.label}:bind${ng}`,
-          layout: layout.getBindGroupLayout(ng),
-          entries
-        });
-        if (cache.size >= BIND_GROUP_CACHE_LIMIT) {
-          cache.clear();
-          _bindGroupStats.clears++;
-        }
-        cache.set(signature, bindGroup);
-      } else {
-        _bindGroupStats.hit++;
-      }
-      state.pass.setBindGroup(ng, bindGroup);
-      state.boundGroups[ng] = signature;
-    }
-  };
-
-  // Largest buffer that gets a diagnostic CPU mirror; see createBuffer.
-  const SHADOW_LIMIT = 8 * 1024 * 1024;
-
-  // DIAG: terrain draws. Sections are drawn out of the shared 128 MiB
-  // "UberBuffer" allocations, so a draw whose slot-0 vertex buffer is that
-  // large is chunk geometry. Terrain currently compiles renderable meshes
-  // (visRenderable > 0) and issues indexed draws with no WebGPU validation
-  // error, yet nothing appears â€” so the question is whether the draw
-  // parameters and buffer bindings addressing that shared buffer are sane.
-  // Queryable via globalThis.mcWebGpu._terrainDraws.
-  // A census keyed by pipeline label: how many draws each pipeline issued, how
-  // many were dropped because no pipeline was bound, and the largest slot-0
-  // vertex buffer it drew from. Chunk geometry lives in the 128 MiB
-  // "UberBuffer" allocations, so a terrain pipeline should show a maxVb in that
-  // range; a terrain label that never appears at all means its draws are being
-  // dropped upstream, which is silent in both the Java and JS layers.
-  // Bytes reaching each buffer, by label. Terrain geometry lands in the
-  // "UberBuffer *" allocations; if those show zero bytes in, the sections are
-  // meshed and drawn but the GPU buffer is still empty, which is silent (no
-  // validation error, correct-looking draw parameters, nothing on screen).
-  // Uniform-buffer content probes (?mcweb_gpu_probe=1).
-  //
-  // Small uniform buffers are created UNIFORM|COPY_DST with no COPY_SRC, so a
-  // copyBufferToBuffer readback of them is invalid and silently yields zeros â€”
-  // which reads exactly like "the uniform is zero". Recording what is written
-  // is the only way to see the value the shader sees, and the atlas and
-  // AutoStorageIndexBuffer investigations both needed it.
-  //
-  // It must not be on by default. Every UBO slot is <= 256 B, so the "watched"
-  // branch fired on essentially every uniform upload and cost a slice plus two
-  // typed-array materializations plus a rounding map â€” on the hot path of a
-  // frame that already uploads ~500 KB.
-  const _gpuProbe = new URLSearchParams(location.search).has("mcweb_gpu_probe");
-  const noteUniformProbe = (entry, handle, destinationOffset, bytes, byteLength) => {
-    if (!entry) return;
-    if (/Auto Storage/i.test(entry._label || "")) {
-      const record = (globalThis.mcWebGpu._autoIndexWrites ||= {
-        writeBuffer: 0, bytes: 0, copies: 0, handles: {}
-      });
-      record.writeBuffer++;
-      record.bytes += byteLength;
-      // Keyed by handle, not label: AutoStorageIndexBuffer grows by creating a
-      // NEW buffer, so "the label was written" can be true while the instance
-      // the draw binds was never touched.
-      const key = String(handle);
-      record.handles[key] = (record.handles[key] || 0) + 1;
-    }
-    if (entry.size <= 256) {
-      const copy = bytes.slice(0, Math.min(64, bytes.length));
-      const record = {
-        offset: destinationOffset,
-        floats: Array.from(new Float32Array(copy.buffer, 0, copy.byteLength >> 2))
-          .map((x) => Math.round(x * 10000) / 10000),
-        ints: Array.from(new Int32Array(copy.buffer, 0, copy.byteLength >> 2))
-      };
-      const key = (entry._label || "?") + "#" + handle;
-      (globalThis.mcWebGpu._smallBufferWrites ||= {})[key] = record;
-      // Keep the first few writes as well as the last. "Never written
-      // correctly" and "written correctly then clobbered" need opposite
-      // fixes, and only the last write was being retained.
-      const history = (globalThis.mcWebGpu._smallBufferWriteHistory ||= {});
-      const list = (history[key] ||= []);
-      if (list.length < 6) list.push(record);
-      record.seq = (history[key + "#count"] = (history[key + "#count"] || 0) + 1);
-    }
-  };
-
-  const _noteBytes = (entry, kind, bytes) => {
-    if (!entry || !(bytes > 0)) return;
-    const io = (globalThis.mcWebGpu._bufferIo ||= {});
-    const row = (io[entry._label ?? "<unlabelled>"] ||= {write: 0, copy: 0, size: entry.size});
-    row[kind] += bytes;
-  };
-
-  // Bounded evidence for the real vanilla cloud path. The cloud vertex shader
-  // has no vertex buffer: each indexed draw expands three CloudFaces bytes
-  // per quad and combines CloudInfo with the regular Projection / transform
-  // UBOs. A draw count alone therefore cannot distinguish real cloud geometry
-  // from an empty or mis-bound storage buffer. Capture one small, serialisable
-  // sample while continuing to count every attempted/executed draw.
-  const _uniformFloatSample = (state, name, count) => {
-    const bound = state.resources.get(name);
-    if (bound?.kind !== "uniform") return null;
-    const entry = objects.get(bound.bufferHandle);
-    const shadow = entry?._shadow;
-    if (!shadow) return null;
-    const byteLength = Math.min(bound.size, count * 4,
-      Math.max(0, shadow.byteLength - bound.offset));
-    if (byteLength < 4) return null;
-    const view = new DataView(shadow.buffer,
-      (shadow.byteOffset || 0) + bound.offset, byteLength);
-    return Array.from({length: Math.floor(byteLength / 4)},
-      (_, index) => view.getFloat32(index * 4, true));
-  };
-
-  const _cloudFacesSample = (state, indexCount) => {
-    const bound = state.resources.get("CloudFaces");
-    if (bound?.kind !== "uniform") return null;
-    const entry = objects.get(bound.bufferHandle);
-    const shadow = entry?._shadow;
-    if (!shadow) {
-      return {
-        label: entry?._label ?? null,
-        bufferSize: entry?.size ?? null,
-        boundOffset: bound.offset,
-        boundSize: bound.size,
-        shadowed: false
-      };
-    }
-    const boundBytes = Math.min(bound.size,
-      Math.max(0, shadow.byteLength - bound.offset));
-    // Six indices address four vertices for each quad; R8_SINT consumes exactly
-    // three signed bytes. Report those logical texels, not the host's padded
-    // u32 storage words, so the sample proves the shader-visible data.
-    const requiredValues = Math.ceil(Math.max(0, indexCount) / 6) * 3;
-    const scannedValues = Math.min(requiredValues, boundBytes);
-    const view = new Uint8Array(shadow.buffer,
-      (shadow.byteOffset || 0) + bound.offset, scannedValues);
-    const firstValues = [];
-    let nonzeroValues = 0;
-    for (let index = 0; index < scannedValues; index++) {
-      const byte = view[index];
-      const value = byte < 128 ? byte : byte - 256;
-      if (value !== 0) nonzeroValues++;
-      if (index < 24) firstValues.push(value);
-    }
-    return {
-      label: entry?._label ?? null,
-      bufferSize: entry?.size ?? null,
-      boundOffset: bound.offset,
-      boundSize: bound.size,
-      shadowed: true,
-      format: "R8_SINT",
-      requiredValues,
-      scannedValues,
-      nonzeroValues,
-      firstValues
-    };
-  };
-
-  const _isCloudPipelineLabel = (label) =>
-    /(?:pipeline\/(?:flat_)?clouds|rendertype_clouds)/i.test(label);
-
-  const _noteCloudDraw = (state, params, executed) => {
-    const label = state.pipeline?.spec?.label ?? "";
-    if (!_isCloudPipelineLabel(label)) return;
-    const report = (globalThis.mcWebGpu._cloudDraws ||= {
-      attemptedDraws: 0,
-      executedDraws: 0,
-      suppressedDraws: 0,
-      totalIndices: 0,
-      maxIndexCount: 0,
-      firstTick: null,
-      lastTick: null,
-      sample: null
-    });
-    report.attemptedDraws++;
-    if (executed) {
-      report.executedDraws++;
-      report.totalIndices += params.indexCount;
-      report.maxIndexCount = Math.max(report.maxIndexCount, params.indexCount);
-    } else {
-      report.suppressedDraws++;
-    }
-    const tick = globalThis.mcWebPump?.ticks ?? 0;
-    if (report.firstTick === null) report.firstTick = tick;
-    report.lastTick = tick;
-    if (executed && !report.sample) {
-      report.sample = {
-        pipeline: label,
-        target: state._targetLabel,
-        targetWH: state._targetWH,
-        depthFormat: state.depthFormat,
-        topology: state.pipeline?.spec?.topology ?? null,
-        cull: state.pipeline?.spec?.cull ?? null,
-        indexCount: params.indexCount,
-        instanceCount: params.instanceCount,
-        cloudFaces: _cloudFacesSample(state, params.indexCount),
-        cloudInfo: _uniformFloatSample(state, "CloudInfo", 11),
-        dynamicTransforms: _uniformFloatSample(state, "DynamicTransforms", 16),
-        projection: _uniformFloatSample(state, "Projection", 16),
-        fog: _uniformFloatSample(state, "Fog", 10)
-      };
-    }
-  };
-
-  const _noteDraw = (state, kind, params) => {
-    const census = (globalThis.mcWebGpu._drawCensus ||= {});
-    const label = state.pipeline?.spec?.label ?? "<no-pipeline>";
-    const row = (census[label] ||= {draws: 0, maxVb: 0, kinds: {}, sample: null,
-                                    firstTick: null, lastTick: null});
-    row.draws++;
-    // Frame numbers bracket the activity. A pipeline whose draws stop early
-    // while the Java side still reports visible, renderable sections means the
-    // geometry is being dropped between LevelRenderer and the render pass.
-    const tick = globalThis.mcWebPump?.ticks ?? 0;
-    if (row.firstTick === null) row.firstTick = tick;
-    row.lastTick = tick;
-    row.kinds[kind] = (row.kinds[kind] || 0) + 1;
-    const slot0 = state.vertexBuffers[0];
-    const vb = slot0 ? objects.get(slot0._handle) : null;
-    if (vb && vb.size > row.maxVb) {
-      row.maxVb = vb.size;
-      row.vbLabel = vb._label;
-    }
-    // Which textures this pipeline samples, and whether they ever received
-    // pixel data. Terrain that draws thousands of valid triangles but shows
-    // nothing is equally consistent with an atlas that uploaded blank.
-    if (!row.textures && state.resources && state.resources.size) {
-      row.textures = [];
-      for (const [name, rec] of state.resources) {
-        if (rec?.kind !== "texture") continue;
-        const te = rec._texEntry;
-        row.textures.push({
-          bound: name,
-          handle: rec.viewHandle,
-          texHandle: te?._hid ?? null,
-          label: te?._label ?? null,
-          wh: te ? `${te.width}x${te.height}` : null,
-          uploads: te?._uploads ?? 0
-        });
-      }
-    }
-    if (!row.sample && vb && vb.size > SHADOW_LIMIT) {
-      const ib = state.indexBuffer ? objects.get(state.indexBuffer._handle) : null;
-      row.sample = {
-        ...params,
-        vbOffset: slot0.offset, vbSize: slot0.size, vbTotal: vb.size,
-        ibLabel: ib?._label ?? null, ibTotal: ib?.size ?? null,
-        ibFormat: state.indexBuffer?.format ?? null
-      };
-    }
-  };
-
-  const applyVertexAndIndex = (state) => {
-    const spec = state.pipeline.spec;
-    if (spec.vertexFormats) {
-      spec.vertexFormats.forEach((vf, slot) => {
-        const bound = state.vertexBuffers[slot];
-        if (bound) {
-          state.pass.setVertexBuffer(slot, bound.buffer, bound.offset, bound.size);
-        }
-      });
-    }
-    if (state.indexBuffer) {
-      state.pass.setIndexBuffer(state.indexBuffer.buffer, state.indexBuffer.format);
-    }
-  };
-
-  const needsLowering = (state) => {
-    const topology = state.pipeline.spec.topology;
-    return topology === "QUADS" || topology === "TRIANGLE_FAN";
-  };
-
-  // ---------------------------------------------------------------------------
-  // On-screen frame graph (?mcweb_framegraph=1)
-  // ---------------------------------------------------------------------------
-  // A visual frame-time strip for live playtesting: one column per client
-  // frame (height = frame ms, 16.7 ms line drawn), one row of squares for
-  // server pump advances (green = tick landed, dark = pump ran without a
-  // tick), and a numeric readout. Stalls read as spikes; a 2 Hz server reads
-  // as a sparse green row. Opt-in so normal runs carry zero cost.
-  const _frameGraph = (() => {
-    const enabled = new URLSearchParams(location.search).has("mcweb_framegraph");
-    if (!enabled) return {
-      push() {}, pushServer() {}, reset() {},
-      report() { return { error: "frame graph off; load with ?mcweb_framegraph=1" }; },
-      enabled: false
-    };
-    const N = 240;
-    // Main bars use frame-start cadence: that is what the player experiences,
-    // and it exposes pauses which occur between Java callbacks (GC, browser
-    // scheduling, GPU back-pressure). With VSync this is rAF-to-rAF; uncapped
-    // mode uses yielding task starts. Cyan ticks retain callback execution
-    // duration so a tall bar can still be attributed at a glance.
-    const frames = new Float32Array(N); // rendered-frame start cadence ms
-    const callbackFrames = new Float32Array(N); // Java callback duration ms
-    const serverDeltas = new Uint8Array(N); // ticks advanced in this frame window
-    // Server-side pump timing from the Worker (pump-stats messages): per
-    // pump-call duration and the gap between pump starts. Big durations =
-    // slow server ticks; big gaps with small durations = a starved Worker
-    // event loop. Both read as the user-visible gameplay delay.
-    const SN = 240;
-    const serverDur = new Float32Array(SN);
-    const serverGap = new Float32Array(SN);
-    let serverHead = 0;
-    let lastServerDur = 0;
-    let worstServerGap = 0;
-    let head = 0;
-    let pendingTicks = 0;
-    let lastTickCount = -1;
-    let canvasEl = null;
-    let labelEl = null;
-    let lastDraw = 0;
-    let lastFrameMs = 0;
-    let lastRafGapMs = 0;
-    let visibleOver33 = 0;
-    let visibleOver100 = 0;
-    const MAX_MS = 250; // vertical scale cap
-    // The visible strip is deliberately short, but QA needs a long enough raw
-    // history to catch intermittent stutters without enabling ?mcweb_perf=1.
-    // That profiler wraps every host method and materially lowers FPS, whereas
-    // these two opt-in typed-array writes do not change the Minecraft/host seam.
-    // Retain a complete 30-second acceptance window even at Minecraft's
-    // 260/unlimited setting (7,800 frames), with room for scheduling jitter.
-    const HN = 12000;
-    const frameHistory = new Float32Array(HN);
-    const rafGapHistory = new Float32Array(HN);
-    let historyHead = 0;
-    let historyCount = 0;
-    // When each hitch happened, not just how many there were. A stutter with a
-    // regular period is a periodic *task*, and its period names the culprit â€”
-    // a 2.0 s spacing led straight to the storage sync. Counts alone cannot
-    // distinguish that from scattered jitter.
-    const HITCH_MS = 33;
-    const hitchTimes = [];
-
-    /**
-     * Spacing between consecutive hitches. A tight median with a small spread
-     * means something periodic is running on the frame thread; `periodicity` is
-     * the fraction of gaps within 25% of the median, so a caller can tell "one
-     * task every 2 s" from "jitter that averages 2 s".
-     */
-    const hitchSpacing = () => {
-      const gaps = [];
-      for (let i = 1; i < hitchTimes.length; i++) gaps.push(hitchTimes[i].t - hitchTimes[i - 1].t);
-      if (!gaps.length) {
-        return {count: hitchTimes.length, gaps: [], medianGapMs: 0, periodicity: 0,
-          events: hitchTimes.slice(0, 40)};
-      }
-      const sorted = [...gaps].sort((a, b) => a - b);
-      const median = sorted[sorted.length >> 1];
-      const near = gaps.filter((g) => Math.abs(g - median) <= median * 0.25).length;
-      return {
-        count: hitchTimes.length,
-        medianGapMs: median,
-        periodicity: Math.round(near / gaps.length * 100) / 100,
-        gaps: gaps.slice(0, 40),
-        events: hitchTimes.slice(0, 40)
-      };
-    };
-
-    const historyValues = (source, positiveOnly = false) => {
-      const out = [];
-      const start = (historyHead - historyCount + HN) % HN;
-      for (let i = 0; i < historyCount; i++) {
-        const value = source[(start + i) % HN];
-        if (!positiveOnly || value > 0) out.push(value);
-      }
-      return out;
-    };
-
-    const summary = (values) => {
-      if (!values.length) return { mean: 0, p50: 0, p95: 0, p99: 0, max: 0 };
-      const sorted = [...values].sort((a, b) => a - b);
-      const at = (p) => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))];
-      const round = (value) => Math.round(value * 100) / 100;
-      return {
-        mean: round(values.reduce((a, b) => a + b, 0) / values.length),
-        p50: round(at(0.50)),
-        p95: round(at(0.95)),
-        p99: round(at(0.99)),
-        max: round(sorted[sorted.length - 1])
-      };
-    };
-
-    const ensureDom = () => {
-      if (canvasEl) return;
-      canvasEl = document.createElement("canvas");
-      canvasEl.width = N * 2;
-      canvasEl.height = 132;
-      canvasEl.style.cssText = "position:fixed;left:8px;top:8px;z-index:9999;"
-        + "background:rgba(0,0,0,0.55);border:1px solid #555;pointer-events:none;";
-      document.body.appendChild(canvasEl);
-      labelEl = document.createElement("div");
-      labelEl.style.cssText = "position:fixed;left:8px;top:144px;z-index:9999;"
-        + "color:#9f9;font:11px monospace;pointer-events:none;white-space:pre;";
-      document.body.appendChild(labelEl);
-    };
-
-    const draw = (nowMs) => {
-      if (nowMs - lastDraw < 100) return; // 10 Hz redraw keeps cost negligible
-      lastDraw = nowMs;
-      ensureDom();
-      const ctx = canvasEl.getContext("2d");
-      const W = canvasEl.width, H = canvasEl.height;
-      const graphH = 88, serverY = 94, durY = 106, gapY = 120;
-      ctx.clearRect(0, 0, W, H);
-      // 16.7 ms reference line (60 FPS).
-      const yOf = (ms) => graphH - Math.min(ms, MAX_MS) / MAX_MS * graphH;
-      ctx.strokeStyle = "#3a6";
-      ctx.beginPath();
-      const ref = yOf(16.7);
-      ctx.moveTo(0, ref); ctx.lineTo(W, ref); ctx.stroke();
-      // Frame bars.
-      for (let i = 0; i < N; i++) {
-        const idx = (head + i) % N;
-        const ms = frames[idx];
-        if (ms <= 0) continue;
-        const x = i * 2;
-        ctx.fillStyle = ms > 100 ? "#e44" : ms > 33 ? "#ea3" : "#5c8";
-        ctx.fillRect(x, yOf(ms), 2, graphH - yOf(ms));
-        const callbackMs = callbackFrames[idx];
-        if (callbackMs > 0) {
-          ctx.fillStyle = "#5cf";
-          ctx.fillRect(x, yOf(callbackMs), 2, 1);
-        }
-        // Server tick advance in this frame window: green square below.
-        ctx.fillStyle = serverDeltas[idx] > 0 ? "#3f6" : "#222";
-        ctx.fillRect(x, serverY, 2, 8);
-      }
-      // Server pump durations (bars rising from durY) and gaps between pump
-      // starts (bars rising from gapY): the attribution for delayed gameplay.
-      for (let i = 0; i < SN; i++) {
-        const idx = (serverHead + i) % SN;
-        const x = i * 2;
-        const d = serverDur[idx];
-        if (d > 0) {
-          ctx.fillStyle = d > 100 ? "#e44" : d > 33 ? "#ea3" : "#69d";
-          const h = Math.max(1, 10 * Math.min(d, MAX_MS) / MAX_MS);
-          ctx.fillRect(x, durY + 10 - h, 2, h);
-        }
-        const g = serverGap[idx];
-        if (g > 0) {
-          ctx.fillStyle = g > 100 ? "#e44" : g > 60 ? "#ea3" : "#244";
-          const h = Math.max(1, 8 * Math.min(g, MAX_MS) / MAX_MS);
-          ctx.fillRect(x, gapY + 8 - h, 2, h);
-        }
-      }
-    };
-
-    const refreshLabel = () => {
-      const server = globalThis.mcWebServer;
-      const info = server?.info?.() ?? {};
-      const fpsNow = lastRafGapMs > 0
-        ? Math.min(999, Math.round(1000 / lastRafGapMs)) : 0;
-      labelEl.textContent =
-        `frame ${globalThis.mcWebPump?.pacing?.().scheduler ?? "?"}`
-        + ` ${Math.round(lastRafGapMs * 10) / 10}ms (~${fpsNow}fps)`
-        + ` callback ${Math.round(lastFrameMs * 10) / 10}ms`
-        + `  recent >33=${visibleOver33} >100=${visibleOver100}`
-        + `  serverTick=${info.tickCount ?? "?"} inQ=${info.inboundQueued ?? "?"}`
-        + `  serverPump ${lastServerDur}ms gap ${worstServerGap}ms`
-        + `  state=${info.state ?? "?"}`;
-    };
-
-    return {
-      enabled: true,
-      push(frameMs, rafGapMs = 0) {
-        // Captured before lastFrameMs is reassigned below: the gap being
-        // recorded ended with THIS callback, so the callback that ran before it
-        // is the one that could have overrun into it.
-        const previousCallbackMs = lastFrameMs;
-        const cadenceMs = rafGapMs > 0 ? rafGapMs : frameMs;
-        if (frames[head] > 33) visibleOver33--;
-        if (frames[head] > 100) visibleOver100--;
-        frames[head] = cadenceMs;
-        callbackFrames[head] = frameMs;
-        if (cadenceMs > 33) visibleOver33++;
-        if (cadenceMs > 100) visibleOver100++;
-        lastFrameMs = frameMs;
-        if (rafGapMs > 0) lastRafGapMs = rafGapMs;
-        frameHistory[historyHead] = frameMs;
-        rafGapHistory[historyHead] = rafGapMs;
-        if (rafGapMs > HITCH_MS && hitchTimes.length < 4096) {
-          // Record the callback cost alongside the gap. The two together say
-          // where the hitch lives without any profiling: a gap that matches its
-          // callback is Java work inside the frame, while a gap much larger
-          // than its callback is time spent *between* callbacks â€” GC, browser
-          // scheduling, or GPU back-pressure â€” and those have different fixes.
-          // `frameMs` is the callback that ran at the END of this gap; the one
-          // that preceded it is the more likely culprit, so keep both.
-          hitchTimes.push({
-            t: Math.round(performance.now()),
-            gapMs: Math.round(rafGapMs * 10) / 10,
-            callbackMs: Math.round(frameMs * 10) / 10,
-            prevCallbackMs: Math.round(previousCallbackMs * 10) / 10
-          });
-        }
-        historyHead = (historyHead + 1) % HN;
-        historyCount = Math.min(HN, historyCount + 1);
-        // Sample the server pump counter once per client frame: the delta is
-        // how many server ticks advanced inside this frame window.
-        const server = globalThis.mcWebServer;
-        const count = server?.info?.()?.tickCount;
-        if (typeof count === "number") {
-          if (lastTickCount >= 0) pendingTicks += Math.max(0, count - lastTickCount);
-          lastTickCount = count;
-        }
-        serverDeltas[head] = pendingTicks;
-        pendingTicks = 0;
-        head = (head + 1) % N;
-        const now = performance.now();
-        draw(now);
-        refreshLabel();
-      },
-      pushServer(samples) {
-        // Each sample is [durationMs, gapMs] for one pump call; the gap is
-        // the time since the previous pump start on the Worker event loop.
-        for (const pair of samples) {
-          serverDur[serverHead] = Number(pair[0]) || 0;
-          serverGap[serverHead] = Number(pair[1]) || 0;
-          if (serverDur[serverHead] > 0) lastServerDur = serverDur[serverHead];
-          if (serverGap[serverHead] > worstServerGap) worstServerGap = serverGap[serverHead];
-          serverHead = (serverHead + 1) % SN;
-        }
-        worstServerGap *= 0.9; // decay so stale spikes fade from the label
-      },
-      reset() {
-        historyHead = 0;
-        historyCount = 0;
-        frames.fill(0);
-        callbackFrames.fill(0);
-        serverDeltas.fill(0);
-        head = 0;
-        pendingTicks = 0;
-        visibleOver33 = 0;
-        visibleOver100 = 0;
-        serverDur.fill(0);
-        serverGap.fill(0);
-        serverHead = 0;
-        lastServerDur = 0;
-        worstServerGap = 0;
-        hitchTimes.length = 0;
-      },
-      report() {
-        const callbackMs = historyValues(frameHistory);
-        const rafGapMs = historyValues(rafGapHistory, true);
-        const gaps = summary(rafGapMs);
-        const nonzeroServerDur = [...serverDur].filter((x) => x > 0);
-        const nonzeroServerGap = [...serverGap].filter((x) => x > 0);
-        return {
-          enabled: true,
-          pacing: globalThis.mcWebPump?.pacing?.() ?? null,
-          samples: callbackMs.length,
-          fps: gaps.mean > 0 ? Math.round(100000 / gaps.mean) / 100 : 0,
-          callbackMs: summary(callbackMs),
-          rafGapMs: {
-            ...gaps,
-            over33: rafGapMs.filter((x) => x > 33).length,
-            over50: rafGapMs.filter((x) => x > 50).length,
-            over100: rafGapMs.filter((x) => x > 100).length,
-            over250: rafGapMs.filter((x) => x > 250).length
-          },
-          serverPumpDurationMs: summary(nonzeroServerDur),
-          serverPumpGapMs: summary(nonzeroServerGap),
-          hitches: hitchSpacing()
-        };
-      },
-    };
-  })();
-
-  // ---------------------------------------------------------------------------
-  // Frame pump and host API
-  // ---------------------------------------------------------------------------
-
-  globalThis.mcWebPump = {
-    callback: null,
-    running: false,
-    ticks: 0,        // JS-side: how many times the frame callback was entered
-    lastMs: 0,       // duration (ms) of the most recent callback
-    slow: 0,         // count of callbacks that took > 1500ms (a hang signature)
-    vsync: !new URLSearchParams(location.search).has("mcweb_uncapped"),
-    targetFps: Math.max(1, Math.min(260,
-      Number(new URLSearchParams(location.search).get("mcweb_max_fps")) || 260)),
-    _nextDueMs: 0,
-    _postTaskUnavailable: false,
-    _skippedPeriods: 0,
-    _firstFrameFallbacks: 0,
-    _wakeFirst: null,
-    configure(vsync, frameLimit) {
-      const params = new URLSearchParams(location.search);
-      const forcedUncapped = params.has("mcweb_uncapped");
-      const forcedLimit = Number(params.get("mcweb_max_fps"));
-      const nextVsync = forcedUncapped ? false : Boolean(vsync);
-      const nextLimit = Math.max(1, Math.min(260,
-        Number.isFinite(forcedLimit) && forcedLimit > 0 ? forcedLimit : Number(frameLimit) || 260));
-      if (this.vsync === nextVsync && this.targetFps === nextLimit) return;
-      this.vsync = nextVsync;
-      this.targetFps = nextLimit;
-      this._nextDueMs = 0;
-      this._skippedPeriods = 0;
-    },
-    _schedulerName() {
-      if (this.vsync) return "requestAnimationFrame";
-      return !this._postTaskUnavailable
-          && typeof globalThis.scheduler?.postTask === "function"
-        ? "scheduler.postTask"
-        : "timer";
-    },
-    pacing() {
-      return {
-        scheduler: this._schedulerName(),
-        vsync: this.vsync,
-        targetFps: this.targetFps,
-        skippedPeriods: this._skippedPeriods,
-        firstFrameFallbacks: this._firstFrameFallbacks
-      };
-    },
-    _schedule(loop) {
-      if (this.vsync) {
-        requestAnimationFrame(loop);
-        return;
-      }
-
-      // Minecraft's desktop limiter treats 260 as "unlimited". Carrying that
-      // literally into a MessageChannel pump let a cheap sky frame repost as
-      // fast as the browser could drain tasks (999+ FPS), starving input and
-      // doing render work the display could never present. In the browser 260
-      // is a real safety ceiling. scheduler.postTask retains the sub-4 ms
-      // capacity that nested setTimeout cannot provide, while its delayed,
-      // user-visible task yields to input and schedules exactly one frame.
-      const now = performance.now();
-      const interval = 1000 / this.targetFps;
-      if (!(this._nextDueMs > 0)) {
-        this._nextDueMs = now;
-      }
-      const due = this._nextDueMs;
-      const delay = Math.max(0, due - now);
-      const fire = () => {
-        const fired = performance.now();
-        let nextDue = due + interval;
-        // A hidden tab, GC pause, or long Java frame must not leave hundreds
-        // of expired callbacks to catch up. Advance to the first future slot
-        // and run Minecraft once; later frames resume from that deadline.
-        if (fired >= nextDue) {
-          const skipped = Math.floor((fired - nextDue) / interval) + 1;
-          this._skippedPeriods += skipped;
-          nextDue += skipped * interval;
-        }
-        this._nextDueMs = nextDue;
-        loop(fired);
-      };
-
-      if (!this._postTaskUnavailable
-          && typeof globalThis.scheduler?.postTask === "function") {
-        try {
-          globalThis.scheduler.postTask(fire, {priority: "user-visible", delay});
-          return;
-        } catch (error) {
-          this._postTaskUnavailable = true;
-          console.warn("scheduler.postTask unavailable; using timer pacing:", error);
-        }
-      }
-      setTimeout(fire, delay);
-    },
-    register(callback) {
-      this.callback = callback;
-      this._lastRafTimestamp = null;
-      if (this.running) return;
-      this.running = true;
-      const loop = (frameTimestamp) => {
-        const cb = this.callback;
-        if (cb) {
-          if (!firstRafRecorded) {
-            firstRafRecorded = true;
-            markPhase("first-raf-entered");
-          }
-          // Apply a pending window resize here rather than in the DOM event, so
-          // Minecraft rebuilds its render targets between frames instead of
-          // underneath one that is already recording commands.
-          globalThis.mcWebCanvas.applyPendingResize();
-          this.ticks++;
-          if (_DBG && (this.ticks <= 3 || this.ticks % 60 === 0)) console.log("[pump] enter #" + this.ticks);
-          const t0 = (typeof performance !== "undefined" ? performance.now() : Date.now());
-          const previousRaf = this._lastRafTimestamp;
-          this._lastRafTimestamp = typeof frameTimestamp === "number" ? frameTimestamp : t0;
-          if (_perf.on) {
-            _perf.rafGaps.push(previousRaf == null ? 0 : this._lastRafTimestamp - previousRaf);
-          }
-          try {
-            if (typeof cb.run === "function") cb.run();
-            else cb();
-          } catch (error) {
-            // Same reasoning as the input bridge: "Exception" on its own names
-            // nothing, and this catch is the last place the object exists.
-            (globalThis.mcWebPumpErrors ||= []).push({
-              tick: this.ticks,
-              text: String(error),
-              ctor: error?.constructor?.name ?? null,
-              message: error?.message ?? null,
-              props: (() => { try { return Object.getOwnPropertyNames(error).slice(0, 20); } catch { return null; } })(),
-              stack: String(error?.stack || "").split("\n").slice(0, 14)
-            });
-            console.error("frame pump error:", error);
-          }
-          const ms = (typeof performance !== "undefined" ? performance.now() : Date.now()) - t0;
-          this.lastMs = Math.round(ms);
-          _frameGraph.push(ms,
-            previousRaf == null ? 0 : this._lastRafTimestamp - previousRaf);
-          if (_perf.on) {
-            _perf.frames.push(ms);
-            _perf.hostFrames.push(_perf.hostMsThisFrame);
-            _perf.callFrames.push(_perf.callsThisFrame);
-            _perf.uploadBytesFrames.push(_perf.bytesThisFrame);
-            if (ms >= 17 && _uploadAttribution) {
-              // Attribution for stutter frames: which buffers ate the frame,
-              // with call counts so many-small vs few-big bursts can be told
-              // apart (over-drain vs inherent upload cost).
-              _perf.slowFrameUploads.push({
-                frame: _perf.frames.length - 1,
-                ms,
-                bytes: _perf.bytesThisFrame,
-                byLabel: Object.fromEntries(_perf.bytesByLabelThisFrame),
-                callsByLabel: Object.fromEntries(_perf.callsByLabelThisFrame),
-              });
-            }
-            _perf.hostMsThisFrame = 0;
-            _perf.callsThisFrame = 0;
-            _perf.bytesThisFrame = 0;
-            _perf.bytesByLabelThisFrame.clear();
-            _perf.callsByLabelThisFrame.clear();
-          }
-          if (ms > 1500) { this.slow++; console.warn("[pump] slow tick #" + this.ticks + " = " + this.lastMs + "ms (runTick hang?)"); }
-        }
-        this._schedule(loop);
-      };
-      // Chromium can lose the very first rAF request when Web Image finishes a
-      // long synchronous boot inside the launch-button task. A visibility
-      // transition makes rAF wake again, which is why changing tabs appeared to
-      // "start" Minecraft. Race that first scheduled callback with one bounded
-      // visible-tab timer. The once gate guarantees exactly one pump chain; all
-      // later frames continue through the selected Minecraft pacing mode.
-      let firstPending = true;
-      const first = (timestamp) => {
-        if (!firstPending) return;
-        firstPending = false;
-        this._wakeFirst = null;
-        loop(timestamp);
-      };
-      // A launch button can finish a long synchronous Web Image constructor
-      // while Safari/Chromium is transitioning the page between task queues.
-      // pageshow, visibilitychange, and focus are explicit wake signals; use
-      // the same once-gated first callback so none of them can create a second
-      // render loop.
-      this._wakeFirst = () => {
-        if (!firstPending || document.visibilityState === "hidden") return false;
-        this._firstFrameFallbacks++;
-        first(performance.now());
-        return true;
-      };
-      const rescueFirst = () => {
-        if (!firstPending) return;
-        if (document.visibilityState === "hidden") {
-          const onVisible = () => {
-            if (document.visibilityState !== "visible") return;
-            removeEventListener("visibilitychange", onVisible);
-            rescueFirst();
-          };
-          addEventListener("visibilitychange", onVisible);
-          return;
-        }
-        this._wakeFirst?.();
-      };
-      this._schedule(first);
-      setTimeout(rescueFirst, 100);
-    },
-    frameReported(count) {
-      document.body.dataset.frames = String(count);
-      // Reveal the canvas once frames start flowing so screenshots show the
-      // actual game render, not the diagnostic overlay. Any positive count
-      // qualifies (the first report may be 0 or 1 depending on ordering).
-      if (count >= 1) {
-        if (!firstFrameReported) {
-          firstFrameReported = true;
-          markPhase("first-frame-reported");
-          markPhase("boot-healthy", "first-frame-reported");
-        }
-        framesFlowing = true;
-        const main = document.querySelector("main");
-        if (main) main.style.display = "none";
-        failure.hidden = true;
-        // Game is rendering: drop the boot overlay (a couple of frames in, so
-        // the title screen's first paint isn't raced by the hide).
-        if (count >= 2 && globalThis.mcWebBootOverlay && !globalThis.mcWebBootOverlay.hidden) {
-          globalThis.mcWebBootOverlay.hide();
-          // Self-report the texture-identity diag a moment after the title
-          // screen starts sampling, so the console carries the evidence
-          // without a manual _texDiagLate() call.
-          setTimeout(() => { try { globalThis.mcWebGpu._texDiagLate && globalThis.mcWebGpu._texDiagLate(); } catch {} }, 2500);
-        }
-      }
-    }
-  };
-
-  const wakeInitialFrame = () => {
-    if (!globalThis.mcWebPump?.running) return;
-    globalThis.mcWebPump._wakeFirst?.();
-  };
-  addEventListener("pageshow", wakeInitialFrame, { passive: true });
-  addEventListener("focus", wakeInitialFrame, { passive: true });
-  document.addEventListener("visibilitychange", wakeInitialFrame, { passive: true });
-
-  // ---------------------------------------------------------------------------
-  // DOM input -> GLFW callback bridge. The Java side registers a
-  // BrowserInputBridge once the frame pump starts; DOM listeners below map
-  // browser events onto GLFW keycodes/buttons/mods and forward them.
-  // ---------------------------------------------------------------------------
-
-  const GLFW = {
-    RELEASE: 0, PRESS: 1, REPEAT: 2,
-    MOUSE_LEFT: 0, MOUSE_RIGHT: 1, MOUSE_MIDDLE: 2,
-    MOD_SHIFT: 1, MOD_CONTROL: 2, MOD_ALT: 4, MOD_SUPER: 8
-  };
-
-  const KEY_MAP = {
-    Space: 32, Apostrophe: 39, Comma: 44, Minus: 45, Period: 46, Slash: 47,
-    Digit0: 48, Digit1: 49, Digit2: 50, Digit3: 51, Digit4: 52,
-    Digit5: 53, Digit6: 54, Digit7: 55, Digit8: 56, Digit9: 57,
-    Semicolon: 59, Equal: 61,
-    KeyA: 65, KeyB: 66, KeyC: 67, KeyD: 68, KeyE: 69, KeyF: 70, KeyG: 71,
-    KeyH: 72, KeyI: 73, KeyJ: 74, KeyK: 75, KeyL: 76, KeyM: 77, KeyN: 78,
-    KeyO: 79, KeyP: 80, KeyQ: 81, KeyR: 82, KeyS: 83, KeyT: 84, KeyU: 85,
-    KeyV: 86, KeyW: 87, KeyX: 88, KeyY: 89, KeyZ: 90,
-    BracketLeft: 91, Backslash: 92, BracketRight: 93, GraveAccent: 96,
-    Escape: 256, Enter: 257, Tab: 258, Backspace: 259, Insert: 260,
-    Delete: 261, ArrowRight: 262, ArrowLeft: 263, ArrowDown: 264,
-    ArrowUp: 265, PageUp: 266, PageDown: 267, Home: 268, End: 269,
-    CapsLock: 280, ScrollLock: 281, NumLock: 282, PrintScreen: 283, Pause: 284,
-    F1: 290, F2: 291, F3: 292, F4: 293, F5: 294, F6: 295, F7: 296, F8: 297,
-    F9: 298, F10: 299, F11: 300, F12: 301,
-    Numpad0: 320, Numpad1: 321, Numpad2: 322, Numpad3: 323, Numpad4: 324,
-    Numpad5: 325, Numpad6: 326, Numpad7: 327, Numpad8: 328, Numpad9: 329,
-    NumpadDecimal: 330, NumpadDivide: 331, NumpadMultiply: 332,
-    NumpadSubtract: 333, NumpadAdd: 334, NumpadEnter: 335, NumpadEqual: 336,
-    ShiftLeft: 340, ControlLeft: 341, AltLeft: 342, MetaLeft: 343,
-    ShiftRight: 344, ControlRight: 345, AltRight: 346, MetaRight: 347,
-    ContextMenu: 348
-  };
-
-  const glfwMods = (event) => {
-    let mods = 0;
-    if (event.shiftKey) mods |= GLFW.MOD_SHIFT;
-    if (event.ctrlKey) mods |= GLFW.MOD_CONTROL;
-    if (event.altKey) mods |= GLFW.MOD_ALT;
-    if (event.metaKey) mods |= GLFW.MOD_SUPER;
-    return mods;
-  };
-
-  const MOUSE_BUTTON_MAP = {0: GLFW.MOUSE_LEFT, 1: GLFW.MOUSE_MIDDLE, 2: GLFW.MOUSE_RIGHT};
-
-  // Keys that would scroll/interact with the page while the game has focus.
-  const PREVENT_DEFAULT_CODES = new Set([
-    "Space", "Tab", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
-    "Backspace", "Enter", "Slash", "F3", "F5"
-  ]);
-
-  globalThis.mcWebInput = {
-    bridge: null,
-    lockPointerOnNextClick: false,
-    syntheticX: 0,
-    syntheticY: 0,
-    // Chromium was already correct with the original canvas listener. Keep
-    // WebKit's document-targeted Pointer Lock workaround scoped to Safari so
-    // it cannot change Chromium's input routing or feel.
-    documentPointerMoves: navigator.vendor === "Apple Computer, Inc.",
-    diagnostics: {
-      calls: Object.create(null),
-      lastCall: null
-    },
-    register(bridge) {
-      this.bridge = bridge;
-      recordStage("input-bridge-registered");
-    },
-    call(name, ...args) {
-      const bridge = this.bridge;
-      if (!bridge) return;
-      try {
-        this.diagnostics.calls[name] = (this.diagnostics.calls[name] || 0) + 1;
-        this.diagnostics.lastCall = {
-          name,
-          args: args.slice(),
-          frame: Number(document.body?.dataset?.frames || 0)
-        };
-        if (typeof bridge === "function") {
-          bridge(name, args[0] ?? 0, args[1] ?? 0, args[2] ?? 0, args[3] ?? 0);
-        } else if (typeof bridge[name] === "function") {
-          // Compatibility with any host-object interop that does expose Java
-          // instance methods directly.
-          bridge[name](...args);
-        }
-      } catch (error) {
-        // A Web Image exception stringifies to a bare "Exception", which names
-        // nothing. Keep the readable parts so a lost click can be attributed.
-        (this.diagnostics.errors ||= []).push({
-          name,
-          args: args.slice(),
-          text: String(error),
-          ctor: error?.constructor?.name ?? null,
-          message: error?.message ?? null,
-          props: (() => { try { return Object.getOwnPropertyNames(error).slice(0, 20); } catch { return null; } })(),
-          stack: String(error?.stack || "").split("\n").slice(0, 12)
-        });
-        console.error("input bridge error:", name, error);
-      }
-    }
-  };
-
-  const inputMapping = globalThis.mcWebInputMapping;
-  if (!inputMapping) throw new Error("MC-Web input mapping module is missing");
-  const canvasToPixel = (clientX, clientY) => inputMapping.point(
-    clientX,
-    clientY,
-    canvas.getBoundingClientRect(),
-    canvas.width,
-    canvas.height,
-  );
-  const pointerLockToPixelDelta = (movementX, movementY) => inputMapping.lockedDelta(
-    movementX,
-    movementY,
-    canvas.getBoundingClientRect(),
-    canvas.width,
-    canvas.height,
-  );
-
-  // Escape while the pointer is locked belongs to the browser: it exits the lock
-  // and does not dispatch the keydown to the page. Minecraft therefore never saw
-  // the press -- the cursor came free but no menu opened, and only a *second*
-  // Escape (delivered normally now that the page has keys again) reached the
-  // game. Desktop Minecraft does both on one press, so the lost key is
-  // synthesized on pointerlockchange below. This timestamp covers the browsers
-  // that do deliver it, so the key is never counted twice. It starts at
-  // -Infinity rather than 0 because performance.now() itself starts near zero,
-  // and a 0 sentinel would read as "just delivered" for the first half-second.
-  let escapeSeenWhileLocked = -Infinity;
-
-  addEventListener("keydown", (event) => {
-    if (!globalThis.mcWebInput.bridge) return;
-    if (PREVENT_DEFAULT_CODES.has(event.code)) event.preventDefault();
-    const key = KEY_MAP[event.code] ?? -1;
-    if (key < 0) return;
-    if (event.code === "Escape" && document.pointerLockElement === canvas) {
-      escapeSeenWhileLocked = performance.now();
-    }
-    const action = event.repeat ? GLFW.REPEAT : GLFW.PRESS;
-    globalThis.mcWebInput.call("key", key, 0, action, glfwMods(event));
-    // Character input for text fields (printable single-codepoint keys).
-    if (action !== GLFW.RELEASE && event.key && event.key.length === 1 && !event.ctrlKey && !event.metaKey) {
-      globalThis.mcWebInput.call("charInput", event.key.codePointAt(0));
-    }
-  });
-
-  addEventListener("keyup", (event) => {
-    if (!globalThis.mcWebInput.bridge) return;
-    const key = KEY_MAP[event.code] ?? -1;
-    if (key < 0) return;
-    globalThis.mcWebInput.call("key", key, 0, GLFW.RELEASE, glfwMods(event));
-  });
-
-  const handleMouseMove = (event) => {
-    if (!globalThis.mcWebInput.bridge) return;
-    if (document.pointerLockElement === canvas) {
-      // Pointer is locked: synthesize absolute coordinates from movement so
-      // Minecraft's delta-based camera handling still works.
-      //
-      // These coordinates must stay UNCLAMPED. Under GLFW_CURSOR_DISABLED the
-      // cursor position GLFW reports is virtual and unbounded, and
-      // MouseHandler.onMove only ever consumes it as a delta
-      // (accumulatedDX += xpos - lastXpos). Clamping to the canvas therefore
-      // capped the total turn at one canvas width: once the virtual cursor
-      // pinned to an edge every further mousemove produced a zero delta and the
-      // camera stopped, which is the "can only turn the width of the window"
-      // symptom. Doubles hold integer pixel sums exactly to 2^53, so unbounded
-      // accumulation cannot lose precision within a session.
-      const input = globalThis.mcWebInput;
-      // WebKit may retarget locked movement to Document when no mouse button
-      // is held, while dragging retains the canvas as its capture target. A
-      // listener attached only to the canvas therefore made free-look appear
-      // much slower than button-held movement in Safari. Chromium stays on
-      // the original canvas listener below. Older WebKit builds exposed only
-      // the prefixed relative deltas.
-      const movementX = Number(event.movementX || event.webkitMovementX || 0);
-      const movementY = Number(event.movementY || event.webkitMovementY || 0);
-      const [deltaX, deltaY] = pointerLockToPixelDelta(movementX, movementY);
-      input.syntheticX += deltaX;
-      input.syntheticY += deltaY;
-      globalThis.mcWebInput.call("cursorPos", input.syntheticX, input.syntheticY);
-      return;
-    }
-    // Safari's document listener also observes every ordinary page mousemove.
-    // Only canvas-targeted movement belongs to Minecraft while the cursor is
-    // free.
-    if (event.target !== canvas) return;
-    const [x, y] = canvasToPixel(event.clientX, event.clientY);
-    if (globalThis.mcWebInput.lockPointerOnNextClick) {
-      // Embedded browsers may deny pointer lock. Keep the captured-coordinate
-      // fallback aligned with the last real mouse position so a click does not
-      // inject a camera delta before Minecraft receives the button event.
-      globalThis.mcWebInput.syntheticX = x;
-      globalThis.mcWebInput.syntheticY = y;
-    }
-    globalThis.mcWebInput.call("cursorPos", x, y);
-  };
-  const pointerMoveTarget = globalThis.mcWebInput.documentPointerMoves
-    ? document : canvas;
-  pointerMoveTarget.addEventListener("mousemove", handleMouseMove,
-    globalThis.mcWebInput.documentPointerMoves ? {capture: true} : undefined);
-
-  canvas.addEventListener("mousedown", (event) => {
-    if (!globalThis.mcWebInput.bridge) return;
-    event.preventDefault();
-    canvas.focus?.();
-    // GLFW reports the current cursor position before a mouse-button callback.
-    // A synthetic/automated click is not required to emit mousemove first, so
-    // refresh it from this event as well or Minecraft can hit-test using the
-    // stale startup position (0, 0).
-    const input = globalThis.mcWebInput;
-    const cursorIsCaptured =
-      document.pointerLockElement === canvas || input.lockPointerOnNextClick;
-    const [x, y] = cursorIsCaptured
-      ? [input.syntheticX, input.syntheticY]
-      : canvasToPixel(event.clientX, event.clientY);
-    globalThis.mcWebInput.call("cursorPos", x, y);
-    if (document.pointerLockElement !== canvas && input.lockPointerOnNextClick
-        && canvas.requestPointerLock) {
-      input.syntheticX = x;
-      input.syntheticY = y;
-      const request = canvas.requestPointerLock();
-      if (request && typeof request.catch === "function") {
-        // A denied lock is not cosmetic: the fallback path feeds Minecraft the
-        // real canvas-bounded cursor, so the camera stops turning at the window
-        // edge. Record the reason instead of swallowing it -- that failure and a
-        // clamped virtual cursor produce the same "can only turn so far" report,
-        // and only this tells them apart.
-        request.catch((error) => {
-          input.diagnostics.pointerLockError = {
-            text: String(error),
-            name: error?.name ?? null,
-            at: Date.now()
-          };
-          console.warn("pointer lock denied:", error);
-        });
-      }
-    }
-    const button = MOUSE_BUTTON_MAP[event.button] ?? event.button;
-    globalThis.mcWebInput.call("mouseButton", button, GLFW.PRESS, glfwMods(event));
-  });
-
-  // Safari does not provide a desktop mouse stream for a sustained finger
-  // drag. Keep the game surface usable while the document stays portrait:
-  // touch points map to the same landscape canvas/backing-pixel contract as
-  // mouse points. Preventing the default touch action also avoids a synthetic
-  // mouse click being delivered a second time after pointerup.
-  const touchPointers = new Set();
-  const handleTouchPointer = (event) => {
-    if (event.pointerType !== "touch" || !globalThis.mcWebInput.bridge) return;
-    event.preventDefault();
-    const input = globalThis.mcWebInput;
-    const [x, y] = canvasToPixel(event.clientX, event.clientY);
-    if (event.type === "pointerdown") {
-      touchPointers.add(event.pointerId);
-      input.call("cursorPos", x, y);
-      input.call("mouseButton", GLFW.MOUSE_LEFT, GLFW.PRESS, glfwMods(event));
-      canvas.setPointerCapture?.(event.pointerId);
-    } else if (event.type === "pointermove" && touchPointers.has(event.pointerId)) {
-      input.call("cursorPos", x, y);
-    } else if ((event.type === "pointerup" || event.type === "pointercancel")
-        && touchPointers.delete(event.pointerId)) {
-      input.call("cursorPos", x, y);
-      input.call("mouseButton", GLFW.MOUSE_LEFT, GLFW.RELEASE, glfwMods(event));
-      canvas.releasePointerCapture?.(event.pointerId);
-    }
-  };
-  canvas.addEventListener("pointerdown", handleTouchPointer, { passive: false });
-  canvas.addEventListener("pointermove", handleTouchPointer, { passive: false });
-  canvas.addEventListener("pointerup", handleTouchPointer, { passive: false });
-  canvas.addEventListener("pointercancel", handleTouchPointer, { passive: false });
-
-  addEventListener("mouseup", (event) => {
-    if (!globalThis.mcWebInput.bridge) return;
-    const button = MOUSE_BUTTON_MAP[event.button] ?? event.button;
-    globalThis.mcWebInput.call("mouseButton", button, GLFW.RELEASE, glfwMods(event));
-  });
-
-  canvas.addEventListener("wheel", (event) => {
-    if (!globalThis.mcWebInput.bridge) return;
-    event.preventDefault();
-    // GLFW scroll is reported in line units; pixel-mode wheels typically
-    // produce multiples of ~100 per line.
-    const scale = event.deltaMode === 1 ? 1 : 1 / 100;
-    globalThis.mcWebInput.call("scroll", -event.deltaX * scale, -event.deltaY * scale);
-  }, {passive: false});
-
-  canvas.addEventListener("contextmenu", (event) => event.preventDefault());
-
-  // The other half of the single-Escape fix: deliver the key the browser ate.
-  //
-  // Minecraft releases the cursor itself whenever it opens a screen, and that
-  // path (BrowserInputCompat.setCursorDisabled(0)) clears lockPointerOnNextClick
-  // *before* calling exitPointerLock. So a lock that drops while the flag is
-  // still set was dropped by the browser -- Escape, or focus loss -- while the
-  // game still wanted the cursor grabbed. That is exactly when Minecraft should
-  // pause, and pausing is what it does with an Escape press.
-  document.addEventListener("pointerlockchange", () => {
-    const input = globalThis.mcWebInput;
-    if (!input.bridge) return;
-    if (document.pointerLockElement === canvas) return;
-    if (!input.lockPointerOnNextClick) return;
-    if (performance.now() - escapeSeenWhileLocked < 500) return;
-    const escape = KEY_MAP.Escape;
-    input.call("key", escape, 0, GLFW.PRESS, 0);
-    input.call("key", escape, 0, GLFW.RELEASE, 0);
-  });
-
-  // Safari versions where requestPointerLock() returns void report denial only
-  // through this event rather than a rejected Promise. Keep the failure visible
-  // in the same diagnostics used by the Promise path above.
-  document.addEventListener("pointerlockerror", (event) => {
-    globalThis.mcWebInput.diagnostics.pointerLockError = {
-      text: "pointerlockerror",
-      name: event?.type ?? "pointerlockerror",
-      at: Date.now(),
-    };
-    console.warn("pointer lock denied: pointerlockerror");
-  });
-
-  // ---------------------------------------------------------------------
-  // Opt-in profiler (?mcweb_perf=1). Answers the first question any perf work
-  // has to answer here: of a frame's milliseconds, how many are spent inside
-  // the host (WebGPU calls) versus inside Java, and which bridge calls carry
-  // the cost -- by total time, not by the call count that intuition reaches
-  // for first.
-  const _perf = {
-    on: false,
-    frames: [],          // per-frame total ms, from the pump loop
-    rafGaps: [],         // time between rAF callbacks, including time outside Java
-    hostMsThisFrame: 0,  // ms inside bridge calls, reset each frame
-    hostFrames: [],      // per-frame host ms, index-aligned with frames
-    calls: new Map(),    // name -> {n, ms} accumulated over the whole run
-    callsThisFrame: 0,
-    callFrames: [],      // per-frame bridge-call count
-    bytesThisFrame: 0,   // bytes handed to queue.writeBuffer this frame
-    bytesByLabelThisFrame: new Map(), // buffer label -> bytes this frame
-    callsByLabelThisFrame: new Map(), // buffer label -> upload calls this frame
-    uploadBytesFrames: [], // index-aligned with frames: upload bytes/frame
-    slowFrameUploads: [],  // per-stutter-frame upload bytes by buffer label
-    gpuQueueMs: [],      // asynchronous submit -> onSubmittedWorkDone timings
-    gpuSubmits: 0
-  };
-
-  // Per-frame upload accounting: total bytes always on; per-buffer-label
-  // attribution is opt-in (?mcweb_upattr) because it allocates per upload and
-  // was isolated while chasing a perf-flag boot stall. Slow-frame attribution
-  // reads the label map.
-  const _uploadAttribution = new URLSearchParams(location.search).has("mcweb_upattr");
-  const _noteUploadBytes = (label, bytes) => {
-    _perf.bytesThisFrame += bytes;
-    if (!_uploadAttribution) return;
-    const map = _perf.bytesByLabelThisFrame;
-    map.set(label, (map.get(label) || 0) + bytes);
-    const calls = _perf.callsByLabelThisFrame;
-    calls.set(label, (calls.get(label) || 0) + 1);
-  };
-  const _forceCopySrc = new URLSearchParams(location.search).has("mcweb_copysrc");
-  const _forceNoCull = new URLSearchParams(location.search).has("mcweb_nocull");
-  let _depthSnapshot = null;
-  let _uniformSnapshot = null;
-  let _visibleUniformSnapshot = null;
-
-  const _suppressPipelines = (() => {
-    const raw = new URLSearchParams(location.search).get("mcweb_suppress");
-    return raw ? new RegExp(raw, "i") : null;
-  })();
-  let _diagnosticSuppression = null;
-  const _isPipelineSuppressed = (label) =>
-    Boolean((_suppressPipelines && _suppressPipelines.test(label))
-      || (_diagnosticSuppression && _diagnosticSuppression.test(label)));
-
-  const _percentile = (sorted, p) =>
-    sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))] : 0;
-
-  function installPerfProfiler() {
-    const target = globalThis.mcWebGpu;
-    for (const name of Object.keys(target)) {
-      const original = target[name];
-      if (typeof original !== "function") continue;
-      target[name] = function (...args) {
-        const start = performance.now();
-        try {
-          return original.apply(this, args);
-        } finally {
-          const ms = performance.now() - start;
-          let entry = _perf.calls.get(name);
-          if (!entry) _perf.calls.set(name, entry = {n: 0, ms: 0});
-          entry.n++;
-          entry.ms += ms;
-          _perf.hostMsThisFrame += ms;
-          _perf.callsThisFrame++;
-        }
-      };
-    }
-    _perf.on = true;
-  }
-
-  // WebGPU reports a destroyed-parent/view mismatch asynchronously, usually at
-  // submit time, after the Java call that created the bad binding is gone. Keep
-  // one bounded, queryable record with the call tail and (on the RPC lane) the
-  // exact batch that carried it. The helper deduplicates the visible report.
-  const snapshotTextureValidation = () => {
-    const viewHandle = _textureLifetime.lastViewHandle();
-    const viewEntry = Number.isInteger(viewHandle)
-      ? (objects.get(viewHandle) ?? _textureLifetime.lastViewEntry()) : null;
-    return _textureLifetime.snapshotValidation(
-      viewHandle,
-      viewEntry,
-      globalThis.mcWebGpu?._rpcLastBatch ?? null,
-    );
-  };
-  let _lastSubmitTextureCandidate = null;
-  const noteTextureValidation = (message, candidate = _lastSubmitTextureCandidate) => {
-    const snapshot = _textureLifetime.captureValidation(message, candidate);
-    if (!snapshot) return null;
-    const gpu = globalThis.mcWebGpu;
-    if (gpu && !gpu._textureValidation) gpu._textureValidation = snapshot;
-    if (gpu && !gpu._textureValidationLogged) {
-      gpu._textureValidationLogged = true;
-      console.error("[GPU-TEXTURE-VALIDATION]", JSON.stringify(snapshot));
-    }
-    return snapshot;
-  };
-
-  globalThis.mcWebGpu = {
-    diagnostics,
-    _itemAtlasDraws: () => _itemAtlasDrawRing.slice(),
-    _compositeDbg: () => ({
-      srcTid: compositeSource?._tid, srcLabel: compositeSource?._label ?? null,
-      srcWH: compositeSource ? (compositeSource.width + "x" + compositeSource.height) : null,
-      srcSeq: compositeSource ? (lastFrameDrawSeq.get(compositeSource._tid) || 0) : 0,
-      lastTid: lastFrameIsCanvas ? -1 : lastFrameDrawSeq.size ? [...lastFrameDrawSeq.entries()].sort((a, b) => b[1] - a[1])[0][0] : 0,
-      lastIsCanvas: lastFrameIsCanvas,
-      draws: Object.fromEntries(lastFrameDraws),
-      seq: Object.fromEntries(lastFrameDrawSeq),
-      inv: texInventory.slice(-40).map((t) => [t._tid, t.width + "x" + t.height, t.format, t.isCanvas ? "C" : ""])
-    }),
-    // DIAG: read back the top-left 32x32 of a texture entry and count non-black /
-    // non-transparent pixels. Returns a promise. Proves whether an uploaded atlas
-    // actually holds pixel data (vs. an empty/black texture = upload gap).
-    _readbackTex: (entry, rw, rh) => new Promise((resolve) => {
-      try {
-        // Read the WHOLE texture (capped) â€” a corner-only read gave false
-        // negatives for atlases whose art isn't in the top-left 32x32.
-        const w = Math.min(rw || 128, entry.width || 1), h = Math.min(rh || 128, entry.height || 1);
-        const bpp = 4;
-        const bpr = Math.ceil(w * bpp / 256) * 256; // WebGPU: bytesPerRow % 256 == 0
-        const buf = device.createBuffer({size: bpr * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ});
-        const enc = device.createCommandEncoder();
-        enc.copyTextureToBuffer({texture: entry.texture}, {buffer: buf, bytesPerRow: bpr, rowsPerImage: h}, {width: w, height: h, depthOrArrayLayers: 1});
-        device.queue.submit([enc.finish()]);
-        buf.mapAsync(GPUMapMode.READ).then(() => {
-          const u8 = new Uint8Array(buf.getMappedRange().slice(0));
-          buf.unmap(); buf.destroy();
-          let nonBlack = 0, nonTransp = 0;
-          for (let i = 0; i < w * h * bpp; i += bpp) {
-            if (u8[i + 3] > 0) nonTransp++;
-            if (u8[i] > 4 || u8[i + 1] > 4 || u8[i + 2] > 4) nonBlack++;
-          }
-          resolve({nonBlack, nonTransp, sampled: w * h});
-        }).catch((e) => resolve({error: "map:" + (e && e.message)}));
-      } catch (e) { resolve({error: String(e && e.message || e)}); }
-    }),
-    // DIAG: snapshot every texture sampled on the last frame: label, size, format,
-    // per-instance upload count, the TOTAL uploads across ALL instances sharing
-    // that label (labelUploads â€” catches a stale-handle: sampled instance=0 but
-    // another instance of the same atlas was uploaded), and a whole-texture
-    // readback. Also runs a magenta self-check (readbackSelf) to prove the
-    // readback path itself returns non-zero pixels.
-    _texDiag: () => {
-      const entries = [...(_lastFrameSampled.size ? _lastFrameSampled : _sampledThisFrame)].slice(0, 16);
-      const rows = entries.map((e) => ({
-        label: (e._label || "?").slice(0, 30),
-        wh: `${e.width}x${e.height}x${e.depth || 1}`,
-        fmt: e.format,
-        uploads: e._uploads || 0,
-        labelUploads: (_uploadByLabel.get(e._label) || [0, 0])[0],
-        upKB: Math.round((e._uploadBytes || 0) / 1024 * 0.75) // base64â†’bytes approx
-      }));
-      // Self-check: a texture we fill with opaque magenta MUST read back non-
-      // transparent. If readbackSelf.nonTransp==0 the readback path is broken and
-      // every nonTransp value above is untrustworthy.
-      const selfCheck = (() => {
-        try {
-          const t = device.createTexture({size: [8, 8, 1], format: "rgba8unorm", usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC});
-          const d = new Uint8Array(8 * 8 * 4); for (let i = 0; i < d.length; i += 4) { d[i] = 255; d[i + 2] = 255; d[i + 3] = 255; }
-          device.queue.writeTexture({texture: t}, d, {bytesPerRow: 8 * 4}, {width: 8, height: 8});
-          return globalThis.mcWebGpu._readbackTex({texture: t, width: 8, height: 8});
-        } catch (e) { return Promise.resolve({error: "self:" + (e && e.message)}); }
-      })();
-      const p = Promise.all([selfCheck, ...entries.map((e) => globalThis.mcWebGpu._readbackTex(e))]).then(([self, ...rbs]) => {
-        const out = rows.map((r, i) => Object.assign({}, r, rbs[i]));
-        _texDiagSnapshot = {readbackSelf: self, rows: out, uploadByLabel: Object.fromEntries(_uploadByLabel), recentCreated: _recentCreated.slice(-24)};
-        console.log("[TEX-DIAG] readbackSelf (MUST be nonTransp>0 else readback is broken):", JSON.stringify(self));
-        console.log("[TEX-DIAG] uploadByLabel [uploads,bytes] (atlas gui.png uploads=0 here â‡’ atlas truly never uploaded):", JSON.stringify(Object.fromEntries(_uploadByLabel)));
-        console.log("[TEX-DIAG] recentCreated (label|wh|uploads) â€” look for gui.png with uploads>0 that is NOT the sampled instance â‡’ stale handle):", JSON.stringify(_recentCreated.slice(-24).map((r) => ({label: (r.label || "?").slice(0, 26), wh: r.wh, uploads: r._e ? (r._e._uploads || 0) : 0}))));
-        try { console.table(out); } catch {}
-        console.log("[TEX-DIAG] sampled rows (uploads=inst uploads; labelUploads=total for that label; nonBlack/nonTransp from whole-tex readback):", JSON.stringify(out));
-        return out;
-      });
-      return p;
-    },
-    _texDiagSnapshot: () => _texDiagSnapshot,
-    _fontProbe: () => ({draws: _fontDrawRing, stats: [..._fontPassStats.values()]}),
-    _atlasProbe: () => ({
-      targets: Object.fromEntries(_animTargetCounts),
-      gui: _guiAtlasRing,
-      assemblyOffTarget: _asmBad,
-      screenSpriteDraws: _scatterDraws
-    }),
-    _textureProbe: (needle) => {
-      const query = String(needle || "").toLowerCase();
-      const entries = _recentCreated
-        .filter((record) => String(record.label || "").toLowerCase().includes(query))
-        .map((record) => record._e)
-        .filter(Boolean);
-      return Promise.all(entries.map(async (entry) => ({
-        label: entry._label,
-        handle: entry._hid,
-        size: `${entry.width}x${entry.height}x${entry.depth || 1}`,
-        format: entry.format,
-        uploads: entry._uploads || 0,
-        uploadBytes: entry._uploadBytes || 0,
-        uploadRegions: entry._uploadRegions || [],
-        readback: await globalThis.mcWebGpu._readbackTex(entry)
-      })));
-    },
-    _textureSamples: (needle, coords) => new Promise((resolve) => {
-      try {
-        const query = String(needle || "").toLowerCase();
-        const record = [..._recentCreated].reverse()
-          .find((item) => String(item.label || "").toLowerCase().includes(query));
-        const entry = record?._e;
-        if (!entry) {
-          resolve({error: "texture not found"});
-          return;
-        }
-        const w = entry.width, h = entry.height, bpr = Math.ceil(w * 4 / 256) * 256;
-        const buffer = device.createBuffer({
-          size: bpr * h,
-          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
-        });
-        const encoder = device.createCommandEncoder();
-        encoder.copyTextureToBuffer(
-          {texture: entry.texture},
-          {buffer, bytesPerRow: bpr, rowsPerImage: h},
-          {width: w, height: h, depthOrArrayLayers: 1}
-        );
-        device.queue.submit([encoder.finish()]);
-        buffer.mapAsync(GPUMapMode.READ).then(() => {
-          const bytes = new Uint8Array(buffer.getMappedRange().slice(0));
-          buffer.unmap();
-          buffer.destroy();
-          const result = (Array.isArray(coords) ? coords : []).map(([u, v]) => {
-            const cx = Math.max(0, Math.min(w - 1, Math.floor(u * w)));
-            const cy = Math.max(0, Math.min(h - 1, Math.floor(v * h)));
-            const neighborhood = [];
-            for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
-              const x = Math.max(0, Math.min(w - 1, cx + dx));
-              const y = Math.max(0, Math.min(h - 1, cy + dy));
-              const offset = y * bpr + x * 4;
-              neighborhood.push([x, y, ...bytes.slice(offset, offset + 4)]);
-            }
-            return {uv: [u, v], pixel: [cx, cy], neighborhood};
-          });
-          let minX = w, minY = h, maxX = -1, maxY = -1, nonzero = 0;
-          const first = [];
-          for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-            const offset = y * bpr + x * 4;
-            if (bytes[offset] || bytes[offset + 1] || bytes[offset + 2] || bytes[offset + 3]) {
-              nonzero++;
-              minX = Math.min(minX, x); minY = Math.min(minY, y);
-              maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
-              if (first.length < 40) first.push([x, y, ...bytes.slice(offset, offset + 4)]);
-            }
-          }
-          resolve({
-            label: entry._label,
-            size: [w, h],
-            uploads: entry._uploadRegions || [],
-            nonzero,
-            bounds: nonzero ? [minX, minY, maxX, maxY] : null,
-            first,
-            samples: result
-          });
-        }).catch((error) => resolve({error: "map:" + error.message}));
-      } catch (error) {
-        resolve({error: String(error?.message || error)});
-      }
-    }),
-    // DIAG: late lifetime dump. instancesPerLabel lists EVERY created texture
-    // instance for labels that contain atlas/gui/font/menu/title (with each
-    // instance's upload count), so we can see a sampled-but-empty instance next
-    // to an uploaded one (stale handle) OR confirm the atlas label never got any
-    // upload at all (upload-path gap). uploadByLabel is the global total.
-    _texDiagLate: () => {
-      const byLabel = {};
-      for (const r of _recentCreated) {
-        const k = r.label || "?";
-        (byLabel[k] = byLabel[k] || []).push(r._e ? (r._e._uploads || 0) : -1);
-      }
-      const interesting = {};
-      for (const k of Object.keys(byLabel)) {
-        if (/atlas|gui|font|menu|title|widget|missing/i.test(k)) interesting[k] = {instances: byLabel[k], totalUploads: (_uploadByLabel.get(k) || [0])[0]};
-      }
-      const out = {tick: globalThis.mcWebPump?.ticks || 0, interestingInstances: interesting, uploadByLabelTotals: Object.fromEntries([..._uploadByLabel.entries()].filter(([k]) => /atlas|gui|font|menu|title|widget/i.test(k)))};
-      _texDiagSnapshot = out;
-      // DIAG: per-handle identity check. sampled[] = textures actually bound for
-      // sampling (with their upload count); uploadedNotSampled[] = textures that
-      // got a writeTexture64 but were NEVER sampled. If a sampled atlas/widget
-      // shows uploads=0 while an uploadedNotSampled entry shares its label => the
-      // bind group samples a DIFFERENT instance than the upload (stale handle).
-      const sampled = [..._sampledEntries].filter((e) => /atlas|gui|widget|title|font/.test(e._label || "")).slice(0, 40)
-        .map((e) => ({label: (e._label || "?").slice(0, 24), hid: e._hid, uploads: e._uploads || 0, wh: `${e.width}x${e.height}`}));
-      const sampledSet = new Set([..._sampledEntries]);
-      const uploadedNotSampled = _recentCreated.filter((r) => r._e && (r._e._uploads || 0) > 0 && !sampledSet.has(r._e) && /atlas|gui|widget|title|font/.test(r.label || ""))
-        .slice(0, 40).map((r) => ({label: (r.label || "?").slice(0, 24), hid: r._e._hid, uploads: r._e._uploads || 0}));
-      console.log("[TEX-IDENTITY] sampled (hid:uploads) â€” uploads=0 on a sampled atlas/widget means the sampled instance never got data:", JSON.stringify(sampled));
-      console.log("[TEX-IDENTITY] uploaded-but-NEVER-sampled (hid:uploads) â€” if a label here matches a sampled uploads=0 label => stale handle:", JSON.stringify(uploadedNotSampled));
-      console.log("[TEX-DIAG-LATE] (frame>200) instancesPerLabel{[uploads per instance]} + totals. If a label shows instances like [0,>0] the sampled [0] one is a STALE handle; if a label is absent from totals it NEVER uploaded:", JSON.stringify(out));
-      return out;
-    },
-    isReady: () => Boolean(device),
-    textureValidationReport: () =>
-      globalThis.mcWebGpu?._textureValidation ?? _textureLifetime.validationReport(),
-    // Progress history, independent of console.log: a chatty run can overflow
-    // the CDP console pipe and drop exactly the failure line you need.
-    stages: (count = 400) => diagnostics.stages.slice(-count),
-    /** The same ring with page-relative milliseconds, newest last. */
-    stageTimeline: (count = 400) => diagnostics.stages.slice(-count)
-      .map((stage, index) => [diagnostics.stageMs.slice(-count)[index], stage]),
-    reloadProbe: (count = 8000) => ({
-      events: diagnostics.reloadProbe.slice(-count),
-      threads: globalThis.mcWebThreadRuntime?.info?.() ?? null,
-    }),
-    canvasWidth: () => canvas.width,
-    canvasHeight: () => canvas.height,
-    adapterName: () =>
-      adapter?.info?.description || adapter?.info?.device || "Browser WebGPU adapter",
-
-    createTexture(label, usage, format, width, height, depth, mips) {
-      markCall("createTexture", {label, usage, format, width, height, depth, mips});
-      const gpuFormat = minecraftFormat(format);
-      const _handle = put({
-        kind: "texture",
-        texture: device.createTexture({
-          label,
-          size: {width, height, depthOrArrayLayers: depth},
-          mipLevelCount: mips,
-          sampleCount: 1,
-          dimension: "2d",
-          format: gpuFormat,
-          // Force the copy bits: Mojang's presenter blits the main target to
-          // the canvas with copyTextureToTexture, but the main target is
-          // created without COPY_SRC. Extra usage bits are harmless.
-          usage: minecraftTextureUsage(usage) | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST
-        }),
-        format: gpuFormat,
-        width,
-        height,
-        depth,
-        _label: label,
-        _hid: nextHandle - 1, // DIAG: stable handle id of this texture instance
-        _uploads: 0,   // DIAG: how many writeTexture64 uploads landed on this texture
-        _uploadBytes: 0,
-        _uploadRegions: []
-      });
-      const _entry = objects.get(_handle);
-      _textureLifetime.initializeTexture(_entry);
-      _recentCreated.push({label, wh: `${width}x${height}x${depth}`, fmt: gpuFormat, _e: _entry}); // DIAG registry
-      if (/panorama/i.test(label)) _panoProbe.created.push({ label, w: width, h: height, depth, fmt: gpuFormat, usage, hid: _entry._hid });
-      return _handle;
-    },
-
-    createTextureView(textureHandle, baseMip, mipLevels, dimension) {
-      markCall("createTextureView", {textureHandle, baseMip, mipLevels, dimension});
-      const entry = get(textureHandle, "texture");
-      const viewEntry = {
-        kind: "textureView",
-        view: entry.texture.createView({
-          dimension: dimension === "cube" ? "cube" : "2d",
-          baseMipLevel: baseMip,
-          mipLevelCount: mipLevels
-        }),
-        textureEntry: entry,
-        // Needed to tell "the atlas was stitched" from "only mip 0 was
-        // stitched": TextureAtlas.upload makes one view per mip and blits into
-        // each, and a distant block face samples a high mip. An unfilled mip
-        // reads as uniform garbage while mip 0 still looks perfect up close.
-        baseMip
-      };
-      _textureLifetime.retainView(entry);
-      return put(viewEntry);
-    },
-
-    createSamplerJson(specJson) {
-      const spec = JSON.parse(specJson);
-      markCall("createSampler", spec);
-      const address = (mode) => (mode === "REPEAT" ? "repeat" : "clamp-to-edge");
-      const linear = (filter) => filter === "LINEAR";
-      const handle = put({
-        kind: "sampler",
-        sampler: device.createSampler({
-          addressModeU: address(spec.addressU),
-          addressModeV: address(spec.addressV),
-          minFilter: linear(spec.min) ? "linear" : "nearest",
-          magFilter: linear(spec.mag) ? "linear" : "nearest",
-          mipmapFilter: linear(spec.min) ? "linear" : "nearest",
-          maxLod: spec.maxLod == null ? 32 : spec.maxLod
-        })
-      });
-      (globalThis.mcWebGpu._samplerSpecs ||= []).push({handle, ...spec});
-      return handle;
-    },
-
-    destroyTexture(handle) {
-      const entry = get(handle, "texture");
-      _textureLifetime.requestDestroy(entry);
-      objects.delete(handle);
-    },
-
-    destroyObject(handle) {
-      const object = objects.get(handle);
-      if (object?.kind === "texture") _textureLifetime.requestDestroy(object);
-      if (object?.kind === "textureView") _textureLifetime.releaseView(object);
-      if (object?.kind === "buffer" && object.buffer) deferDestroyBuffer(object.buffer);
-      objects.delete(handle);
-    },
-
-    createCommandEncoder() {
-      markCall("createCommandEncoder");
-      return put({kind: "encoder", encoder: device.createCommandEncoder({label: "Minecraft CommandEncoder"})});
-    },
-
-    createBuffer(label, usage, size) {
-      markCall("createBuffer", {label, usage, size});
-      if (usage & 256) {
-        (globalThis.mcWebGpu._texelBuffers ||= []).push({label, usage, size});
-      }
-      return put({
-        kind: "buffer",
-        size, // retained so uniform binds can cap their inflated range to the buffer
-        _label: label, // DIAG: for UBO inspection
-        // DIAG: CPU mirror of buffer contents, for the UBO/vertex/index
-        // decoders below. Skipped above SHADOW_LIMIT: terrain's three
-        // "UberBuffer solid/cutout/translucent" are 128 MiB each, so mirroring
-        // them costs ~384 MiB of JS heap for diagnostics that only ever inspect
-        // small uniform and GUI buffers. Every reader is null-guarded, and the
-        // two writers (writeBuffer, copyBuffer) test for it before mirroring.
-        _shadow: size <= SHADOW_LIMIT ? new Uint8Array(size) : null,
-        buffer: device.createBuffer({
-          label,
-          size,
-          // ?mcweb_copysrc=1 makes every buffer readable. Uniform buffers are
-          // normally UNIFORM|COPY_DST, so copyBufferToBuffer on them is a
-          // validation error that leaves the destination zero-filled -- which
-          // is indistinguishable from the uniform genuinely being zero, and
-          // already produced one false "ProjMat is all zeros" reading.
-          usage: minecraftBufferUsage(usage) | (_forceCopySrc ? GPUBufferUsage.COPY_SRC : 0)
-        })
-      });
-    },
-
-    destroyBuffer(handle) {
-      const entry = get(handle, "buffer");
-      if (entry?.buffer) deferDestroyBuffer(entry.buffer);
-      objects.delete(handle);
-    },
-
-    writeBuffer64(handle, destinationOffset, base64) {
-      const _bytes0 = base64ToBytes(base64);
-      if (_gpuProbe) {
-        noteUniformProbe(get(handle, "buffer"), handle, destinationOffset,
-          _bytes0, base64 ? base64.length : 0);
-      }
-      markCall("writeBuffer", {handle, destinationOffset, base64Length: base64?.length});
-      const _be = get(handle, "buffer");
-      const _bytes = _bytes0;
-      // DIAG: keep CPU shadow for UBO inspection
-      if (_be._shadow && destinationOffset + _bytes.length <= _be._shadow.length) {
-        _be._shadow.set(_bytes, destinationOffset);
-      }
-      _noteBytes(_be, "write", _bytes.length);
-      _noteUploadBytes(_be._label || "?", _bytes.length);
-      device.queue.writeBuffer(_be.buffer, destinationOffset, _bytes);
-    },
-
-    // Bytes straight from the caller, no encoding at all. The OpenJDK lane
-    // hands its uploads over as a typed array, which the RPC copies once into
-    // its SharedArrayBuffer; base64 cost an encode, three string copies and a
-    // decode for data that was always bytes. Same body as the linear-memory
-    // path, which already takes bytes.
-    writeBufferBytes(handle, destinationOffset, bytes) {
-      return this.writeBufferRaw(handle, destinationOffset, bytes);
-    },
-
-    // Texture counterpart of writeBufferBytes: no base64, no strings.
-    writeTextureBytes(handle, bytes, mipLevel, depthOrLayer, x, y, width, height, bytesPerRow, rowsPerImage) {
-      return this.writeTextureRaw(handle, bytes, mipLevel, depthOrLayer, x, y, width, height, bytesPerRow, rowsPerImage);
-    },
-
-    writeBufferText(handle, destinationOffset, text, byteLength) {
-      const bytes = packedTextToBytes(text, byteLength);
-      if (_gpuProbe) {
-        noteUniformProbe(get(handle, "buffer"), handle, destinationOffset, bytes, byteLength);
-      }
-      markCall("writeBuffer", {
-        handle, destinationOffset, byteLength, packedChars: text.length
-      });
-      const buffer = get(handle, "buffer");
-      if (buffer._shadow && destinationOffset + byteLength <= buffer._shadow.length) {
-        buffer._shadow.set(bytes, destinationOffset);
-      }
-      _noteBytes(buffer, "write", byteLength);
-      _noteUploadBytes(buffer._label || "?", byteLength);
-      device.queue.writeBuffer(buffer.buffer, destinationOffset, bytes);
-    },
-
-    /**
-     * Typed-array upload path. WasmLM passes a view into its shared Java heap;
-     * WasmGC's raw reader bridge passes the exact decoded scratch view without
-     * materializing a Java String.
-     */
-    writeBufferRaw(handle, destinationOffset, bytes) {
-      const byteLength = bytes?.byteLength ?? 0;
-      const entry = get(handle, "buffer");
-      // Two uniform-buffer probes used to run on every upload: a regex over
-      // the label, and â€” for any buffer <= 256 B, which is every UBO slot â€”
-      // a slice plus two typed-array materializations with a rounding map.
-      // They answer questions from the atlas/uniform investigations, so they
-      // are kept, behind the flag that asks for them.
-      if (_gpuProbe) noteUniformProbe(entry, handle, destinationOffset, bytes, byteLength);
-      markCall("writeBufferRaw", {handle, destinationOffset, byteLength});
-      if (entry._shadow && destinationOffset + byteLength <= entry._shadow.length) {
-        entry._shadow.set(bytes, destinationOffset);
-      }
-      _noteBytes(entry, "write", byteLength);
-      _noteUploadBytes(entry._label || "?", byteLength);
-      device.queue.writeBuffer(entry.buffer, destinationOffset, bytes);
-    },
-
-    writeTexture64(handle, base64, mipLevel, depthOrLayer, x, y, width, height, bytesPerRow, rowsPerImage) {
-      markCall("writeTexture", {handle, mipLevel, depthOrLayer, x, y, width, height, bytesPerRow, rowsPerImage, base64Length: base64?.length});
-      const _te = get(handle, "texture");
-      _te._uploads = (_te._uploads || 0) + 1;            // DIAG
-      // Survives destroyTexture: records that a label was written at all, and
-      // on which handle. If an atlas shows writes here but the handle terrain
-      // samples has none, the upload landed on a since-replaced instance --
-      // the "stale handle" case the probe below was written to catch.
-      {
-        const wl = (globalThis.mcWebGpu._texWriteLog ||= {});
-        const key = (_te._label || "?");
-        const rec = (wl[key] ||= {writes: 0, handles: []});
-        rec.writes++;
-        if (!rec.handles.includes(handle)) rec.handles.push(handle);
-      }
-      _te._uploadBytes = (_te._uploadBytes || 0) + (base64 ? base64.length : 0); // DIAG (base64 len âˆ bytes)
-      if (_te._uploadRegions.length < 100) {
-        _te._uploadRegions.push({mipLevel, depthOrLayer, x, y, width, height, bytesPerRow, rowsPerImage});
-      }
-      { const _k = _te._label || "?"; const _u = _uploadByLabel.get(_k) || [0, 0]; _u[0]++; _u[1] += base64 ? base64.length : 0; _uploadByLabel.set(_k, _u); } // DIAG
-      if (/panorama/i.test(_te._label)) _panoProbe.uploads.push({ hid: _te._hid, label: _te._label, layer: depthOrLayer, w: width, h: height, mip: mipLevel, b64len: base64 ? base64.length : 0 });
-      device.queue.writeTexture(
-        {texture: _te.texture, mipLevel, origin: {x, y, z: depthOrLayer}},
-        base64ToBytes(base64),
-        {bytesPerRow, rowsPerImage},
-        {width, height, depthOrArrayLayers: 1}
-      );
-    },
-
-    /** WasmLM texture upload: consume the shared linear-memory view directly. */
-    writeTextureRaw(handle, bytes, mipLevel, depthOrLayer, x, y, width, height, bytesPerRow, rowsPerImage) {
-      const byteLength = bytes?.byteLength ?? 0;
-      markCall("writeTextureRaw", {handle, mipLevel, depthOrLayer, x, y, width, height, bytesPerRow, rowsPerImage, byteLength});
-      const _te = get(handle, "texture");
-      _te._uploads = (_te._uploads || 0) + 1;
-      {
-        const wl = (globalThis.mcWebGpu._texWriteLog ||= {});
-        const key = (_te._label || "?");
-        const rec = (wl[key] ||= {writes: 0, handles: []});
-        rec.writes++;
-        if (!rec.handles.includes(handle)) rec.handles.push(handle);
-      }
-      _te._uploadBytes = (_te._uploadBytes || 0) + byteLength;
-      if (_te._uploadRegions.length < 100) {
-        _te._uploadRegions.push({mipLevel, depthOrLayer, x, y, width, height, bytesPerRow, rowsPerImage});
-      }
-      { const _k = _te._label || "?"; const _u = _uploadByLabel.get(_k) || [0, 0]; _u[0]++; _u[1] += byteLength; _uploadByLabel.set(_k, _u); }
-      if (/panorama/i.test(_te._label)) _panoProbe.uploads.push({hid: _te._hid, label: _te._label, layer: depthOrLayer, w: width, h: height, mip: mipLevel, byteLength});
-      device.queue.writeTexture(
-        {texture: _te.texture, mipLevel, origin: {x, y, z: depthOrLayer}},
-        bytes,
-        {bytesPerRow, rowsPerImage},
-        {width, height, depthOrArrayLayers: 1}
-      );
-    },
-
-    clearColorTexture(encoderHandle, textureHandle, r, g, b, a) {
-      const encoder = get(encoderHandle, "command encoder").encoder;
-      const texture = get(textureHandle, "texture").texture;
-      const pass = encoder.beginRenderPass({
-        label: "Minecraft clearColorTexture",
-        colorAttachments: [{
-          view: texture.createView(),
-          clearValue: {r, g, b, a},
-          loadOp: "clear",
-          storeOp: "store"
-        }]
-      });
-      pass.end();
-    },
-
-    clearColorAndDepth(encoderHandle, colorHandle, r, g, b, a, depthHandle, depth) {
-      const encoder = get(encoderHandle, "command encoder").encoder;
-      const pass = encoder.beginRenderPass({
-        label: "Minecraft clearColorAndDepth",
-        colorAttachments: [{
-          view: get(colorHandle, "texture").texture.createView(),
-          clearValue: {r, g, b, a},
-          loadOp: "clear",
-          storeOp: "store"
-        }],
-        depthStencilAttachment: {
-          view: get(depthHandle, "texture").texture.createView(),
-          depthClearValue: depth,
-          depthLoadOp: "clear",
-          depthStoreOp: "store"
-        }
-      });
-      pass.end();
-    },
-
-    clearColorAndDepthRegion(
-      encoderHandle,
-      colorHandle,
-      r,
-      g,
-      b,
-      a,
-      depthHandle,
-      depth,
-      x,
-      y,
-      width,
-      height
-    ) {
-      const encoder = get(encoderHandle, "command encoder").encoder;
-      const colorEntry = get(colorHandle, "texture");
-      const depthEntry = get(depthHandle, "texture");
-      const colorFormat = colorEntry.format || "rgba8unorm";
-      const depthFormat = depthEntry.format || "depth32float";
-      const values = [r, g, b, a, depth].map((value) => Number(value).toFixed(8));
-      const key = `${colorFormat}|${depthFormat}|${values.join("|")}`;
-      let pipeline = regionClearPipelines.get(key);
-      if (!pipeline) {
-        const module = device.createShaderModule({
-          label: "Minecraft regional color/depth clear",
-          code: `
-struct ClearOutput {
-  @location(0) color: vec4<f32>,
-  @builtin(frag_depth) depth: f32,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> @builtin(position) vec4<f32> {
-  let positions = array<vec2<f32>, 3>(
-    vec2<f32>(-1.0, -1.0),
-    vec2<f32>(3.0, -1.0),
-    vec2<f32>(-1.0, 3.0)
-  );
-  return vec4<f32>(positions[vertexIndex], 0.0, 1.0);
-}
-
-@fragment
-fn fs_main() -> ClearOutput {
-  var output: ClearOutput;
-  output.color = vec4<f32>(${values.slice(0, 4).join(", ")});
-  output.depth = ${values[4]};
-  return output;
-}`
-        });
-        pipeline = device.createRenderPipeline({
-          label: "Minecraft regional color/depth clear",
-          layout: "auto",
-          vertex: {module, entryPoint: "vs_main"},
-          fragment: {
-            module,
-            entryPoint: "fs_main",
-            targets: [{format: colorFormat}]
-          },
-          primitive: {topology: "triangle-list"},
-          depthStencil: {
-            format: depthFormat,
-            depthWriteEnabled: true,
-            depthCompare: "always"
-          }
-        });
-        regionClearPipelines.set(key, pipeline);
-      }
-
-      const pass = encoder.beginRenderPass({
-        label: "Minecraft clearColorAndDepthRegion",
-        colorAttachments: [{
-          view: colorEntry.texture.createView(),
-          loadOp: "load",
-          storeOp: "store"
-        }],
-        depthStencilAttachment: {
-          view: depthEntry.texture.createView(),
-          depthLoadOp: "load",
-          depthStoreOp: "store"
-        }
-      });
-      const clearWidth = Math.max(1, Math.min(width, colorEntry.width - x));
-      const clearHeight = Math.max(1, Math.min(height, colorEntry.height - y));
-      // Minecraft exposes OpenGL's bottom-left texture coordinates; WebGPU
-      // scissor rectangles use a top-left origin.
-      const webGpuY = Math.max(0, colorEntry.height - y - clearHeight);
-      pass.setScissorRect(
-        Math.max(0, x),
-        webGpuY,
-        clearWidth,
-        clearHeight
-      );
-      pass.setPipeline(pipeline);
-      pass.draw(3);
-      pass.end();
-    },
-
-    clearDepth(encoderHandle, textureHandle, depth) {
-      (globalThis.mcWebGpu._depthClears ||= {})["clearDepth:" + depth] =
-        ((globalThis.mcWebGpu._depthClears || {})["clearDepth:" + depth] || 0) + 1;
-      const encoder = get(encoderHandle, "command encoder").encoder;
-      const pass = encoder.beginRenderPass({
-        label: "Minecraft clearDepth",
-        // colorAttachments is a required WebIDL member even for depth-only
-        // passes â€” an empty sequence is the valid depth-only form.
-        colorAttachments: [],
-        depthStencilAttachment: {
-          view: get(textureHandle, "texture").texture.createView(),
-          depthClearValue: depth,
-          depthLoadOp: "clear",
-          depthStoreOp: "store"
-        }
-      });
-      pass.end();
-    },
-
-    copyTexture(encoderHandle, sourceHandle, destinationHandle,
-                sourceX, sourceY, destinationX, destinationY,
-                width, height, mipLevel) {
-      const encoder = get(encoderHandle, "command encoder").encoder;
-      const source = get(sourceHandle, "source texture");
-      const destination = get(destinationHandle, "destination texture");
-      // DIAG (one-shot per dest label): is the atlas/gui assembled by GPU blit,
-      // and from a source that actually has uploads? Remove with the fix.
-      {
-        const dl = destination._label || "?";
-        if (/atlas|gui|widget|title|font/.test(dl) && !(copyTexture._seen || (copyTexture._seen = new Set())).has(dl)) {
-          copyTexture._seen.add(dl);
-          console.log("[COPY-TEX] dest=" + dl + " (hid=" + destination._hid + ",uploads=" + (destination._uploads || 0) + ") <- src=" + (source._label || "?") + " (hid=" + source._hid + ",uploads=" + (source._uploads || 0) + ") " + width + "x" + height);
-        }
-      }
-      destination._copiesIn = (destination._copiesIn || 0) + 1;
-      source._copiesOut = (source._copiesOut || 0) + 1;
-      // Clamp to what actually remains in each texture from its own origin. The
-      // offsets used to be dropped entirely, which silently turned every
-      // sub-rectangle blit into a copy of the top-left corner; the mip level was
-      // dropped with them, so mip blits overwrote mip 0.
-      const mip = Math.max(0, mipLevel | 0);
-      const sx = Math.max(0, sourceX | 0);
-      const sy = Math.max(0, sourceY | 0);
-      const dx = Math.max(0, destinationX | 0);
-      const dy = Math.max(0, destinationY | 0);
-      const mipExtent = (size) => Math.max(1, (size ?? 0) >> mip);
-      const w = Math.max(0, Math.min(
-        width,
-        mipExtent(source.width) - sx,
-        mipExtent(destination.width) - dx
-      ));
-      const h = Math.max(0, Math.min(
-        height,
-        mipExtent(source.height) - sy,
-        mipExtent(destination.height) - dy
-      ));
-      if (!w || !h) return;
-      encoder.copyTextureToTexture(
-        {texture: source.texture, mipLevel: mip, origin: {x: sx, y: sy, z: 0}},
-        {texture: destination.texture, mipLevel: mip, origin: {x: dx, y: dy, z: 0}},
-        {width: w, height: h, depthOrArrayLayers: 1}
-      );
-    },
-
-    copyBuffer(encoderHandle, sourceHandle, sourceOffset, destinationHandle, destinationOffset, size) {
-      const encoder = get(encoderHandle, "command encoder").encoder;
-      const source = get(sourceHandle, "source buffer");
-      const destination = get(destinationHandle, "destination buffer");
-      if (/Auto Storage/i.test(destination?._label || "")) {
-        const r = (globalThis.mcWebGpu._autoIndexWrites ||= {writeBuffer: 0, bytes: 0, copies: 0});
-        r.copies++;
-      }
-      // Keep the diagnostic CPU mirror coherent with the GPU copy. Persistent
-      // GUI/text vertex buffers are filled from transient staging buffers, so
-      // inspecting only queue.writeBuffer calls otherwise reports misleading
-      // all-zero destination vertices.
-      if (source._shadow && destination._shadow
-          && sourceOffset >= 0 && destinationOffset >= 0
-          && sourceOffset + size <= source._shadow.length
-          && destinationOffset + size <= destination._shadow.length) {
-        destination._shadow.set(
-          source._shadow.subarray(sourceOffset, sourceOffset + size),
-          destinationOffset
-        );
-      }
-      _noteBytes(destination, "copy", size);
-      encoder.copyBufferToBuffer(
-        source.buffer,
-        sourceOffset,
-        destination.buffer,
-        destinationOffset,
-        size
-      );
-    },
-
-    submit(encoderHandle) {
-      markCall("submit", {encoderHandle});
-      const entry = get(encoderHandle, "command encoder");
-      // Error scopes resolve asynchronously. Freeze the candidate view, its
-      // parent state, the call tail, and the RPC batch at this submit boundary
-      // so a later frame cannot overwrite the evidence before the scope pops.
-      const validationCandidate = snapshotTextureValidation();
-      _lastSubmitTextureCandidate = validationCandidate;
-      const gpuSubmitStarted = _perf.on ? performance.now() : 0;
-      // Validation errors poison the device; capture them per submit so the
-      // first offending command is reported before the device is lost.
-      if (typeof device.pushErrorScope === "function") {
-        device.pushErrorScope("validation");
-        device.pushErrorScope("out-of-memory");
-      }
-      device.queue.submit([entry.encoder.finish()]);
-      if (_perf.on && typeof device.queue.onSubmittedWorkDone === "function") {
-        _perf.gpuSubmits++;
-        device.queue.onSubmittedWorkDone().then(() => {
-          _perf.gpuQueueMs.push(performance.now() - gpuSubmitStarted);
-        }).catch(() => {});
-      }
-      // Attach everything queued since the prior submit to this submission's
-      // completion fence before releasing the underlying GPU objects.
-      flushGraveyard();
-      if (typeof device.popErrorScope === "function") {
-        const onScopeError = (label) => (error) => {
-          if (error) {
-            const msg = `[WebGPU ${label}] ${error.message}`;
-            noteTextureValidation(msg, validationCandidate);
-            console.error(msg);
-            if (!globalThis.mcWebGpu._firstGpuError) {
-              globalThis.mcWebGpu._firstGpuError = msg;
-            }
-            // DIAG: keep the first N validation messages UN-deduplicated so the
-            // ROOT error (e.g. a createBindGroup "too small"/overrun) is visible
-            // and not hidden behind later "invalid due to a previous error"
-            // cascades. Queryable via globalThis.mcWebGpu._valErrors.
-            const ve = (globalThis.mcWebGpu._valErrors ||= []);
-            if (ve.length < 16) ve.push(msg.slice(0, 400));
-          }
-        };
-        // "Instance dropped" rejections are benign (headless SwiftShader
-        // quirk, or device torn down at process exit); swallow them quietly.
-        const swallowDropped = () => {};
-        device.popErrorScope().then(onScopeError("oom"), swallowDropped);
-        device.popErrorScope().then(onScopeError("validation"), swallowDropped);
-      }
-      objects.delete(encoderHandle);
-    },
-
-    createPipeline(specJson) {
-      const spec = JSON.parse(specJson);
-      (globalThis.mcWebGpu._pipelineSpecs ||= {})[spec.label] = {
-        vertexShader: spec.vertexShader,
-        fragmentShader: spec.fragmentShader,
-        defines: spec.defines,
-        uniforms: (spec.bindGroups || []).flatMap((g) => g.uniforms || []),
-        samplers: (spec.bindGroups || []).flatMap((g) => g.samplers || []),
-        vertexElements: (spec.vertexFormats?.[0]?.elements || []).map((e) => e.name),
-      };
-      if (/entity|item_|transparency/.test(spec.label || "")) {
-        (globalThis.mcWebGpu._rawPipelineSpecs ||= {})[spec.label] = spec;
-      }
-      // DIAG: what depth state each pipeline declares, and what it resolves to.
-      // COMPARE_OP silently falls back to "less-equal" for any name it does not
-      // know, which under Mojang's reverse-Z projection (near maps to 1, far to
-      // 0) rejects every fragment against a 0.0 depth clear -- invisible
-      // geometry with correct draw calls and no validation error.
-      (globalThis.mcWebGpu._pipelineDepth ||= {})[spec.label] = spec.depthStencil
-        ? {
-            declared: spec.depthStencil.depthTest,
-            resolved: COMPARE_OP[spec.depthStencil.depthTest] || "less-equal(FALLBACK)",
-            write: spec.depthStencil.writeDepth
-          }
-        : null;
-      if (/panorama/i.test(spec.label)) _panoProbe.pipeBegin.push({ label: spec.label, vs: spec.vertexShader, topo: spec.topology });
-      markCall("createPipeline", {label: spec.label});
-      try {
-        // For families whose spec declares no depth state, the natural base is
-        // the NO-depth pipeline; the depth variant is the alt below. (Passing
-        // the default would synthesize depth into the base and leave the
-        // no-depth pass unmatched.) Families with depthStencil keep the default.
-        const baseDepthArg = spec.depthStencil ? undefined : null;
-        const built = buildPipeline(spec, baseDepthArg);
-        if (!built) {
-          recordStage(`pipeline-skipped:${spec.label}`);
-          if (/panorama/i.test(spec.label)) _panoProbe.pipeSkip.push(spec.label);
-          return 0;
-        }
-        // Pre-build the *other* depth attachment state up front so rpSetPipeline
-        // can pick an exact match by direct lookup (the lazy variant path raced
-        // the cached base handle and left the no-depth pipeline bound in a
-        // depth pass). Map key null = no depth attachment.
-        const byDepth = new Map();
-        byDepth.set(built.depthFormat, built.pipeline);
-        const baseDepth = built.depthFormat;
-        const altDepth = spec.depthStencil ? null : "depth32float";
-        if (altDepth !== baseDepth) {
-          try {
-            const alt = buildPipeline(spec, altDepth);
-            if (alt) byDepth.set(alt.depthFormat, alt.pipeline);
-          } catch (altError) {
-            recordStage(`pipeline-alt-failed:${spec.label}:${altDepth}:${altError.message}`);
-          }
-        }
-        recordStage(`pipeline-ok:${spec.label}`);
-        if (/panorama/i.test(spec.label)) _panoProbe.pipeOk.push(spec.label);
-        return put({kind: "pipeline", ...built, byDepth});
-      } catch (error) {
-        recordStage(`pipeline-failed:${spec.label}:${error.message}`);
-        if (/panorama/i.test(spec.label)) _panoProbe.pipeFail.push(spec.label + ":" + error.message);
-        console.warn("pipeline failed:", spec.label, error);
-        return 0;
-      }
-    },
-
-    beginRenderPass(encoderHandle, descriptorJson) {
-      const descriptor = JSON.parse(descriptorJson);
-      markCall("beginRenderPass", descriptor);
-      const encoder = get(encoderHandle, "command encoder").encoder;
-      const colorAttachments = descriptor.color.map((attachment) => {
-        if (!attachment) return null;
-        const viewEntry = get(attachment.view, "texture view");
-        _textureLifetime.noteViewUse(attachment.view, viewEntry);
-        const gpuAttachment = {
-          view: viewEntry.view,
-          storeOp: "store"
-        };
-        if (attachment.clear) {
-          gpuAttachment.loadOp = "clear";
-          gpuAttachment.clearValue = {
-            r: attachment.clear[0],
-            g: attachment.clear[1],
-            b: attachment.clear[2],
-            a: attachment.clear[3]
-          };
-        } else {
-          gpuAttachment.loadOp = "load";
-        }
-        return gpuAttachment;
-      });
-      // Render-target census. 26.2 fills an atlas by *drawing* sprites into it,
-      // so neither _uploads (writeTexture) nor _copiesIn (copyTexture) counts
-      // that path -- an atlas can read 0/0 and still be fully populated, or
-      // 0/0 and never touched, and those look identical without this. Keyed by
-      // the colour attachment's texture label.
-      {
-        const census = (globalThis.mcWebGpu._renderTargets ||= {});
-        for (const attachment of descriptor.color) {
-          if (!attachment) continue;
-          const viewEntry = get(attachment.view, "texture view");
-          const label = String(viewEntry.textureEntry?._label ?? "?")
-            + " mip" + (viewEntry.baseMip ?? 0);
-          const record = (census[label] ||= {passes: 0, draws: 0, cleared: 0});
-          record.passes++;
-          if (attachment.clear) record.cleared++;
-        }
-      }
-      const passDescriptor = {label: "Minecraft render pass", colorAttachments};
-      let depthFormat = null;
-      if (descriptor.depth) {
-        const viewEntry = get(descriptor.depth.view, "texture view");
-        _textureLifetime.noteViewUse(descriptor.depth.view, viewEntry);
-        depthFormat = viewEntry.textureEntry.format || "depth32float";
-        const hasStencil = depthFormat.includes("stencil");
-        passDescriptor.depthStencilAttachment = {
-          view: viewEntry.view,
-          depthStoreOp: "store",
-          // Stencil ops only for stencil-bearing formats.
-          ...(hasStencil ? {stencilStoreOp: "store"} : {})
-        };
-        if (descriptor.depth.clear != null) {
-          passDescriptor.depthStencilAttachment.depthLoadOp = "clear";
-          passDescriptor.depthStencilAttachment.depthClearValue = descriptor.depth.clear;
-          (globalThis.mcWebGpu._depthClears ||= {})[String(descriptor.depth.clear)] =
-            ((globalThis.mcWebGpu._depthClears || {})[String(descriptor.depth.clear)] || 0) + 1;
-          if (hasStencil) {
-            passDescriptor.depthStencilAttachment.stencilLoadOp = "clear";
-            passDescriptor.depthStencilAttachment.stencilClearValue = 0;
-          }
-        } else {
-          passDescriptor.depthStencilAttachment.depthLoadOp = "load";
-          if (hasStencil) passDescriptor.depthStencilAttachment.stencilLoadOp = "load";
-        }
-      }
-      const pass = encoder.beginRenderPass(passDescriptor);
-      const firstColor = descriptor.color.find((a) => a) || null;
-      const firstColorEntry = firstColor ? get(firstColor.view, "texture view").textureEntry : null;
-      const height = descriptor.height || (firstColorEntry ? firstColorEntry.height : canvas.height);
-      // The scene main target is whichever non-canvas target the frame draws to
-      // most (the GUI/title render), NOT the largest by area. Count draws per
-      // target this frame and choose at present() time.
-      let passState_tid = 0;
-      if (firstColorEntry && !firstColorEntry.isCanvas) {
-        if (firstColorEntry._tid == null) { firstColorEntry._tid = ++texSeq; texInventory.push(firstColorEntry); }
-        passState_tid = firstColorEntry._tid;
-      } else {
-        passState_tid = firstColorEntry && firstColorEntry.isCanvas ? -1 : 0;
-      }
-      return put({
-        kind: "renderPass",
-        pass,
-        // Retained so the depth attachment can be snapshotted the instant the
-        // world pass ends. Reading it at end of frame is useless: GUI passes
-        // clear depth (clearDepth:0 fires 6495 times a run), so a late read
-        // always shows the cleared value and hides whether terrain ever wrote.
-        _encoder: encoder,
-        _depthEntry: descriptor.depth ? get(descriptor.depth.view, "texture view").textureEntry : null,
-        _sawTerrain: false,
-        height,
-        depthFormat,
-        area: descriptor.area || null,
-        _tid: passState_tid,
-        _drawn: 0,
-        pipeline: null,
-        resources: new Map(),
-        drawTexBinds: [], // positional texture binds this draw (name-independent fallback)
-        vertexBuffers: [],
-        indexBuffer: null,
-        boundGroups: [],
-        // DIAG: render target identity for atlas-assembly debugging
-        _targetLabel: firstColorEntry
-          ? firstColorEntry._label + " mip" + (get(firstColor.view, "texture view").baseMip ?? 0)
-          : null,
-        _targetWH: firstColorEntry ? (firstColorEntry.width + "x" + firstColorEntry.height) : null,
-        _targetTid: firstColorEntry ? firstColorEntry._tid : null,
-        // Ordered pass trace for ?mcweb_drawcensus. Terrain drawing into the
-        // right target and still not appearing points at frame order: a later
-        // pass that clears the same attachment would erase it.
-        _traceEntry: _drawCensus
-          ? (() => {
-              const entry = {
-                target: firstColorEntry ? String(firstColorEntry._label) : "?",
-                clear: !!(firstColor && firstColor.clear), draws: 0,
-                // Depth state matters as much as colour here: sky draws with
-                // no depth test, terrain is depth-tested, so a depth buffer
-                // that is never cleared rejects every terrain fragment while
-                // the sky still shows.
-                depth: descriptor.depth
-                  ? (descriptor.depth.clear != null ? "clear" + descriptor.depth.clear : "load")
-                  : "none",
-              };
-              _framePassTrace.push(entry);
-              return entry;
-            })()
-          : null,
-        _scissor: null
-      });
-    },
-
-    rpEnd(passHandle) {
-      if (_renderCommandReplayDepth === 0) markCall("rpEnd", {passHandle});
-      const state = passState(passHandle);
-      state.pass.end();
-      if (state._drawn) {
-        const record = (globalThis.mcWebGpu._renderTargets ||= {})[state._targetLabel ?? "?"];
-        if (record) record.draws += state._drawn;
-      }
-      // Capture a pass that actually drew a lot of terrain, not merely the
-      // first pass that bound a terrain pipeline: terrain does not start
-      // drawing until ~tick 2425, so an early pass yields an all-zero depth
-      // buffer that proves nothing. Record the draw count so an all-zero
-      // result can be told apart from an empty pass.
-      if (state._sawTerrain) {
-        // Census first: how many draws a terrain pass really carries, whether
-        // it has a depth attachment at all, and at which ticks. The previous
-        // threshold of 50 draws never triggered -- terrain draws ~36 times per
-        // frame split across passes -- so the "no depth captured" result said
-        // nothing about the renderer.
-        const c = (globalThis.mcWebGpu._terrainPassCensus ||= {
-          passes: 0, totalDraws: 0, maxDraws: 0, withDepth: 0, firstTick: null, lastTick: null
-        });
-        c.passes++;
-        c.totalDraws += state._drawn;
-        c.maxDraws = Math.max(c.maxDraws, state._drawn);
-        if (state._depthEntry) c.withDepth++;
-        const tick = globalThis.mcWebPump?.ticks || 0;
-        if (c.firstTick == null) c.firstTick = tick;
-        c.lastTick = tick;
-      }
-      if (state._sawTerrain && state._depthEntry && !_depthSnapshot
-          && state._drawn >= 5
-          && (_drawCensus || (globalThis.mcWebPump?.ticks || 0) > 2600)) {
-        const tex = state._depthEntry;
-        const bytesPerRow = Math.ceil(tex.width * 4 / 256) * 256;
-        try {
-          _depthSnapshot = {
-            buffer: device.createBuffer({
-              size: bytesPerRow * tex.height,
-              usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
-            }),
-            bytesPerRow, width: tex.width, height: tex.height, label: tex._label,
-            drawn: state._drawn, tick: globalThis.mcWebPump?.ticks || 0
-          };
-          state._encoder.copyTextureToBuffer(
-            {texture: tex.texture, aspect: "depth-only"},
-            {buffer: _depthSnapshot.buffer, bytesPerRow, rowsPerImage: tex.height},
-            {width: tex.width, height: tex.height, depthOrArrayLayers: 1}
-          );
-        } catch (error) {
-          _depthSnapshot = {error: String(error).slice(0, 200)};
-        }
-      }
-      // Uniform snapshot, taken the same way the depth snapshot is: with the
-      // pass's own encoder, immediately after pass.end(), so the bytes are the
-      // ones this submission used. Reading a uniform buffer at present() time
-      // measures a recycled ring buffer and reports zeros for every pipeline,
-      // including ones that visibly render.
-      if (_drawCensus && state._sawTerrain && !_uniformSnapshot
-          && globalThis.mcWebGpu._terrainDrawSample?.projection) {
-        const range = globalThis.mcWebGpu._terrainDrawSample.projection;
-        const entry = objects.get(range.bufferHandle);
-        if (entry && entry.buffer) {
-          try {
-            _uniformSnapshot = {
-              buffer: device.createBuffer({
-                size: 64,
-                usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
-              }),
-              drawn: state._drawn
-            };
-            state._encoder.copyBufferToBuffer(entry.buffer, range.offset,
-              _uniformSnapshot.buffer, 0, 64);
-          } catch (error) {
-            _uniformSnapshot = {error: String(error).slice(0, 160)};
-          }
-        }
-      }
-      if (_drawCensus && state._sawVisible && !_visibleUniformSnapshot
-          && globalThis.mcWebGpu._visibleProjRange) {
-        const range = globalThis.mcWebGpu._visibleProjRange;
-        const entry = objects.get(range.bufferHandle);
-        if (entry && entry.buffer) {
-          try {
-            _visibleUniformSnapshot = {
-              buffer: device.createBuffer({
-                size: 64,
-                usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
-              }),
-              drawn: state._drawn
-            };
-            state._encoder.copyBufferToBuffer(entry.buffer, range.offset,
-              _visibleUniformSnapshot.buffer, 0, 64);
-          } catch (error) {
-            _visibleUniformSnapshot = {error: String(error).slice(0, 160)};
-          }
-        }
-      }
-      // Track canvas passes (_tid === -1) separately: Mojang draws the splash
-      // straight to the canvas, so when the canvas is the last-drawn target we
-      // must NOT composite (it would overwrite Mojang's correct output).
-      if (state._tid === -1 && state._drawn) {
-        frameLastTid = -1;
-        frameLastIsCanvas = true;
-      }
-      if (state._tid > 0 && state._drawn) {
-        frameDraws.set(state._tid, (frameDraws.get(state._tid) || 0) + state._drawn);
-        // Stamp draw order for non-canvas targets.
-        state._seq = ++drawSeq;
-        frameDrawSeq.set(state._tid, state._seq);
-        frameLastTid = state._tid;
-        // A non-canvas target drawn after any canvas pass means Mojang is NOT
-        // presenting to the canvas directly (title screen renders offscreen).
-        frameLastIsCanvas = false;
-      }
-      objects.delete(passHandle);
-    },
-
-    rpSetPipeline(passHandle, pipelineHandle) {
-      if (_renderCommandReplayDepth === 0) {
-        markCall("rpSetPipeline", {passHandle, pipelineHandle});
-      }
-      const state = passState(passHandle);
-      if (!pipelineHandle) {
-        state.pipeline = null;
-        return;
-      }
-      const entry = get(pipelineHandle, "pipeline");
-      const passDepth = state.depthFormat || null;
-      // Pick the pre-built pipeline whose depth attachment matches this pass
-      // (createPipeline built both states into entry.byDepth). Direct lookup,
-      // no lazy caching race. Fall back to a just-in-time build for any depth
-      // format not pre-built (e.g. depth24plus-stencil8), then to the base.
-      let chosen = entry.byDepth?.get(passDepth);
-      let chosenDepth = passDepth;
-      if (!chosen && passDepth) {
-        let lazy = entry.variants?.get(passDepth);
-        if (!lazy) {
-          try {
-            const built = buildPipeline(entry.spec, passDepth);
-            if (built) {
-              lazy = {pipeline: built.pipeline, depthFormat: passDepth};
-              (entry.variants ??= new Map()).set(passDepth, lazy);
-              recordStage(`depth-variant-ok:${entry.spec.label}:${passDepth}`);
-            }
-          } catch (error) {
-            recordStage(`depth-variant-failed:${entry.spec.label}:${error.message}`);
-          }
-        }
-        if (lazy) { chosen = lazy.pipeline; chosenDepth = lazy.depthFormat; }
-      }
-      if (!chosen) { chosen = entry.pipeline; chosenDepth = entry.depthFormat; }
-      if (entry.spec && /panorama/i.test(entry.spec.label)) _panoProbe.set++;
-      if (_DBG && entry.spec && /blit|interpolate|panorama|sky|stars/.test(entry.spec.label) && (_rpDbgN = (_rpDbgN || 0) + 1) <= 6) {
-        console.log("[rpSetPipeline-dbg]", entry.spec.label, "passDepth=", String(passDepth),
-          "byDepthKeys=", JSON.stringify([...(entry.byDepth?.keys() || [])].map((k) => String(k))),
-          "variantsKeys=", JSON.stringify([...(entry.variants?.keys() || [])].map((k) => String(k))),
-          "chosenDepth=", String(chosenDepth),
-          "entryDepth=", String(entry.depthFormat));
-      }
-      if (/terrain/.test(entry.spec?.label || "")) state._sawTerrain = true;
-      // Control: a pipeline whose output is visible on screen, sampled the
-      // same way, so "terrain's projection is zero" can be told apart from
-      // "every projection reads zero".
-      if (_drawCensus && /\/(sky|celestial)$/.test(entry.spec?.label || "")) {
-        state._sawVisible = true;
-        const r = state.resources.get("Projection");
-        if (r && !globalThis.mcWebGpu._visibleProjRange) {
-          globalThis.mcWebGpu._visibleProjRange =
-            {bufferHandle: r.bufferHandle, offset: r.offset, size: r.size};
-        }
-      }
-      state.pipeline = {...entry, pipeline: chosen, depthFormat: chosenDepth};
-      // ?mcweb_suppress=<regex> drops draws from matching pipelines. This is an
-      // isolation tool only; the normal path renders CloudFaces through the
-      // formatted-texel compatibility adapter above.
-      state._suppressed = _isPipelineSuppressed(entry.spec?.label || "");
-      state.pass.setPipeline(chosen);
-      state.boundGroups = [];
-    },
-
-    // Renames a freshly created object's handle.
-    //
-    // For the OpenJDK lane, whose RPC has to answer Java before the host has
-    // run the call: the client hands Java a placeholder, the host creates the
-    // object under its own handle, and this moves it onto the placeholder so
-    // the two are the same number from then on. Every lookup goes through the
-    // one `objects` map, so nothing else needs to know. Returns false if the
-    // handle names no object, which keeps a non-handle return value (a width, a
-    // boolean) from renaming something at random.
-    rekeyObject(from, to) {
-      if (from === to) return true;
-      const object = objects.get(from);
-      if (object === undefined) return false;
-      objects.delete(from);
-      if (object && typeof object === "object") object._handle = to;
-      objects.set(to, object);
-      return true;
-    },
-
-    // Publishes one interned binding name. Images used to write _bindingNames
-    // directly from their @JS body, which only works when the host object is
-    // the host: over the OpenJDK lane's RPC proxy the write lands on a local
-    // stand-in and every later rpSetUniform fails to resolve its name. Going
-    // through a method means the call is forwarded like any other.
-    registerBindingName(id, name) {
-      (this._bindingNames ||= [])[id] = name;
-    },
-
-    // New images pass an interned integer id here.  Keep accepting a string as
-    // well: staged WasmLM images are expensive to rebuild and older artifacts
-    // call this same host entry point with the pre-interning String ABI.  Do not
-    // index _bindingNames with that value -- a WasmLM Java String is a Proxy,
-    // and coercing it to a property key re-enters the wasm string bridge until
-    // the Java stack overflows.
-    rpBindTexture(passHandle, nameId, viewHandle, samplerHandle) {
-      const name = resolveBindingName(nameId, "texture");
-      if (_renderCommandReplayDepth === 0) markCall("rpBindTexture", {passHandle, name});
-      const state = passState(passHandle);
-      const _viewEntry = get(viewHandle, "texture view");
-      _textureLifetime.noteViewUse(viewHandle, _viewEntry);
-      const texRec = {
-        kind: "texture",
-        view: _viewEntry.view,
-        viewHandle,
-        sampler: get(samplerHandle, "sampler").sampler,
-        samplerHandle,
-        _name: name,                  // DIAG: name Mojang bound under
-        _texEntry: _viewEntry.textureEntry // DIAG: underlying texture entry (uploads/size)
-      };
-      state.resources.set(name, texRec);
-      // Positional record too: Mojang's bindTexture name need not equal the
-      // pipeline spec's sampler name (the lookup key in ensureBindGroups). When
-      // the name lookup misses we fall back to bind order (Nth bind â†’ Nth
-      // sampler slot), which is name-independent and correct for the
-      // single-sampler textured families (text/position_tex*/panorama).
-      state.drawTexBinds.push(texRec);
-    },
-
-    rpSetUniform(passHandle, nameId, bufferHandle, offset, size) {
-      const name = resolveBindingName(nameId, "uniform");
-      if (_renderCommandReplayDepth === 0) markCall("rpSetUniform", {passHandle, name});
-      const state = passState(passHandle);
-      const _bentry = get(bufferHandle, "buffer");
-      // DIAG: terrain.fsh ends with
-      //   color = mix(FogColor * vec4(1,1,1,color.a), color, ChunkVisibility)
-      // so ChunkVisibility == 0 paints the whole chunk in FogColor no matter
-      // what the atlas sample returned -- a uniform pale-blue wash over all
-      // terrain, while entity and GUI shaders (no ChunkVisibility) stay
-      // correct. Capture the bytes actually bound, std140:
-      //   mat4 ModelViewMat @0, float ChunkVisibility @64,
-      //   ivec2 TextureSize @72, ivec3 ChunkPosition @80.
-      if (name === "ChunkSection" && _bentry._shadow) {
-        const ring = (globalThis.mcWebGpu._chunkSectionRing ||= []);
-        if (ring.length < 40) {
-          const base = (_bentry._shadow.byteOffset || 0) + offset;
-          if (base + 92 <= _bentry._shadow.buffer.byteLength) {
-            const f = new Float32Array(_bentry._shadow.buffer, base, 23);
-            const i = new Int32Array(_bentry._shadow.buffer, base, 23);
-            ring.push({
-              chunkVisibility: f[16],
-              textureSize: [i[18], i[19]],
-              chunkPosition: [i[20], i[21], i[22]],
-              // Full matrix, not just the diagonal: terrain provably does not
-              // rasterise (a pass with 18 draws writes zero depth), so
-              // gl_Position must be recomputed by hand from the measured
-              // inputs to find which factor collapses or clips it.
-              modelView: Array.from({length: 16}, (_, k) => f[k])
-            });
-          }
-        }
-      }
-      state.resources.set(name, {
-        kind: "uniform",
-        buffer: _bentry.buffer,
-        bufferHandle,
-        bufferSize: _bentry.size, // full buffer size, for safe uniform-range inflate
-        offset,
-        size
-      });
-    },
-
-    rpSetVertexBuffer(passHandle, slot, bufferHandle, offset, size) {
-      const state = passState(passHandle);
-      state.vertexBuffers[slot] = {buffer: get(bufferHandle, "buffer").buffer, offset, size, _handle: bufferHandle};
-    },
-
-    rpSetIndexBuffer(passHandle, bufferHandle, format) {
-      const state = passState(passHandle);
-      state.indexBuffer = {buffer: get(bufferHandle, "buffer").buffer, format, _handle: bufferHandle};
-    },
-
-    rpScissor(passHandle, x, y, width, height) {
-      const state = passState(passHandle);
-      // Bottom-left origin (Minecraft) -> top-left origin (WebGPU).
-      const yy = Math.max(0, state.height - y - height);
-      const ww = Math.max(1, width);
-      const hh = Math.max(1, height);
-      state._scissor = [x, yy, ww, hh];
-      state.pass.setScissorRect(x, yy, ww, hh);
-    },
-
-    rpDisableScissor(passHandle) {
-      const state = passState(passHandle);
-      if (state.area) {
-        state._scissor = state.area.slice();
-        state.pass.setScissorRect(state.area[0], state.area[1], state.area[2], state.area[3]);
-      } else {
-        state._scissor = [0, 0, 32767, 32767];
-        state.pass.setScissorRect(0, 0, 32767, 32767);
-      }
-    },
-
-    rpCommandStreamRaw(passHandle, bytes, byteLength, end) {
-      return replayRenderPassCommands(this, passHandle, bytes, byteLength, end, "raw");
-    },
-
-    rpCommandStream64(passHandle, base64, byteLength, end) {
-      return replayRenderPassCommands(this, passHandle, base64, byteLength, end, "base64");
-    },
-
-    rpCommandStreamText(passHandle, text, wordCount, end) {
-      return replayRenderPassCommands(
-        this, passHandle, text, wordCount * 4, end, "packed-text"
-      );
-    },
-
-    rpCommandStreamWasmGc(passHandle, words, wordCount, end, readWord) {
-      return replayRenderPassCommands(
-        this, passHandle, words, wordCount * 4, end, "wasmgc-reader", readWord
-      );
-    },
-
-    drawBatchEnabled() {
-      return new URLSearchParams(globalThis.location?.search || "").has("mcweb_gpu_immediate") ? 0 : 1;
-    },
-
-    rpDrawIndexedBatch(passHandle, base64, drawCount) {
-      const bytes = base64ToBytes(base64);
-      if (bytes.length < drawCount * 20) throw new Error("indexed draw batch is truncated");
-      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-      for (let i = 0; i < drawCount; i++) {
-        const base = i * 20;
-        this.rpDrawIndexed(passHandle, view.getInt32(base, true), view.getInt32(base + 4, true),
-          view.getInt32(base + 8, true), view.getInt32(base + 12, true), view.getInt32(base + 16, true));
-      }
-    },
-
-    rpDrawBatch(passHandle, base64, drawCount) {
-      const bytes = base64ToBytes(base64);
-      if (bytes.length < drawCount * 16) throw new Error("draw batch is truncated");
-      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-      for (let i = 0; i < drawCount; i++) {
-        const base = i * 16;
-        this.rpDraw(passHandle, view.getInt32(base, true), view.getInt32(base + 4, true),
-          view.getInt32(base + 8, true), view.getInt32(base + 12, true));
-      }
-    },
-
-    rpDraw(passHandle, firstVertex, vertexCount, instanceCount, baseInstance) {
-      if (_renderCommandReplayDepth === 0) markCall("rpDraw", {passHandle, vertexCount});
-      const state = passState(passHandle);
-      state._drawn++;
-      // ?mcweb_drawcensus=1: which pipelines actually issue draws, and into
-      // which target. Chunk counters say terrain is renderable; this says
-      // whether anything is drawn for it. Inert unless the flag is present.
-      if (_drawCensus) _noteDrawCensus(state, vertexCount, instanceCount);
-      if (!state.pipeline || state._suppressed) return;
-      _noteFontDraw(state, "draw", {firstVertex, vertexCount, instanceCount});
-      ensureBindGroups(state);
-      state.drawTexBinds.length = 0; // binds consumed AFTER ensureBindGroups reads them
-      // DIAG: one-shot animate_sprite UBO + target dump
-      if (!_animDbgDone && state.pipeline.spec && /animate_sprite/.test(state.pipeline.spec.label)) {
-        _animDbgDone = true;
-        const uni = state.resources.get("SpriteAnimationInfo");
-        let uboDump = "no SpriteAnimationInfo bound";
-        if (uni && uni.kind === "uniform") {
-          const be = objects.get(uni.bufferHandle);
-          if (be && be._shadow) {
-            const f = new Float32Array(be._shadow.buffer, uni.offset, 32);
-            const i32 = new Int32Array(be._shadow.buffer, uni.offset, 35);
-            uboDump = JSON.stringify({
-              bufLabel: be._label, bufSize: be.size, uniOffset: uni.offset, uniSize: uni.size,
-              ProjMat: Array.from(f.slice(0, 16)),
-              SpriteMat: Array.from(f.slice(16, 32)),
-              UPadding: f[32], VPadding: f[33], MipMapLevel: i32[34]
-            });
-          } else { uboDump = "buffer handle " + uni.bufferHandle + " has no shadow"; }
-        }
-        const spr = state.resources.get("Sprite");
-        const sprInfo = spr && spr.kind === "texture" && spr._texEntry
-          ? {label: spr._texEntry._label, uploads: spr._texEntry._uploads, wh: spr._texEntry.width + "x" + spr._texEntry.height}
-          : "not bound or no entry";
-        console.log("[ANIM-SPRITE-DIAG] target=" + state._targetLabel + " " + state._targetWH
-          + " | UBO: " + uboDump
-          + " | Sprite tex: " + JSON.stringify(sprInfo)
-          + " | vertexCount=" + vertexCount + " firstVertex=" + firstVertex);
-      }
-      if (state.pipeline && state.pipeline.spec && /animate_sprite/.test(state.pipeline.spec.label) && _animRing.length < 40) {
-        const _au = state.resources.get("SpriteAnimationInfo");
-        let _asm = null, _apm = null;
-        if (_au && _au.kind === "uniform") { const _abe = objects.get(_au.bufferHandle); if (_abe && _abe._shadow) { const _af = new Float32Array(_abe._shadow.buffer, (_abe._shadow.byteOffset || 0) + _au.offset, 32); _apm = [_af[0], _af[5]]; _asm = [_af[16], _af[21], _af[28], _af[29]]; } }
-        const _asp = state.resources.get("Sprite"); const _ase = _asp && _asp.kind === "texture" && _asp._texEntry;
-        _animRing.push({ tgt: state._targetLabel, tgtWH: state._targetWH, pm: _apm, sm: _asm, spr: _ase ? (_ase._label || "?").split("/").pop() : null, swh: _ase ? (_ase.width + "x" + _ase.height) : null, sup: _ase ? _ase._uploads : null });
-        if (_asmBad.length < 12 && state._targetLabel && !/\/atlas\//.test(state._targetLabel)) _asmBad.push({ tgt: state._targetLabel, tgtWH: state._targetWH, pm: _apm, spr: _ase ? (_ase._label || "?").split("/").pop() : null });
-      }
-      if (state.pipeline && state.pipeline.spec && /animate_sprite/.test(state.pipeline.spec.label)) {
-        const target = state._targetLabel || "?";
-        _animTargetCounts.set(target, (_animTargetCounts.get(target) || 0) + 1);
-        if (/atlas\/gui\.png/.test(target) && _guiAtlasRing.length < 40) {
-          const uniform = state.resources.get("SpriteAnimationInfo");
-          let projection = null;
-          let spriteMatrix = null;
-          if (uniform && uniform.kind === "uniform") {
-            const buffer = objects.get(uniform.bufferHandle);
-            if (buffer && buffer._shadow) {
-              const values = new Float32Array(
-                buffer._shadow.buffer,
-                (buffer._shadow.byteOffset || 0) + uniform.offset,
-                32
-              );
-              projection = [values[0], values[5]];
-              spriteMatrix = [values[16], values[21], values[28], values[29]];
-            }
-          }
-          const sprite = state.resources.get("Sprite");
-          const texture = sprite && sprite.kind === "texture" && sprite._texEntry;
-          _guiAtlasRing.push({
-            target,
-            projection,
-            spriteMatrix,
-            sprite: texture ? texture._label : null,
-            size: texture ? `${texture.width}x${texture.height}` : null,
-            uploads: texture ? texture._uploads || 0 : 0
-          });
-        }
-      }
-      _maybeTexDrawDiag(state, "rpDraw");
-      _decodeGuiDraw(state, "draw", {vertexCount, firstVertex, baseVertex: 0, indexCount: 0});
-      _noteScatter(state);
-      applyVertexAndIndex(state);
-      if (needsLowering(state)) {
-        const lowered = loweredIndices(state.pipeline.spec.topology, firstVertex + vertexCount);
-        if (lowered) {
-          state.pass.setIndexBuffer(lowered.buffer, "uint32");
-          state.pass.drawIndexed(lowered.count, Math.max(1, instanceCount), 0, 0, 0);
-          return;
-        }
-      }
-      state.pass.draw(vertexCount, Math.max(1, instanceCount), firstVertex, 0);
-    },
-
-    rpDrawIndexed(passHandle, indexCount, instanceCount, firstIndex, baseVertex, firstInstance) {
-      if (_renderCommandReplayDepth === 0) {
-        markCall("rpDrawIndexed", {passHandle, indexCount});
-      }
-      const state = passState(passHandle);
-      state._drawn++;
-      // Indexed draws are how world geometry actually reaches the GPU; the
-      // non-indexed path above is mostly atlas blits. Census both or the
-      // in-world picture looks empty for the wrong reason.
-      if (_drawCensus) _noteDrawCensus(state, indexCount, instanceCount);
-      // Control sample: the same uniform ranges for a pipeline that is visibly
-      // rendering. "Terrain's Projection reads as zero" only means something
-      // if a working draw's Projection does not.
-      if (_drawCensus && !globalThis.mcWebGpu._visibleDrawSample
-          && /celestial|clouds|entity_/.test(state.pipeline?.spec?.label || "")
-          && state.resources.get("Projection")) {
-        const r = state.resources.get("Projection");
-        globalThis.mcWebGpu._visibleDrawSample = {
-          label: state.pipeline.spec.label,
-          projection: {bufferHandle: r.bufferHandle, offset: r.offset, size: r.size},
-        };
-      }
-      // One-shot: remember which vertex buffer a terrain draw read, so its
-      // actual bytes can be decoded later (see readTerrainVertices).
-      if (!globalThis.mcWebGpu._terrainDrawSample
-          && /solid_terrain/.test(state.pipeline?.spec?.label || "")
-          && state.vertexBuffers[0]) {
-        const vb = state.vertexBuffers[0];
-        const uniformRange = (name) => {
-          const r = state.resources.get(name);
-          return r ? {bufferHandle: r.bufferHandle, offset: r.offset, size: r.size} : null;
-        };
-        globalThis.mcWebGpu._terrainDrawSample = {
-          bufferHandle: vb._handle,
-          offset: vb.offset,
-          stride: state.pipeline.spec.vertexFormats?.[0]?.stride ?? 28,
-          indexCount, baseVertex, firstIndex,
-          // The transform inputs, captured at the draw that used them:
-          //   pos = Position + (ChunkPosition - CameraBlockPos) + CameraOffset
-          //   gl_Position = ProjMat * ModelViewMat * vec4(pos, 1)
-          // Vertex data and every texture measured correct, so if terrain is
-          // absent rather than black, one of these is placing it off-screen.
-          vbOffset: vb.offset,
-          vbSize: vb.size,
-          vbBufferSize: objects.get(vb._handle)?.size ?? null,
-          // The comparison that matters: a bound range of vbSize bytes at
-          // stride 28 holds vbSize/28 vertices, and the draw indexes up to
-          // baseVertex + (max index in the run). If that exceeds the range the
-          // browser rejects the draw outright.
-          vertexCapacity: Math.floor((vb.size ?? 0) / 28),
-          indexBufferHandle: state.indexBuffer?._handle ?? null,
-          indexFormat: state.indexBuffer?.format ?? null,
-          globals: uniformRange("Globals"),
-          projection: uniformRange("Projection"),
-          chunkSection: uniformRange("ChunkSection")
-        };
-      }
-      if (state._suppressed) {
-        _noteCloudDraw(state,
-          {indexCount, instanceCount, firstIndex, baseVertex, firstInstance}, false);
-        return;
-      }
-      if (!state.pipeline) {
-        // Silently dropped: no pipeline bound. Counted so a whole family of
-        // missing geometry cannot hide behind a clean validation log.
-        const census = (globalThis.mcWebGpu._drawCensus ||= {});
-        const row = (census["<dropped-no-pipeline>"] ||= {draws: 0, maxVb: 0, kinds: {}, sample: null});
-        row.draws++;
-        return;
-      }
-      _noteFontDraw(state, "indexed", {indexCount, instanceCount, firstIndex, baseVertex, firstInstance});
-      ensureBindGroups(state);
-      state.drawTexBinds.length = 0;
-      _maybeTexDrawDiag(state, "rpDrawIndexed");
-      _decodeGuiDraw(state, "idx", {indexCount, firstIndex, baseVertex, firstVertex: 0});
-      _noteScatter(state);
-      applyVertexAndIndex(state);
-      _noteDraw(state, "indexed", {indexCount, firstIndex, baseVertex});
-      _noteCloudDraw(state,
-        {indexCount, instanceCount, firstIndex, baseVertex, firstInstance}, true);
-      state.pass.drawIndexed(indexCount, Math.max(1, instanceCount), firstIndex, baseVertex, firstInstance);
-    },
-
-    rpDrawIndirect(passHandle, bufferHandle, offset, drawCount) {
-      const state = passState(passHandle);
-      state._drawn++;
-      if (!state.pipeline) return;
-      _noteFontDraw(state, "indirect", {bufferHandle, offset, drawCount});
-      ensureBindGroups(state);
-      state.drawTexBinds.length = 0;
-      applyVertexAndIndex(state);
-      const buffer = get(bufferHandle, "buffer").buffer;
-      for (let i = 0; i < drawCount; i++) {
-        state.pass.drawIndirect(buffer, offset + i * 16);
-      }
-    },
-
-    rpDrawIndexedIndirect(passHandle, bufferHandle, offset, drawCount) {
-      const state = passState(passHandle);
-      state._drawn++;
-      if (!state.pipeline) return;
-      _noteFontDraw(state, "indexedIndirect", {bufferHandle, offset, drawCount});
-      ensureBindGroups(state);
-      state.drawTexBinds.length = 0;
-      applyVertexAndIndex(state);
-      const buffer = get(bufferHandle, "buffer").buffer;
-      for (let i = 0; i < drawCount; i++) {
-        state.pass.drawIndexedIndirect(buffer, offset + i * 20);
-      }
-    },
-
-    rpPushDebugGroup(passHandle, label) {
-      const state = passState(passHandle);
-      if (typeof state.pass.pushDebugGroup === "function") state.pass.pushDebugGroup(label);
-    },
-
-    rpPushDebugGroupId(passHandle, labelId) {
-      const label = resolveBindingName(labelId, "debug group");
-      const state = passState(passHandle);
-      if (typeof state.pass.pushDebugGroup === "function") state.pass.pushDebugGroup(label);
-    },
-
-    rpPopDebugGroup(passHandle) {
-      const state = passState(passHandle);
-      if (typeof state.pass.popDebugGroup === "function") state.pass.popDebugGroup();
-    },
-
-    configureCanvas(width, height) {
-      canvas.width = width;
-      canvas.height = height;
-      context.configure({
-        device,
-        format: "rgba8unorm",
-        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
-        alphaMode: "opaque"
-      });
-    },
-
-    acquireCanvasTexture() {
-      return put({kind: "texture", isCanvas: true, texture: context.getCurrentTexture(), format: "rgba8unorm", width: canvas.width, height: canvas.height, depth: 1});
-    },
-
-    present(handle) {
-      markCall("present", {handle});
-      _lastPresentAt = Date.now();
-      _presentCount++;
-      if (_drawCensus && _lastPresentAt - _presentEnterAt > 10000) {
-        _presentEnterAt = _lastPresentAt;
-        console.log("[draw-census] present enter #" + _presentCount);
-      }
-      // End of frame: the per-target draw maps are complete. Snapshot + reset.
-      lastFrameDraws = frameDraws;
-      frameDraws = new Map();
-      lastFrameDrawSeq = frameDrawSeq;
-      frameDrawSeq = new Map();
-      lastFrameIsCanvas = frameLastIsCanvas;
-      frameLastTid = 0; frameLastIsCanvas = false;
-      // DIAG: preserve this frame's sampled set for _texDiag, then clear for next.
-      _lastFrameSampled = _sampledThisFrame;
-      _sampledThisFrame = new Set();
-      const _qs = new URLSearchParams(location.search);
-      // DIAG: with ?mcweb_texdiag, snapshot+readback the sampled textures ONCE the
-      // title screen is up (frame>40). Console.table the result; no blind testing.
-      if (_qs.has("mcweb_texdiag") && !_texDiagDone && (globalThis.mcWebPump?.ticks || 0) > 40 && _lastFrameSampled.size) {
-        _texDiagDone = true;
-        globalThis.mcWebGpu._texDiag();
-      }
-      // DIAG: LATE lifetime dump (frame>200): per-label total uploads + how many
-      // texture INSTANCES exist per label and each one's upload count. Answers
-      // "did the atlas EVER upload (just late)?" and "is the sampled atlas a
-      // different instance than the uploaded one (stale handle)?".
-      // Gate on a few ticks, not 200: with the per-frame blur validation spam
-      // each tick takes ~6s, so 200 ticks never arrives in a probe window.
-      // _sampledEntries is cumulative, so a few frames already hold the title
-      // screen's textures.
-      if (_qs.has("mcweb_texdiag") && !_texDiagLateDone && (globalThis.mcWebPump?.ticks || 0) >= 3) {
-        _texDiagLateDone = true;
-        globalThis.mcWebGpu._texDiagLate();
-      }
-      if (!_guiRingDumped && _guiDrawRing.length && (globalThis.mcWebPump?.ticks || 0) >= 2) {
-        _guiRingDumped = true;
-        console.log("[GUI-DRAW-RING] " + JSON.stringify(_guiDrawRing));
-      }
-      if (!_panoDumped && (globalThis.mcWebPump?.ticks || 0) >= 2) {
-        _panoDumped = true;
-        console.log("[PANO-PROBE] " + JSON.stringify(_panoProbe));
-      }
-      if (!_probe2Dumped && (globalThis.mcWebPump?.ticks || 0) >= 2) {
-        _probe2Dumped = true;
-        console.log("[PROBE2] animRing=" + JSON.stringify(_animRing) + " | javaErr=" + JSON.stringify(_javaErrBuf));
-      }
-      if (!_probe3Dumped && (globalThis.mcWebPump?.ticks || 0) >= 2) {
-        _probe3Dumped = true;
-        console.log("[PROBE3] asmBad=" + JSON.stringify(_asmBad) + " | scatter=" + JSON.stringify(_scatterDraws) + " | comp=" + JSON.stringify(compositeSource ? {label: compositeSource._label, wh: compositeSource.width + "x" + compositeSource.height, tid: compositeSource._tid} : null));
-        // Write a human-readable verdict to the on-page div so a screenshot suffices.
-        const _vLines = [];
-        const _compLbl = compositeSource ? (compositeSource._label || "?") + " " + compositeSource.width + "x" + compositeSource.height : "null";
-        _vLines.push("comp=" + _compLbl);
-        if (_asmBad.length) {
-          _vLines.push("VERDICT: atlas-assembly MIS-TARGETED (" + _asmBad.length + " draws onto non-atlas)");
-          _vLines.push("  first tgt=" + (_asmBad[0].tgt || "?") + " src=" + (_asmBad[0].src || "?"));
-        } else if (_scatterDraws.length) {
-          _vLines.push("VERDICT: screen draws sample raw sprites (" + _scatterDraws.length + " draws)");
-          _vLines.push("  first src=" + (_scatterDraws[0].src || "?") + " tgt=" + (_scatterDraws[0].tgt || "?"));
-        } else {
-          _vLines.push("VERDICT: asmBad=0 scatter=0 â†’ scatter NOT from assembly or screen-draw path");
-          _vLines.push("  (check composite source above; if comp=atlas â†’ composite picks wrong texture)");
-        }
-        const _vd = document.getElementById("mcweb-probe-verdict");
-        if (_vd) _vd.textContent = _vLines.join("\n");
-      }
-      const _diag = _qs.get("mcweb_diag");
-      // Composite-source policy. Mojang draws the loading SPLASH straight to the
-      // canvas, but renders the TITLE screen (panorama + GUI) into an offscreen
-      // main target that its presenter does NOT copy to the canvas in our
-      // backend â€” so with no composite the title goes black (the user's
-      // "splash â†’ black" report). The correct source is the target drawn LAST
-      // in the frame (the GUI/title composition; the panorama atlas is drawn
-      // early and samples as flat black, which is what the old max-draws pick
-      // grabbed). The composite is a no-op for the splash (there the last draw
-      // is the canvas itself, which we never composite), so it is safe to
-      // enable by default. Overrides: ?mcweb_nocomposite (off), or
-      // ?mcweb_composite=lastdraw|maxdraws|<tid>.
-      const _cval = _qs.get("mcweb_composite");
-      const _noComposite = _qs.has("mcweb_nocomposite");
-      const _mode = !_cval ? "lastdraw" : (_cval === "maxdraws" ? "maxdraws" : (_cval === "lastdraw" ? "lastdraw" : "tid"));
-      const _forceTid = _mode === "tid" ? Number(_cval) : 0;
-      if (!_diag && !_noComposite && !lastFrameIsCanvas) {
-        if (_forceTid) {
-          const e = texInventory.find((t) => t._tid === _forceTid);
-          if (e) compositeSource = e;
-        } else if (_mode === "maxdraws") {
-          let bestTid = 0, bestDraws = 0;
-          for (const [tid, n] of lastFrameDraws) { if (n > bestDraws) { bestDraws = n; bestTid = tid; } }
-          if (bestTid) {
-            const e = texInventory.find((t) => t._tid === bestTid);
-            if (e) compositeSource = e;
-          }
-        } else {
-          // Composite-source selection. Mojang's frame draws the panorama + GUI
-          // composition into the main target (created at exactly canvas pixel
-          // size), then TextureAtlas.tick() â†’ uploadAnimationFrames() opens a
-          // render pass on the atlas (both dims power-of-two) which gets the
-          // highest drawSeq.  The old naive max-seq pick grabbed the atlas and
-          // stretched its packed sprites across the canvas (the scattered icon
-          // grid in the broken screenshot).  Fix: prefer the target whose
-          // dimensions EXACTLY match the canvas (the main target is created at
-          // canvas.width Ã— canvas.height by Mojang's presenter), then fall back
-          // to aspect-ratio match excluding atlases, then plain lastdraw.
-          const isPOT = (n) => n > 0 && (n & (n - 1)) === 0;
-          const isAtlas = (e) => {
-            if (!e || !e.width || !e.height) return true;
-            // Both dims power-of-two = texture atlas (gui/widgets/blocks).
-            if (isPOT(e.width) && isPOT(e.height)) return true;
-            // Very wide or very tall non-screen-aspect textures (sprite sheets).
-            const a = e.width / e.height;
-            if (a > 3 || a < 0.33) return true;
-            return false;
-          };
-          const canvasAspect = canvas.width / canvas.height;
-          const aspectMatch = (e) => {
-            if (!e || !e.width || !e.height) return false;
-            const a = e.width / e.height;
-            return Math.abs(a - canvasAspect) / canvasAspect < 0.15;
-          };
-          // Pass 1: Minecraft names the scene presenter target `Main / Color`.
-          // Prefer that semantic identity before considering dimensions or draw
-          // order. Portal/transparency/post processing creates FBO 0 and FBO 1
-          // at the exact same canvas size; choosing the last of those is browser
-          // scheduling dependent and can present a cleared black auxiliary FBO.
-          let bestTid = 0, bestSeq = 0;
-          for (const [tid, sq] of lastFrameDrawSeq) {
-            const e = texInventory.find((t) => t._tid === tid);
-            if (e && String(e._label || "").toLowerCase() === "main / color"
-                && sq > bestSeq) {
-              bestSeq = sq; bestTid = tid;
-            }
-          }
-          // Pass 2: exact canvas-dimension match. This remains the generic
-          // fallback for early/diagnostic images that do not name a Main target.
-          if (!bestTid) {
-            for (const [tid, sq] of lastFrameDrawSeq) {
-              const e = texInventory.find((t) => t._tid === tid);
-              if (e && e.width === canvas.width && e.height === canvas.height && sq > bestSeq) {
-                bestSeq = sq; bestTid = tid;
-              }
-            }
-          }
-          // Pass 3: aspect match + not atlas.
-          if (!bestTid) {
-            for (const [tid, sq] of lastFrameDrawSeq) {
-              const e = texInventory.find((t) => t._tid === tid);
-              if (e && !isAtlas(e) && aspectMatch(e) && sq > bestSeq) { bestSeq = sq; bestTid = tid; }
-            }
-          }
-          // Pass 4: last-drawn non-atlas (any aspect).
-          if (!bestTid) {
-            for (const [tid, sq] of lastFrameDrawSeq) {
-              const e = texInventory.find((t) => t._tid === tid);
-              if (e && !isAtlas(e) && sq > bestSeq) { bestSeq = sq; bestTid = tid; }
-            }
-          }
-          // Pass 5: plain lastdraw (fallback).
-          if (!bestTid) {
-            for (const [tid, sq] of lastFrameDrawSeq) { if (sq > bestSeq) { bestSeq = sq; bestTid = tid; } }
-          }
-          if (bestTid) {
-            const e = texInventory.find((t) => t._tid === bestTid);
-            if (e) compositeSource = e;
-          }
-        }
-      }
-      // Composite the scene main target to the swap-chain canvas: Mojang's 26.2
-      // presenter acquires + presents the canvas texture but never draws or
-      // copies into it, so without this the canvas stays empty. The canvas
-      // texture is still the current one here (valid until context.present()).
-      // Under ?mcweb_drawcensus the census already says which pipelines drew
-      // into which target; pair it with what the composite actually put on the
-      // canvas, or "terrain drew but nothing appeared" stays ambiguous.
-      if (_drawCensus) {
-        const now = Date.now();
-        if (now - _compositeLogAt > 10000) {
-          _compositeLogAt = now;
-          console.log("[draw-census] composite <- "
-            + (compositeSource ? (compositeSource._label || "?") + " "
-                + compositeSource.width + "x" + compositeSource.height
-                + " tid=" + compositeSource._tid : "null")
-            + " noComposite=" + _noComposite + " lastFrameIsCanvas=" + lastFrameIsCanvas);
-        }
-      }
-      if (!_noComposite && compositeSource && compositeSource.texture) {
-        try {
-          const canvasTexture = context.getCurrentTexture();
-          const enc = device.createCommandEncoder({label: "mcweb-composite-encoder"});
-          // ?mcweb_diag=magenta â†’ clear the canvas to magenta and draw nothing.
-          // If magenta appears on screen, this pass reaches the presented
-          // drawable (so a black screen means the SOURCE is empty/wrong); if
-          // the screen stays black, this pass isn't being presented at all.
-          const diag = _diag;
-          const clear = diag === "magenta" ? {r: 1, g: 0, b: 1, a: 1} : {r: 0, g: 0, b: 0, a: 1};
-          const pass = enc.beginRenderPass({colorAttachments: [{
-            view: canvasTexture.createView(),
-            loadOp: "clear", storeOp: "store", clearValue: clear
-          }]});
-          if (diag !== "magenta") {
-            const pipeline = ensureComposite(canvas.height);
-            // ?mcweb_diag=checker â†’ sample a known-good in-page texture instead
-            // of the tracked scene target. Checker on screen â‡’ sampling works
-            // and the tracked source is the problem; black â‡’ sampling is broken.
-            const srcTex = diag === "checker" ? ensureDiagChecker() : compositeSource.texture;
-            const bg = device.createBindGroup({layout: pipeline.getBindGroupLayout(0), entries: [
-              {binding: 0, resource: compositeSampler},
-              {binding: 1, resource: srcTex.createView()}
-            ]});
-            pass.setPipeline(pipeline);
-            pass.setBindGroup(0, bg);
-            pass.draw(3);
-          }
-          pass.end();
-          device.queue.submit([enc.finish()]);
-          flushGraveyard();
-          markCall("composite", {source: compositeSource.width + "x" + compositeSource.height, area: compositeSource._area, diag: diag || "blit"});
-        } catch (error) {
-          markCall("composite-failed", {error: String(error).slice(0, 120)});
-          if (_drawCensus) console.log("[draw-census] composite FAILED " + String(error).slice(0, 160));
-        }
-      }
-      if (_drawCensus && Date.now() - _presentExitAt > 10000) {
-        _presentExitAt = Date.now();
-        console.log("[draw-census] present exit #" + _presentCount);
-        // Only the passes that touched the composited target matter here.
-        const main = _framePassTrace
-          .filter((entry) => /main \/ color/i.test(entry.target))
-          .map((entry) => (entry.clear ? "CLEAR" : "load") + "/d=" + entry.depth
-            + "/sc=" + (entry.scissor ?? "-") + "/ar=" + (entry.area ?? "-")
-            + ":" + entry.draws + "[" + [...(entry.pipes || [])].join(",") + "]");
-        console.log("[draw-census] frame passes on Main/Color: " + main.slice(0, 8).join(" -> "));
-        // The question is what runs *after* terrain in the same target.
-        const terrainAt = main.findLastIndex((entry) => /terrain/.test(entry));
-        // Which depth clear values the frame used at all. Vanilla clears the
-        // world depth before terrain; if only GUI's clear-to-0 ever appears,
-        // terrain is depth-testing against a buffer that says "nearest".
-        // One-shot: read back what a terrain draw actually fed the GPU. If the
-        // positions are degenerate or absurd, the geometry never had a chance
-        // of landing on screen and nothing downstream matters.
-        // Did terrain rasterise at all? The pass clears depth to 0 and terrain
-        // writes depth, so a non-zero texel is geometry that passed the depth
-        // test and wrote. All-zero means nothing rasterised, whatever the
-        // colour buffer shows - which separates "geometry never landed" from
-        // "geometry landed and was not shaded/blended into view".
-        if (!_terrainDepthDumped && _depthSnapshot) {
-          _terrainDepthDumped = true;
-          Promise.resolve(globalThis.mcWebGpu.readTerrainPassDepth()).then((result) => {
-            console.log("[draw-census] terrain pass depth " + JSON.stringify(result));
-          }).catch((error) => {
-            console.log("[draw-census] terrain depth failed " + String(error).slice(0, 120));
-          });
-        }
-        if (!_uniformSnapshotDumped && _uniformSnapshot && !_uniformSnapshot.error) {
-          _uniformSnapshotDumped = true;
-          const snapshot = _uniformSnapshot;
-          snapshot.buffer.mapAsync(GPUMapMode.READ).then(() => {
-            const floats = new Float32Array(snapshot.buffer.getMappedRange().slice(0));
-            snapshot.buffer.unmap();
-            console.log("[draw-census] PROJECTION at terrain pass (drawn="
-              + snapshot.drawn + ") "
-              + JSON.stringify(Array.from(floats).map((v) => Number(v.toFixed(4)))));
-          }).catch((error) => {
-            console.log("[draw-census] projection snapshot failed "
-              + String(error).slice(0, 120));
-          });
-        }
-        if (!_visibleSnapshotDumped && _visibleUniformSnapshot
-            && !_visibleUniformSnapshot.error) {
-          _visibleSnapshotDumped = true;
-          const snapshot = _visibleUniformSnapshot;
-          snapshot.buffer.mapAsync(GPUMapMode.READ).then(() => {
-            const floats = new Float32Array(snapshot.buffer.getMappedRange().slice(0));
-            snapshot.buffer.unmap();
-            console.log("[draw-census] PROJECTION at sky pass (drawn="
-              + snapshot.drawn + ") "
-              + JSON.stringify(Array.from(floats).map((v) => Number(v.toFixed(4)))));
-          }).catch(() => {});
-        }
-        // With ?mcweb_gpu_probe the host records the floats of every UBO-sized
-        // write keyed by label#handle. Pair that with the handle the terrain
-        // draw actually bound: if a good matrix is written to one instance and
-        // the draw binds another, the draw sees a freshly-zeroed buffer.
-        if (!_writeProbeDumped && globalThis.mcWebGpu._smallBufferWrites
-            && globalThis.mcWebGpu._terrainDrawSample?.projection) {
-          _writeProbeDumped = true;
-          const bound = globalThis.mcWebGpu._terrainDrawSample.projection;
-          console.log("[draw-census] terrain binds Projection handle="
-            + bound.bufferHandle + " offset=" + bound.offset + " size=" + bound.size);
-          const history = globalThis.mcWebGpu._smallBufferWriteHistory || {};
-          for (const [key, list] of Object.entries(history)) {
-            if (!Array.isArray(list) || !/level/i.test(key)) continue;
-            list.forEach((r, i) => {
-              console.log("[draw-census] history " + key + " #" + i
-                + " seq=" + r.seq + " f=" + JSON.stringify(r.floats.slice(0, 6)));
-            });
-          }
-          for (const [key, value] of Object.entries(globalThis.mcWebGpu._smallBufferWrites)) {
-            if (!/Proj|Dynamic|Transform|Globals/i.test(key)) continue;
-            console.log("[draw-census] write " + key + " @" + value.offset
-              + " f=" + JSON.stringify(value.floats.slice(0, 16)));
-            // Ints too: garbage floats that are a byte-shifted or int-encoded
-            // view of a sane matrix show up clearly in the raw words.
-            console.log("[draw-census] write " + key + " i="
-              + JSON.stringify(value.ints.slice(0, 16)));
-          }
-        }
-        if (!_terrainUniformDumped && globalThis.mcWebGpu._terrainDrawSample) {
-          _terrainUniformDumped = true;
-          for (const which of ["projection", "globals", "chunkSection"]) {
-            Promise.resolve(globalThis.mcWebGpu.readTerrainUniform(which)).then((r) => {
-              console.log("[draw-census] uniform " + which + " "
-                + (r.error ? r.error : JSON.stringify(r.floats)));
-            }).catch(() => {});
-          }
-          Promise.resolve(globalThis.mcWebGpu.readTerrainUniform("projection", "visible"))
-            .then((r) => {
-              console.log("[draw-census] uniform CONTROL projection ("
-                + (globalThis.mcWebGpu._visibleDrawSample?.label || "?") + ") "
-                + (r.error ? r.error : JSON.stringify(r.floats)));
-            }).catch(() => {});
-        }
-        if (!_terrainVertsDumped && globalThis.mcWebGpu._terrainDrawSample) {
-          _terrainVertsDumped = true;
-          Promise.resolve(globalThis.mcWebGpu.readTerrainVertices()).then((result) => {
-            if (!result || result.error) {
-              console.log("[draw-census] terrain verts: " + (result && result.error));
-              return;
-            }
-            console.log("[draw-census] terrain rec "
-              + JSON.stringify(result.rec).slice(0, 900));
-            for (const vertex of result.vertices.slice(0, 4)) {
-              console.log("[draw-census] vert pos=" + JSON.stringify(vertex.position)
-                + " col=" + JSON.stringify(vertex.color)
-                + " uv0=" + JSON.stringify(vertex.uv0));
-            }
-          }).catch((error) => {
-            console.log("[draw-census] terrain verts failed " + String(error).slice(0, 120));
-          });
-        }
-        // Copies are invisible to a draw census: copyTextureToTexture into the
-        // composited target after the terrain pass would erase terrain without
-        // appearing as a pass or a draw anywhere above.
-        if (compositeSource) {
-          console.log("[draw-census] target tid=" + compositeSource._tid
-            + " copiesIn=" + (compositeSource._copiesIn || 0)
-            + " copiesOut=" + (compositeSource._copiesOut || 0)
-            + " uploads=" + (compositeSource._uploads || 0));
-        }
-        console.log("[draw-census] depthClears="
-          + JSON.stringify(globalThis.mcWebGpu._depthClears || {}));
-        if (terrainAt >= 0) {
-          console.log("[draw-census] terrainPass=" + main[terrainAt]);
-        }
-        console.log("[draw-census] passes=" + main.length + " lastTerrainPass=" + terrainAt
-          + " after=" + (terrainAt < 0 ? "n/a" : main.slice(terrainAt + 1).join(" -> ").slice(0, 400)));
-        // Per-target draws for the frame being presented right now. The
-        // aggregate census covers ten seconds; if terrain only draws in frames
-        // that are never presented, these two disagree and that is the answer.
-        const perTarget = [];
-        for (const [tid, n] of lastFrameDraws) {
-          const e = texInventory.find((t) => t._tid === tid);
-          perTarget.push((e ? (e._label || "?") + " " + e.width + "x" + e.height : "tid" + tid)
-            + "=" + n);
-        }
-        console.log("[draw-census] presented frame draws: " + (perTarget.join(", ") || "none"));
-      }
-      if (_drawCensus) _framePassTrace.length = 0;
-      if (_presentCount === 1) markPhase("first-frame-presented");
-      objects.delete(handle);
-    },
-
-    reportSuccess(argb, backend, path) {
-      const hex = (argb >>> 0).toString(16).padStart(8, "0").toUpperCase();
-      setText("jar-status", "executed from minecraft-26.2-client.jar");
-      setText("jar-method", path);
-      setText("jar-result", `0x${hex}`);
-      setText("gpu-status", `${backend} canvas presented`);
-      document.documentElement.style.setProperty(
-        "--jar-color",
-        `rgb(${(argb >>> 16) & 255} ${(argb >>> 8) & 255} ${argb & 255})`
-      );
-      document.body.dataset.ready = "true";
-    },
-
-    reportReloadProbe(event, source = "main") {
-      const text = String(event);
-      const entries = diagnostics.reloadProbe;
-      entries.push({
-        at: Math.round(performance.now()),
-        source: String(source),
-        event: text,
-      });
-      if (entries.length > 8000) entries.splice(0, entries.length - 8000);
-      // The reload probe is most useful precisely when the main thread is stuck
-      // inside the synchronous Create World barrier. Keep the last few events in
-      // the out-of-thread watchdog ring as well; the page-side array above cannot
-      // be read while that renderer is frozen. Do not route through reportProgress:
-      // this path can be hot during the reload and must remain shared-memory-only.
-      globalThis.mcWebThreadRuntime?.diag?.("reload " + text);
-      // Keep a compact copy in CDP for the healthy portion of a run. The full
-      // reload stream is intentionally not logged here (it is thousands of task
-      // events and would overflow the console pipe); these transition records are
-      // the ones that identify a barrier that never completes.
-      if (/event=(begin|snapshot|all-done|listener-(complete|create-failed)|barrier-(wait|submit-main|main-ran|main-failed|ready-for-apply)|task-failed)/.test(text)) {
-        console.log("[MC-RELOAD]", text);
-      }
-    },
-
-    reportProgress(stage) {
-      /*
-       * Telemetry markers take the cheap path: the ring only.
-       *
-       * This method used to do the same seven things for every marker â€” a
-       * console line, a beacon write, an object allocation, a markCall, and TWO
-       * DOM writes â€” and gameplay emits ~230 markers a second, dominated by
-       * per-packet `evt:` ones. Measured at 35.76 us each, that is ~500 ms of
-       * every minute spent describing the frame rather than drawing it, and it
-       * gets far worse with DevTools open, which is exactly when someone is
-       * looking. The <dd> elements those DOM writes feed sit behind the canvas
-       * and nobody reads them mid-game.
-       *
-       * The ring is what the tests and probes actually read, so it is kept
-       * exact. `?mcweb_log_all=1` restores the full treatment for debugging.
-       */
-      if (!_logAllStages && typeof stage === "string" && _CHATTY_STAGE.test(stage)) {
-        globalThis.__mcWebLastStage = stage;
-        recordStage(stage);
-        return;
-      }
-      console.log("[MC-INIT]", stage);
-      /*
-       * Mirror into shared linear memory, where a Worker can still read it after this
-       * thread stops returning. Everything else in this method â€” the console line, the
-       * stage ring, `__mcWebLastStage` â€” lives on the main thread and disappears with
-       * it, which is why a world-load hang has never had a last known position.
-       */
-      globalThis.mcWebThreadRuntime?.beacon?.(0, stage);
-      // Web Image strips *Java* stack traces (getStackTrace() is always empty),
-      // but every @JS bridge call crosses into JavaScript, so the JS/wasm stack
-      // at the boundary is still available -- and under WasmGC it carries wasm
-      // frames. BrowserNativeMemory already reports each large allocation
-      // through here, so capturing a stack at that moment attributes the block
-      // to whatever asked for it, with no image rebuild.
-      if (typeof stage === "string" && stage.startsWith("native:large-alloc")) {
-        const sink = (globalThis.mcWebGpu._allocStacks ||= []);
-        if (sink.length < 12) {
-          sink.push({stage, stack: String(new Error("alloc").stack || "").split("\n").slice(1, 40)});
-        }
-      }
-      // Read by tests/world-create.spec.ts, tools/menu-clickthrough.mjs,
-      // tools/t0-probe.mjs and tools/browser-check.mjs. It was never assigned,
-      // so every screen wait in those tools silently saw "" and fell through to
-      // its timeout.
-      globalThis.__mcWebLastStage = stage;
-      recordStage(stage);
-      markCall("reportProgress", {stage});
-      setText("jar-status", "running minecraft-26.2-client.jar");
-      setText("jar-method", stage);
-    },
-
-    /**
-     * High-frequency probe channel: shared memory only, no console and no stage ring.
-     *
-     * Callers are spin loops that run while this thread is *not* returning to the
-     * browser, so everything `reportProgress` also does â€” the console line, the stage
-     * ring, the DOM text â€” is both unreachable and, at this rate, ruinous. The beacon
-     * write is two atomics and a bounded byte copy, which is affordable inside a wait.
-     */
-    reportDiag(text) {
-      globalThis.mcWebThreadRuntime?.diag?.(text);
-      if (String(text ?? "").startsWith("worldgen:step-failure n=")) {
-        globalThis.mcWebThreadRuntime?.stickyDiag?.(text);
-      }
-    },
-
-    // DIAG: float contents of the small uniform buffers that drive fog and the
-    // global render settings. A frame that is uniformly fog-coloured -- no
-    // sky/ground split -- while terrain issues thousands of valid draws points
-    // at the fog term saturating, not at missing geometry.
-    dumpUniforms() {
-      const out = {};
-      for (const [handle, entry] of objects) {
-        if (entry?.kind !== "buffer" || !entry._shadow) continue;
-        const label = entry._label || String(handle);
-        // All small buffers, not just fog: the terrain transform (projection,
-        // model-view, per-section offset) lives in one of these, and a section
-        // offset that never reaches the shader would draw every chunk at the
-        // world origin -- hundreds of blocks from the player, so off-screen,
-        // with entirely valid draw calls.
-        if (entry.size > 4096) continue;
-        const n = Math.min(entry._shadow.byteLength >> 2, 24);
-        out[label] = {
-          size: entry.size,
-          floats: Array.from(new Float32Array(entry._shadow.buffer, entry._shadow.byteOffset || 0, n))
-        };
-      }
-      return out;
-    },
-
-    // DIAG: every texture with its upload count. An atlas at 0 uploads never
-    // received pixels; a non-zero count means the bytes arrived and any
-    // blankness is downstream (blit, sampler, or the sprite UV lookup).
-    /**
-     * Every texture object matching `pattern`, with its handle and no top-N
-     * slicing. dumpTextures() dedups and truncates, which hides the case where
-     * several objects share a label (four are labelled blocks.png) and the one
-     * being uploaded into is not the one a draw binds.
-     */
-    /**
-     * Async readback of a small texture, for the two multipliers that can
-     * saturate terrain to white. Returns a promise of RGBA rows. Only sane for
-     * tiny textures -- the lightmap is 16x16.
-     */
-    async readSmallTexture(pattern) {
-      const re = new RegExp(pattern, "i");
-      let found = null;
-      for (const [, entry] of objects) {
-        if (entry?.kind === "texture" && re.test(String(entry._label ?? ""))) { found = entry; break; }
-      }
-      if (!found) return {error: "no texture matches " + pattern};
-      const w = found.width, h = found.height;
-      const bytesPerRow = Math.ceil(w * 4 / 256) * 256;
-      const readback = device.createBuffer({
-        size: bytesPerRow * h,
-        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
-      });
-      const encoder = device.createCommandEncoder();
-      encoder.copyTextureToBuffer(
-        {texture: found.texture},
-        {buffer: readback, bytesPerRow, rowsPerImage: h},
-        {width: w, height: h, depthOrArrayLayers: 1}
-      );
-      device.queue.submit([encoder.finish()]);
-      await readback.mapAsync(GPUMapMode.READ);
-      const bytes = new Uint8Array(readback.getMappedRange().slice(0));
-      readback.unmap();
-      readback.destroy();
-      // Sample a coarse grid across the whole texture, so this works for a
-      // 2048x2048 atlas as well as a 16x16 lightmap.
-      const stepX = Math.max(1, Math.floor(w / 16));
-      const stepY = Math.max(1, Math.floor(h / 16));
-      const rows = [];
-      const histogram = new Map();
-      for (let y = 0; y < h; y += stepY) {
-        const row = [];
-        for (let x = 0; x < w; x += stepX) {
-          const o = y * bytesPerRow + x * 4;
-          row.push([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
-        }
-        rows.push(row);
-      }
-      for (let y = 0; y < h; y += 4) {
-        for (let x = 0; x < w; x += 4) {
-          const o = y * bytesPerRow + x * 4;
-          const key = `${bytes[o]},${bytes[o + 1]},${bytes[o + 2]},${bytes[o + 3]}`;
-          histogram.set(key, (histogram.get(key) ?? 0) + 1);
-        }
-      }
-      return {
-        label: found._label,
-        wh: `${w}x${h}`,
-        rows,
-        top: [...histogram.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6)
-      };
-    },
-
-    /**
-     * Decode the vertices a terrain draw actually consumed. The section uber
-     * buffers are far above the CPU-shadow limit, so this reads the real GPU
-     * buffer back rather than a mirror -- the mirror does not exist for them,
-     * and the port's own readback path returns zeros for GPU-written buffers.
-     */
-    /** Read back any recorded uniform range as floats and ints. */
-    async readUniformRange(which) {
-      const rec = globalThis.mcWebGpu._terrainDrawSample?.[which];
-      if (!rec) return {error: "no range for " + which};
-      const entry = objects.get(rec.bufferHandle);
-      if (!entry) return {error: "buffer gone"};
-      const size = Math.ceil(Math.min(rec.size || 256, entry.size - rec.offset) / 4) * 4;
-      if (size <= 0) return {error: "empty range", rec};
-      const readback = device.createBuffer({
-        size, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
-      });
-      const encoder = device.createCommandEncoder();
-      encoder.copyBufferToBuffer(entry.buffer, rec.offset, readback, 0, size);
-      device.queue.submit([encoder.finish()]);
-      await readback.mapAsync(GPUMapMode.READ);
-      const raw = readback.getMappedRange().slice(0);
-      readback.unmap();
-      readback.destroy();
-      return {
-        rec,
-        floats: Array.from(new Float32Array(raw)).map((x) => Math.round(x * 10000) / 10000),
-        ints: Array.from(new Int32Array(raw))
-      };
-    },
-
-    /**
-     * The shared sequential quad-index buffer a terrain draw used. All-zero
-     * indices make every triangle degenerate: no fragments, from draw calls
-     * that validate cleanly and carry correct vertices and uniforms.
-     */
-    /**
-     * Depth histogram. Colour-independent answer to "did terrain rasterise?":
-     * the pass clears depth to 0 and terrain writes depth, so any texel that is
-     * not 0 is geometry that passed the depth test and wrote. All-zero means
-     * nothing ever rasterised, whatever the colour buffer shows.
-     */
-    /** The depth snapshot taken the instant a terrain pass ended. */
-    async readTerrainPassDepth() {
-      if (!_depthSnapshot) return {error: "no terrain pass depth captured"};
-      if (_depthSnapshot.error) return _depthSnapshot;
-      await _depthSnapshot.buffer.mapAsync(GPUMapMode.READ);
-      const raw = _depthSnapshot.buffer.getMappedRange().slice(0);
-      _depthSnapshot.buffer.unmap();
-      const floats = new Float32Array(raw);
-      const perRow = _depthSnapshot.bytesPerRow / 4;
-      let zero = 0, nonZero = 0, min = Infinity, max = -Infinity;
-      for (let y = 0; y < _depthSnapshot.height; y += 2) {
-        for (let x = 0; x < _depthSnapshot.width; x += 2) {
-          const d = floats[y * perRow + x];
-          if (d === 0) zero++; else { nonZero++; if (d < min) min = d; if (d > max) max = d; }
-        }
-      }
-      return {label: _depthSnapshot.label, drawn: _depthSnapshot.drawn,
-              tick: _depthSnapshot.tick, zero, nonZero,
-              min: nonZero ? min : null, max: nonZero ? max : null};
-    },
-
-    async readDepthHistogram() {
-      let found = null;
-      for (const [, entry] of objects) {
-        if (entry?.kind === "texture" && /depth/i.test(String(entry._label ?? ""))) {
-          if (!found || entry.width > found.width) found = entry;
-        }
-      }
-      if (!found) return {error: "no depth texture"};
-      const w = found.width, h = found.height;
-      const bytesPerRow = Math.ceil(w * 4 / 256) * 256;
-      const readback = device.createBuffer({
-        size: bytesPerRow * h,
-        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
-      });
-      const encoder = device.createCommandEncoder();
-      encoder.copyTextureToBuffer(
-        {texture: found.texture, aspect: "depth-only"},
-        {buffer: readback, bytesPerRow, rowsPerImage: h},
-        {width: w, height: h, depthOrArrayLayers: 1}
-      );
-      device.queue.submit([encoder.finish()]);
-      await readback.mapAsync(GPUMapMode.READ);
-      const raw = readback.getMappedRange().slice(0);
-      readback.unmap();
-      readback.destroy();
-      const floats = new Float32Array(raw);
-      let zero = 0, nonZero = 0, min = Infinity, max = -Infinity;
-      const perRow = bytesPerRow / 4;
-      for (let y = 0; y < h; y += 2) {
-        for (let x = 0; x < w; x += 2) {
-          const d = floats[y * perRow + x];
-          if (d === 0) zero++; else { nonZero++; if (d < min) min = d; if (d > max) max = d; }
-        }
-      }
-      return {
-        label: found._label, wh: `${w}x${h}`, format: found.format,
-        zero, nonZero,
-        min: nonZero ? min : null, max: nonZero ? max : null
-      };
-    },
-
-    async readTerrainIndices() {
-      const rec = globalThis.mcWebGpu._terrainDrawSample;
-      if (!rec?.indexBufferHandle) return {error: "no index buffer captured", rec};
-      const entry = objects.get(rec.indexBufferHandle);
-      if (!entry) return {error: "index buffer gone"};
-      const wide = rec.indexFormat !== "uint16";
-      const stride = wide ? 4 : 2;
-      const first = rec.firstIndex * stride;
-      const size = Math.min(48 * stride, entry.size - first);
-      if (size <= 0) return {error: "range past end", rec};
-      const readback = device.createBuffer({
-        size: Math.ceil(size / 4) * 4,
-        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
-      });
-      const encoder = device.createCommandEncoder();
-      encoder.copyBufferToBuffer(entry.buffer, first, readback, 0, Math.ceil(size / 4) * 4);
-      device.queue.submit([encoder.finish()]);
-      await readback.mapAsync(GPUMapMode.READ);
-      const raw = readback.getMappedRange().slice(0);
-      readback.unmap();
-      readback.destroy();
-      const values = Array.from(wide ? new Uint32Array(raw) : new Uint16Array(raw));
-      return {
-        label: entry._label,
-        bufferSize: entry.size,
-        format: rec.indexFormat,
-        indexCount: rec.indexCount,
-        firstIndex: rec.firstIndex,
-        baseVertex: rec.baseVertex,
-        first48: values.slice(0, 48)
-      };
-    },
-
-    /**
-     * The transform the GPU actually saw, read back from the uniform buffer
-     * rather than from a host-side shadow copy. A shadow can be stale or
-     * mis-offset; this cannot.
-     */
-    async readTerrainUniform(name, from) {
-      const rec = from === "visible"
-        ? globalThis.mcWebGpu._visibleDrawSample
-        : globalThis.mcWebGpu._terrainDrawSample;
-      const range = rec && rec[name];
-      if (!range) return {error: "no " + name + " range captured"};
-      const entry = objects.get(range.bufferHandle);
-      if (!entry) return {error: name + " buffer gone"};
-      const size = Math.min(64, range.size || 64);
-      const readback = device.createBuffer({
-        size: Math.ceil(size / 4) * 4,
-        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
-      });
-      try {
-        const encoder = device.createCommandEncoder();
-        encoder.copyBufferToBuffer(entry.buffer, range.offset, readback, 0,
-          Math.ceil(size / 4) * 4);
-        device.queue.submit([encoder.finish()]);
-        await readback.mapAsync(GPUMapMode.READ);
-        const floats = new Float32Array(readback.getMappedRange().slice(0));
-        readback.unmap();
-        readback.destroy();
-        return {name, floats: Array.from(floats).map((v) => Number(v.toFixed(4)))};
-      } catch (error) {
-        try { readback.destroy(); } catch (ignored) { /* best effort */ }
-        return {error: String(error).slice(0, 160)};
-      }
-    },
-
-    async readTerrainVertices() {
-      const rec = globalThis.mcWebGpu._terrainDrawSample;
-      if (!rec) return {error: "no terrain draw captured"};
-      const entry = objects.get(rec.bufferHandle);
-      if (!entry) return {error: "vertex buffer gone"};
-      const count = 8;
-      // Decode the vertices the draw actually used. An indexed draw starts at
-      // baseVertex, so reading from the binding offset alone decodes whatever
-      // happens to sit at the start of a 16 MB shared buffer - which looks
-      // like garbage and says nothing about the geometry that was drawn.
-      const start = (rec.offset || 0) + (rec.baseVertex || 0) * rec.stride;
-      const size = Math.min(rec.stride * count, entry.size - start);
-      if (size <= 0) return {error: "offset past end", rec, start};
-      const readback = device.createBuffer({
-        size: Math.ceil(size / 4) * 4,
-        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
-      });
-      const encoder = device.createCommandEncoder();
-      encoder.copyBufferToBuffer(entry.buffer, start, readback, 0, Math.ceil(size / 4) * 4);
-      device.queue.submit([encoder.finish()]);
-      await readback.mapAsync(GPUMapMode.READ);
-      const raw = readback.getMappedRange().slice(0);
-      readback.unmap();
-      readback.destroy();
-      const view = new DataView(raw);
-      const bytes = new Uint8Array(raw);
-      const out = [];
-      for (let v = 0; v * rec.stride + 28 <= raw.byteLength; v++) {
-        const base = v * rec.stride;
-        out.push({
-          position: [view.getFloat32(base, true), view.getFloat32(base + 4, true), view.getFloat32(base + 8, true)],
-          color: [bytes[base + 12], bytes[base + 13], bytes[base + 14], bytes[base + 15]],
-          uv0: [view.getFloat32(base + 16, true), view.getFloat32(base + 20, true)],
-          uv2: [view.getInt16(base + 24, true), view.getInt16(base + 26, true)]
-        });
-      }
-      return {rec, start, vertices: out};
-    },
-
-    dumpTexturesMatching(pattern) {
-      const re = new RegExp(pattern, "i");
-      const out = [];
-      for (const [handle, entry] of objects) {
-        if (entry?.kind !== "texture") continue;
-        const label = String(entry._label ?? "?");
-        if (!re.test(label)) continue;
-        out.push({
-          handle,
-          label: label.slice(0, 46),
-          wh: `${entry.width}x${entry.height}`,
-          mipLevels: entry.texture?.mipLevelCount ?? null,
-          uploads: entry._uploads || 0,
-          copiesIn: entry._copiesIn || 0,
-          copiesOut: entry._copiesOut || 0
-        });
-      }
-      return out;
-    },
-
-    dumpTextures() {
-      const out = [];
-      for (const [, entry] of objects) {
-        if (entry?.kind !== "texture") continue;
-        out.push({
-          label: (entry._label || "?").slice(0, 46),
-          wh: `${entry.width}x${entry.height}`,
-          uploads: entry._uploads || 0,
-          // An atlas is stitched by blitting each sprite in, so writeTexture64
-          // uploads can legitimately be 0 while the texture is still fully
-          // populated. copiesIn is what distinguishes "assembled by blit" from
-          // "never filled at all".
-          copiesIn: entry._copiesIn || 0
-        });
-      }
-      return out.filter((t) => /atlas|lightmap|font|gui/i.test(t.label))
-                .sort((a, b) => (b.copiesIn + b.uploads) - (a.copiesIn + a.uploads))
-                .slice(0, 25);
-    },
-
-    /** Raw frame/stutter census used by the on-screen graph, without the
-     *  method-wrapping overhead of the full performance profiler. */
-    /** Bind-group cache effectiveness: hit/miss since boot, and live size. */
-    bindGroupStats() {
-      return {..._bindGroupStats, size: _bindGroupCache.size};
-    },
-
-    frameGraphReport() {
-      return _frameGraph.report();
-    },
-
-    /** Start a clean raw measurement window after boot/join has settled. */
-    frameGraphReset() {
-      _frameGraph.reset();
-      return true;
-    },
-
-    /**
-     * Real cloud-path evidence used by the localhost visual gate. Suppression
-     * is opt-in and diagnostic-only: normal Minecraft rendering never calls
-     * this method. Toggling the existing pipeline filter in the same live world
-     * gives the pixel test a causal clouds-on / clouds-off comparison without
-     * changing the camera, weather, world, or Minecraft's cloud settings.
-     */
-    setDiagnosticPipelineSuppression(pattern) {
-      const raw = String(pattern ?? "").trim();
-      if (raw.length > 128) throw new Error("diagnostic pipeline pattern is too long");
-      _diagnosticSuppression = raw ? new RegExp(raw, "i") : null;
-      return _diagnosticSuppression ? String(_diagnosticSuppression) : null;
-    },
-
-    cloudDrawReset() {
-      delete globalThis.mcWebGpu._cloudDraws;
-      return true;
-    },
-
-    cloudDrawReport() {
-      return {
-        draws: globalThis.mcWebGpu._cloudDraws ?? null,
-        validationErrors: (globalThis.mcWebGpu._valErrors ?? []).slice(-10),
-        firstGpuError: globalThis.mcWebGpu._firstGpuError ?? null
-      };
-    },
-
-    /**
-     * Frame-time and bridge-cost census. `sinceFrame` drops the boot and
-     * world-load frames, which are enormous and would otherwise dominate every
-     * average; pass the tick at which the world became steady.
-     */
-    perfReport(sinceFrame = 0) {
-      if (!_perf.on) return {error: "profiler off; load with ?mcweb_perf=1"};
-      const frames = _perf.frames.slice(sinceFrame);
-      const hostFrames = _perf.hostFrames.slice(sinceFrame);
-      const callFrames = _perf.callFrames.slice(sinceFrame);
-      const rafGaps = _perf.rafGaps.slice(sinceFrame);
-      if (!frames.length) return {error: "no frames recorded"};
-      const sorted = [...frames].sort((a, b) => a - b);
-      const sortedGaps = [...rafGaps].sort((a, b) => a - b);
-      const gpuQueueMs = _perf.gpuQueueMs.slice();
-      const sortedGpu = [...gpuQueueMs].sort((a, b) => a - b);
-      const sum = (xs) => xs.reduce((a, b) => a + b, 0);
-      const totalMs = sum(frames);
-      const hostMs = sum(hostFrames);
-      const round = (x) => Math.round(x * 100) / 100;
-      return {
-        frames: frames.length,
-        fps: round(1000 / (totalMs / frames.length)),
-        frameMs: {
-          mean: round(totalMs / frames.length),
-          p50: round(_percentile(sorted, 0.5)),
-          p95: round(_percentile(sorted, 0.95)),
-          p99: round(_percentile(sorted, 0.99)),
-          max: round(sorted[sorted.length - 1])
-        },
-        rafGapMs: {
-          mean: round(sum(rafGaps) / Math.max(1, rafGaps.length)),
-          p50: round(_percentile(sortedGaps, 0.5)),
-          p95: round(_percentile(sortedGaps, 0.95)),
-          p99: round(_percentile(sortedGaps, 0.99)),
-          max: round(sortedGaps.length ? sortedGaps[sortedGaps.length - 1] : 0),
-          over50: rafGaps.filter((x) => x > 50).length,
-          over100: rafGaps.filter((x) => x > 100).length,
-          over250: rafGaps.filter((x) => x > 250).length
-        },
-        gpuQueue: {
-          timing: "coarse queue.submit -> onSubmittedWorkDone (asynchronous)",
-          submits: _perf.gpuSubmits,
-          samples: gpuQueueMs.length,
-          mean: round(sum(gpuQueueMs) / Math.max(1, gpuQueueMs.length)),
-          p50: round(_percentile(sortedGpu, 0.5)),
-          p95: round(_percentile(sortedGpu, 0.95)),
-          max: round(sortedGpu.length ? sortedGpu[sortedGpu.length - 1] : 0),
-          timestampQuerySupported: Boolean(globalThis.mcWebGpu?._gpuTiming?.timestampQuery)
-        },
-        // The split that decides where optimisation effort belongs.
-        hostMsPerFrame: round(hostMs / frames.length),
-        javaMsPerFrame: round((totalMs - hostMs) / frames.length),
-        hostSharePct: round((hostMs / totalMs) * 100),
-        bridgeCallsPerFrame: Math.round(sum(callFrames) / frames.length),
-        // Whole-run totals, ranked by cost rather than by count -- the two
-        // orders disagree, and the cheap-but-numerous calls are the trap.
-        topCallsByMs: [..._perf.calls.entries()]
-          .sort((a, b) => b[1].ms - a[1].ms)
-          .slice(0, 18)
-          .map(([name, e]) => ({
-            name,
-            ms: Math.round(e.ms),
-            n: e.n,
-            usPerCall: round((e.ms / e.n) * 1000)
-          }))
-      };
-    },
-
-    /**
-     * Raw per-frame total/host millisecond arrays for the probe harnesses that
-     * need the distribution rather than perfReport's summary (long-frame
-     * host-vs-Java split). Read-only; returns copies.
-     */
-    perfFrames(sinceFrame = 0) {
-      if (!_perf.on) return {error: "profiler off; load with ?mcweb_perf=1"};
-      return {
-        frames: _perf.frames.slice(sinceFrame),
-        hostFrames: _perf.hostFrames.slice(sinceFrame),
-        uploadBytes: _perf.uploadBytesFrames.slice(sinceFrame),
-        slowFrames: _perf.slowFrameUploads,
-      };
-    },
-
-    reportJavaFailure(stage, type, message) {
-      const activeStage = globalThis.__mcWebLastStage || stage;
-      const failureNumber = (globalThis.mcWebGpu._javaFailureCount || 0) + 1;
-      globalThis.mcWebGpu._javaFailureCount = failureNumber;
-      // Same trick at the failure boundary. This is the catch site rather than
-      // the throw site, but the wasm frames below it still name the call path
-      // the frame pump was in when the heap gave out.
-      globalThis.mcWebGpu._failStack =
-        String(new Error("fail").stack || "").split("\n").slice(1, 40);
-      // The bridge calls immediately preceding the failure. Web Image gives no
-      // Java stack, but every GPU operation crosses this boundary, so the tail
-      // of this list brackets whatever the frame pump was doing when it threw.
-      // First failure only: the frame pump now survives a bad frame, so later
-      // failures would otherwise overwrite the one that started the cascade.
-      globalThis.mcWebGpu._recentAtFail ||= _recentCalls.slice(-60);
-      globalThis.mcWebGpu._recentAtLastFail = _recentCalls.slice(-60);
-      // `stage` is the caller's own label ("integrated-server", "frame-pump",
-      // â€¦) and names the subsystem that caught the throw; `activeStage` is only
-      // the last progress marker anyone recorded. Keep both: with no Java stack
-      // traces under Web Image, the caller label is the single most direct clue
-      // about where a failure came from, and it used to be dropped here.
-      recordStage(`FAIL source=${stage} ${activeStage} ${type}`);
-      console.error("[MC-FAIL]", `source=${stage}`, activeStage, type, message);
-      if (failureNumber === 1) {
-        console.error("[MC-FAIL-RECENT]", globalThis.mcWebGpu._recentAtFail.join(" | "));
-      }
-      markCall("reportJavaFailure", {source: stage, stage: activeStage, type, message});
-      const detail = `${type}${message ? `: ${message}` : ""}`;
-      setText("jar-status", "runtime error");
-      setText("jar-method", activeStage);
-      failure.hidden = false;
-      failure.textContent = `${activeStage}\n${detail}`;
-      globalThis.mcWebGpu.lastJavaFailure = {source: stage, stage: activeStage, type, message};
-    }
-  };
-
-  // Capture the unwrapped render operations before ?mcweb_perf replaces every
-  // public bridge function with a timing wrapper. Stream replay is one bridge
-  // call; counting its internal JS dispatches as additional crossings would
-  // both perturb the benchmark and lie about the boundary reduction.
-  const _renderPassReplay = Object.freeze({
-    end: globalThis.mcWebGpu.rpEnd,
-    setPipeline: globalThis.mcWebGpu.rpSetPipeline,
-    bindTexture: globalThis.mcWebGpu.rpBindTexture,
-    setUniform: globalThis.mcWebGpu.rpSetUniform,
-    setVertexBuffer: globalThis.mcWebGpu.rpSetVertexBuffer,
-    setIndexBuffer: globalThis.mcWebGpu.rpSetIndexBuffer,
-    scissor: globalThis.mcWebGpu.rpScissor,
-    disableScissor: globalThis.mcWebGpu.rpDisableScissor,
-    draw: globalThis.mcWebGpu.rpDraw,
-    drawIndexed: globalThis.mcWebGpu.rpDrawIndexed,
-    drawIndirect: globalThis.mcWebGpu.rpDrawIndirect,
-    drawIndexedIndirect: globalThis.mcWebGpu.rpDrawIndexedIndirect,
-    pushDebugGroup: globalThis.mcWebGpu.rpPushDebugGroup,
-    popDebugGroup: globalThis.mcWebGpu.rpPopDebugGroup
-  });
-
-  const _renderCommandHandlers = Object.freeze({
-    setPipeline(host, pass, pipeline) {
-      _renderPassReplay.setPipeline.call(host, pass, pipeline);
-    },
-    bindTexture(host, pass, nameId, view, sampler) {
-      const name = resolveBindingName(nameId, "render texture");
-      _renderPassReplay.bindTexture.call(host, pass, name, view, sampler);
-    },
-    setUniform(host, pass, nameId, buffer, offset, size) {
-      const name = resolveBindingName(nameId, "render uniform");
-      _renderPassReplay.setUniform.call(host, pass, name, buffer, offset, size);
-    },
-    setVertexBuffer(host, pass, slot, buffer, offset, size) {
-      _renderPassReplay.setVertexBuffer.call(host, pass, slot, buffer, offset, size);
-    },
-    setIndexBuffer(host, pass, buffer, formatCode) {
-      const format = formatCode === 0 ? "uint16" : formatCode === 1 ? "uint32" : null;
-      if (!format) throw new Error(`unknown render index format ${formatCode}`);
-      _renderPassReplay.setIndexBuffer.call(host, pass, buffer, format);
-    },
-    scissor(host, pass, x, y, width, height) {
-      _renderPassReplay.scissor.call(host, pass, x, y, width, height);
-    },
-    disableScissor(host, pass) {
-      _renderPassReplay.disableScissor.call(host, pass);
-    },
-    draw(host, pass, firstVertex, vertexCount, instanceCount, firstInstance) {
-      _renderPassReplay.draw.call(
-        host, pass, firstVertex, vertexCount, instanceCount, firstInstance
-      );
-    },
-    drawIndexed(host, pass, indexCount, instanceCount, firstIndex, baseVertex, firstInstance) {
-      _renderPassReplay.drawIndexed.call(
-        host, pass, indexCount, instanceCount, firstIndex, baseVertex, firstInstance
-      );
-    },
-    drawIndirect(host, pass, buffer, offset, drawCount) {
-      _renderPassReplay.drawIndirect.call(host, pass, buffer, offset, drawCount);
-    },
-    drawIndexedIndirect(host, pass, buffer, offset, drawCount) {
-      _renderPassReplay.drawIndexedIndirect.call(host, pass, buffer, offset, drawCount);
-    },
-    pushDebugGroup(host, pass, labelId) {
-      const label = host._bindingNames?.[labelId];
-      if (typeof label !== "string") throw new Error(`unknown render debug label ${labelId}`);
-      _renderPassReplay.pushDebugGroup.call(host, pass, label);
-    },
-    popDebugGroup(host, pass) {
-      _renderPassReplay.popDebugGroup.call(host, pass);
-    }
-  });
-
-  function replayRenderPassCommands(
-    host, passHandle, payload, byteLength, end, transport, rawWordReader
-  ) {
-    let replaying = false;
-    try {
-      if (!Number.isInteger(byteLength) || byteLength < 0 || (byteLength & 3) !== 0) {
-        throw new RangeError(`invalid render command byte length ${byteLength}`);
-      }
-      const protocol = globalThis.mcWebRenderCommands;
-      if (!protocol) throw new Error("render command stream decoder is unavailable");
-      const stats = (diagnostics.renderCommands ||= {
-        streams: 0, bytes: 0, maxBytes: 0, empty: 0,
-        le64: 0, le256: 0, le1024: 0, over1024: 0
-      });
-      stats.streams++;
-      stats.bytes += byteLength;
-      stats.maxBytes = Math.max(stats.maxBytes, byteLength);
-      if (byteLength === 0) stats.empty++;
-      else if (byteLength <= 64) stats.le64++;
-      else if (byteLength <= 256) stats.le256++;
-      else if (byteLength <= 1024) stats.le1024++;
-      else stats.over1024++;
-      markCall("rpCommandStream", {passHandle, byteLength, end: Boolean(end)});
-      _renderCommandReplayDepth++;
-      replaying = true;
-      let count;
-      if (transport === "wasmgc-reader") {
-        if (typeof protocol.replayReader !== "function") {
-          throw new Error("raw WasmGC render command decoder is unavailable");
-        }
-        count = protocol.replayReader(
-          payload, byteLength >>> 2, rawWordReader,
-          _renderCommandHandlers, host, passHandle
-        );
-      } else if (transport === "packed-text") {
-        if (typeof protocol.replayText !== "function") {
-          throw new Error("packed render command decoder is unavailable");
-        }
-        count = protocol.replayText(
-          payload, byteLength >>> 2, _renderCommandHandlers, host, passHandle
-        );
-      } else {
-        const bytes = transport === "base64" ? base64ToBytes(payload) : payload;
-        if (transport === "base64" && bytes.byteLength !== byteLength) {
-          throw new Error(
-            `render command base64 length mismatch: ${bytes.byteLength} != ${byteLength}`
-          );
-        }
-        count = protocol.replay(
-          bytes, byteLength, _renderCommandHandlers, host, passHandle
-        );
-      }
-      if (end) _renderPassReplay.end.call(host, passHandle);
-      return count;
-    } catch (error) {
-      // A failed segment is not recoverable, even when it was flushed for a
-      // timestamp rather than pass end. Never strand an open pass encoder.
-      if (objects.has(passHandle)) {
-        try {
-          _renderPassReplay.end.call(host, passHandle);
-        } catch (_cleanupError) {
-          objects.delete(passHandle);
-        }
-      }
-      throw error;
-    } finally {
-      if (replaying) _renderCommandReplayDepth--;
-    }
-  }
-
-  addEventListener("error", (event) => fail(event.error || event.message));
-  addEventListener("unhandledrejection", (event) => fail(event.reason));
-
-  globalThis.mcWebServer = globalThis.mcWebServer || (() => {
-    let worker = null;
-    let transport = null;
-    let state = "idle";
-    let statusLog = [];
-    /** Inbound frames awaiting drainPackets64(); see the comment in onPacket. */
-    const inboundQueue = [];
-    let inboundQueueBytes = 0;
-    /** Peak queue depth since the last info() read â€” the burst evidence a
-     *  point sample misses: S->C packets arriving faster than the client
-     *  drains them (or in bursts after a server stall). */
-    let inboundQueuePeak = 0;
-    let packetHandler = null;
-    let packetHandler64 = null;
-    let tickCount = 0;
-    let lastError = null;
-    let serverStages = [];
-    /**
-     * Saved worlds shipped back by the Worker, oldest first. A queue rather than
-     * a slot because two arrive per world â€” the small openable set as soon as the
-     * world is ready, then the full directory on exit â€” and dropping the first
-     * would put back exactly the failure the early one exists to prevent.
-     */
-    const worldSnapshots = [];
-    let serverLoadProgress = [];
-    let serverLoadProgressCount = 0;
-    /** Grid frames stream while the loading screen is up; the client drains the
-     *  queue every frame, so this counter is the durable evidence of streaming. */
-    let serverGridFrames = 0;
-    /** Server pump timing from the Worker (pump-stats), always recorded:
-     *  per-pump-call [durationMs, gapSincePreviousStartMs]. The delay probe
-     *  reads this through info(); the frame graph renders it when enabled. */
-    const pumpStats = [];
-    /** Slow-tick attribution markers, never evicted (the serverStages ring
-     *  is 200 entries and floods during worldgen). */
-    /** Durable server-realm evt: log. The client realm's mcWebEvtCounts
-     *  cannot see what the server received or sent; combat attribution
-     *  needs both sides of the wire. Never evicted. */
-    const serverEvtLog = [];
-    const slowTickLog = [];
-
-    const status = (s) => {
-      state = s;
-      statusLog.push({ t: performance.now(), s });
-      markPhase(`server-${String(s).toLowerCase().replace(/[^a-z0-9._:-]/g, "-").slice(0, 64)}`);
-      console.log("[mcweb-server]", s);
-    };
-
-    async function launch(imageName) {
-      // Replace any previous Worker here rather than making the caller stop()
-      // first. A separate stop() leaves the state at "stopped" until this
-      // function's first await resolves, and the client reads that as a
-      // terminal server failure and abandons the world it is starting.
-      if (worker) {
-        try { worker.terminate(); } catch { /* already gone */ }
-        worker = null;
-      }
-      if (transport) {
-        try { transport.close(); } catch { /* already closed */ }
-        transport = null;
-      }
-      inboundQueue.length = 0;
-      inboundQueueBytes = 0;
-      worldSnapshots.length = 0;
-      status("launching");
-
-      const requestedServerImage = new URLSearchParams(location.search)
-        .get("mcweb_server_image");
-      // The client passes a placeholder ("minecraft-client"); resolve the real
-      // Worker image here so it can never silently lag behind the tree.
-      // The derivation reads the page's own ?image= parameter: a WasmGC page
-      // runs its own image in the Worker; a WasmLM page falls back to the
-      // WasmGC image, since the Worker realm is cooperative WasmGC regardless
-      // of the client lane (Wasm-GC references cannot cross realms; WasmLM
-      // images import shared memory plus thread agents that a plain Worker
-      // cannot provide). Losing this derivation once silently reverted the
-      // Worker realm to the Aug-6 "minecraft-client" placeholder â€” every
-      // server-side fix stopped applying while client-side probes still
-      // looked healthy (STATUS 2026-08-07 meta-bug).
-      const pageImage = new URLSearchParams(location.search).get("image");
-      const stripped = (pageImage || imageName).replace(/-threaded$/, "");
-      const derivedImage = stripped.includes("-lm")
-        ? "minecraft-client-command-text"
-        : stripped;
-      const serverImage = requestedServerImage
-        && /^[a-z0-9.-]+$/i.test(requestedServerImage)
-        ? requestedServerImage : derivedImage;
-      console.log(`[mcweb-server] worker image ${serverImage}`);
-
-      const runtimePrefix = globalThis.mcWebRuntimePrefix || "/";
-      const { PacketTransport } = await import(`${runtimePrefix}packet-transport.js?v=20260807-batch1`);
-      const channel = new MessageChannel();
-      const port = channel.port1;
-      const workerPort = channel.port2;
-      serverLoadProgress = [];
-      serverLoadProgressCount = 0;
-
-      transport = new PacketTransport(port, (msg) => {
-        if (msg.type === "status") {
-          status(msg.status);
-        } else if (msg.type === "ready") {
-          status("ready");
-        } else if (msg.type === "error") {
-          lastError = msg.message;
-          status("error");
-          console.error("[mcweb-server] worker error:", msg.message);
-        } else if (msg.type === "tick") {
-          tickCount = msg.count;
-        } else if (msg.type === "server-stage") {
-          serverStages.push(msg.stage);
-          if (typeof msg.stage === "string" && msg.stage.startsWith("pumpslow:")) {
-            slowTickLog.push(msg.stage);
-            if (slowTickLog.length > 400) slowTickLog.shift();
-          }
-          if (typeof msg.stage === "string" && msg.stage.startsWith("evt:")
-              && msg.stage.includes("C->S")) {
-            // Only client-to-server packets: these are the rare player-input
-            // packets (attacks, actions, commands). Server-to-client markers
-            // flood at entity-motion rates and would evict the input events
-            // that combat attribution needs.
-            serverEvtLog.push(msg.stage + " @" + Math.round(performance.now()));
-            if (serverEvtLog.length > 500) serverEvtLog.shift();
-          }
-          if (serverStages.length > 200) serverStages.shift();
-        } else if (msg.type === "server-load-progress") {
-          const message = String(msg.message || "");
-          serverLoadProgress.push(message);
-          serverLoadProgressCount++;
-          if (message.startsWith("grid ")) serverGridFrames++;
-          if (serverLoadProgressCount <= 4 || (serverLoadProgressCount & 0x3F) === 0) {
-            console.log("[mcweb-server] load-progress", `n=${serverLoadProgressCount}`, message);
-          }
-          if (serverLoadProgress.length > 256) serverLoadProgress.shift();
-        } else if (msg.type === "pump-stats") {
-          for (const pair of (msg.samples || [])) pumpStats.push(pair);
-          if (pumpStats.length > 1200) pumpStats.splice(0, pumpStats.length - 1200);
-          _frameGraph.pushServer(msg.samples || []);
-        } else if (msg.type === "world-snapshot") {
-          // The saved world coming home. Queued until the client's Java side
-          // drains it in consumeWorldSnapshot(); "" means the Worker had
-          // nothing to send.
-          const snapshot = String(msg.json ?? "");
-          worldSnapshots.push(snapshot);
-          // The Java client still consumes and applies this exact snapshot to
-          // its in-memory saves directory.  Persist the already-serialised copy
-          // at the page boundary as well so a reload can rebuild that directory.
-          if (snapshot) globalThis.mcWebStorage?.storeWorldSnapshot?.(snapshot);
-          console.log(`[mcweb-server] world snapshot ${snapshot.length} chars`);
-        }
-      });
-      transport.onPacket((bytes) => {
-        if (packetHandler) packetHandler(bytes);
-        if (packetHandler64) { packetHandler64(bytesToBase64(bytes)); return; }
-        inboundQueue.push(bytes);
-        inboundQueueBytes += bytes.length + 4;
-        if (inboundQueue.length > inboundQueuePeak) inboundQueuePeak = inboundQueue.length;
-      });
-
-      worker = new Worker(`${runtimePrefix}server-worker.js?v=20260810-actualticks1`);
-      worker.onerror = (e) => {
-        lastError = e.message;
-        status("worker-error");
-        console.error("[mcweb-server] worker onerror:", e.message);
-      };
-
-      const wasmPath = `${runtimePrefix}graal/${serverImage || "minecraft-client"}.js.wasm`;
-      const runtimeManifest = globalThis.mcWebDevRuntimeManifest;
-      const loaderEntry = runtimeManifest?.files?.find((entry) => entry?.name === "minecraft-client.js");
-      worker.postMessage({
-        type: "init",
-        port: workerPort,
-        wasmPath,
-        loaderSha256: loaderEntry?.sha256,
-        loaderBytes: loaderEntry?.bytes,
-      }, [workerPort]);
-
-      return { ok: true };
-    }
-
-    function stop() {
-      if (worker) {
-        worker.terminate();
-        worker = null;
-      }
-      if (transport) {
-        transport.close();
-        transport = null;
-      }
-      serverLoadProgress = [];
-      serverLoadProgressCount = 0;
-      serverGridFrames = 0;
-      status("stopped");
-    }
-
-    function consumeLoadProgress() {
-      const batch = serverLoadProgress;
-      serverLoadProgress = [];
-      return batch.join("\n");
-    }
-
-    /**
-     * Hands the pending saved world to the client's Java side exactly once.
-     * Returns null while nothing has arrived, so the caller can distinguish
-     * "still waiting" from the Worker's empty "nothing to send" answer.
-     */
-    function consumeWorldSnapshot() {
-      return worldSnapshots.length ? worldSnapshots.shift() : null;
-    }
-
-    function startWorld(commandJson) {
-      if (!transport || state !== "ready") {
-        return { error: `server worker is not ready (${state})` };
-      }
-      // A snapshot from the previous world must never be applied over the one
-      // starting now â€” the client has already shipped its files.
-      worldSnapshots.length = 0;
-      status("world-starting");
-      transport.sendControl({ type: "command", json: commandJson });
-      return { ok: true };
-    }
-
-    /**
-     * Client -> server control-plane push. "world-entered" flips the Worker
-     * server from accelerated world-load pacing into the normal 20 TPS loop.
-     */
-    function sendState(state) {
-      if (transport && worker) transport.sendControl({ type: "state", state: String(state) });
-    }
-
-    function sendPacket(bytes) {
-      if (transport && worker && state !== "error" && state !== "worker-error") {
-        transport.send(bytes);
-      }
-    }
-
-    function sendPacket64(base64) {
-      if (transport && worker && state !== "error" && state !== "worker-error") {
-        transport.send(base64ToBytes(base64));
-      }
-    }
-
-    function onPacket(handler) {
-      packetHandler = handler;
-    }
-
-    function onPacket64(handler) {
-      packetHandler64 = handler;
-    }
-
-    function bytesToBase64(bytes) {
-      if (typeof bytes.toBase64 === "function") return bytes.toBase64();
-      let binary = "";
-      for (let offset = 0; offset < bytes.length; offset += 0x8000) {
-        binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
-      }
-      return btoa(binary);
-    }
-
-    /**
-     * Hands the client every packet queued since the last call, as one base64
-     * blob of 4-byte-big-endian-length-prefixed frames.
-     *
-     * One crossing and one Base64 decode per frame instead of per packet. The
-     * framing is explicit because concatenating base64 strings would force the
-     * client to decode each one separately, which is the cost being removed.
-     */
-    function drainPackets64() {
-      if (inboundQueue.length === 0) return "";
-      const blob = new Uint8Array(inboundQueueBytes);
-      let offset = 0;
-      for (const bytes of inboundQueue) {
-        const length = bytes.length;
-        blob[offset++] = (length >>> 24) & 0xff;
-        blob[offset++] = (length >>> 16) & 0xff;
-        blob[offset++] = (length >>> 8) & 0xff;
-        blob[offset++] = length & 0xff;
-        blob.set(bytes, offset);
-        offset += length;
-      }
-      inboundQueue.length = 0;
-      inboundQueueBytes = 0;
-      return bytesToBase64(blob);
-    }
-
-    function info() {
-      const peak = inboundQueuePeak;
-      inboundQueuePeak = 0;
-      return {
-        state,
-        tickCount,
-        inboundQueued: inboundQueue.length,
-        inboundQueuePeak: peak,
-        lastError,
-        statusLog: statusLog.slice(-20),
-        serverStages: serverStages.slice(-80),
-        serverLoadProgress: serverLoadProgress.slice(-80),
-        serverLoadProgressCount,
-        serverGridFrames,
-        pumpStats: pumpStats.slice(-600),
-        serverEvts: serverEvtLog.slice(-200),
-        slowTicks: slowTickLog.slice(-100),
-      };
-    }
-
-    return {
-      launch, startWorld, stop, sendPacket, sendPacket64, sendState,
-      onPacket, onPacket64, drainPackets64, consumeLoadProgress,
-      consumeWorldSnapshot, info
-    };
-  })();
-
-  /**
-   * Waits for one painted frame, or for `budgetMs`, whichever comes first.
-   *
-   * Nothing on the boot path may block on an animation frame. Animation frames
-   * are a rendering courtesy the browser can withhold â€” a hidden tab, an
-   * occluded window, a backgrounded process â€” and every second of that wait is
-   * a second the game is not starting for a player who is sitting there
-   * watching it.
-   */
-  function paintOrGiveUp(budgetMs) {
-    return new Promise((resolve) => {
-      let settled = false;
-      const finish = () => {
-        if (settled) return;
-        settled = true;
-        resolve();
-      };
-      requestAnimationFrame(() => requestAnimationFrame(finish));
-      setTimeout(finish, budgetMs);
-    });
-  }
-
-  // Some Chromium/Android contexts expose navigator.gpu while their
-  // high-performance adapter request is filtered out by the browser's power
-  // policy. A null result for that preference does not prove that WebGPU is
-  // unavailable: retry the neutral request, then low-power, and use the first
-  // adapter the browser actually offers. The selected adapter is requested only
-  // once, so the fallback cannot create two runtimes or devices.
-  async function requestCompatibleAdapter(gpu) {
-    const attempts = [
-      { label: "high-performance", options: {powerPreference: "high-performance"} },
-      { label: "default", options: {} },
-      { label: "low-power", options: {powerPreference: "low-power"} },
-    ];
-    const probe = {
-      secureContext: Boolean(globalThis.isSecureContext),
-      userAgent: String(globalThis.navigator?.userAgent || "unknown").slice(0, 240),
-      attempts: [],
-    };
-    for (const attempt of attempts) {
-      const started = typeof performance?.now === "function" ? performance.now() : 0;
-      try {
-        // Pass an options dictionary even for the neutral request. This is
-        // accepted by current Safari/Chromium and avoids strict WebIDL
-        // implementations treating an omitted argument differently.
-        const candidate = await gpu.requestAdapter(attempt.options);
-        const result = candidate ? "available" : "null";
-        probe.attempts.push({
-          label: attempt.label,
-          options: {...attempt.options},
-          result,
-          ms: Math.max(0, Math.round((typeof performance?.now === "function" ? performance.now() : started) - started)),
-        });
-        if (!candidate) continue;
-        const info = candidate.info || {};
-        probe.selected = attempt.label;
-        probe.adapter = {
-          vendor: String(info.vendor || ""),
-          architecture: String(info.architecture || ""),
-          device: String(info.device || ""),
-          description: String(info.description || ""),
-          features: candidate.features ? Array.from(candidate.features, String).sort() : [],
-          limits: {
-            maxBindGroups: candidate.limits?.maxBindGroups,
-            maxBindingsPerBindGroup: candidate.limits?.maxBindingsPerBindGroup,
-          },
-        };
-        globalThis.mcWebGpu._adapterProbe = probe;
-        return candidate;
-      } catch (error) {
-        // A browser may reject one preference rather than returning null. Keep
-        // its bounded diagnostic, then continue with the next preference.
-        probe.attempts.push({
-          label: attempt.label,
-          options: {...attempt.options},
-          result: "error",
-          error: String(error?.name || "Error"),
-          message: String(error?.message || error).slice(0, 240),
-          ms: Math.max(0, Math.round((typeof performance?.now === "function" ? performance.now() : started) - started)),
-        });
-      }
-    }
-    // There is no standard WebGPU blocklist-reason API. If a browser exposes
-    // one in an adapter-request error, it is retained above; otherwise the
-    // attempt table makes the null/error distinction explicit for support.
-    globalThis.mcWebGpu._adapterProbe = probe;
-    const error = new Error(
-      "WebGPU is present, but this browser context has no compatible adapter."
-    );
-    error.code = "CAPABILITY_UNAVAILABLE";
-    error.capability = "webgpu-adapter";
-    error.adapterProbe = probe;
-    throw error;
-  }
-
-  (async () => {
-    if (!navigator.gpu) throw new Error("WebGPU is unavailable in this browser");
-    // Everything from here to the first [MC-INIT] line used to report nothing,
-    // so a slow adapter or a cold Wasm compile was indistinguishable from a
-    // hang. Each step names itself before it can block.
-    markPhase("webgpu-adapter-requested");
-    globalThis.mcWebBootOverlay.stage("asking the browser for a WebGPU adapterâ€¦");
-    adapter = await requestCompatibleAdapter(navigator.gpu);
-    markPhase("webgpu-adapter-ready");
-    globalThis.mcWebBootOverlay.stage("opening the GPU deviceâ€¦");
-    device = await adapter.requestDevice();
-    globalThis.mcWebGpu._gpuTiming = {
-      timestampQuery: Boolean(adapter.features?.has?.("timestamp-query")),
-      method: adapter.features?.has?.("timestamp-query")
-        ? "timestamp-query capability detected; per-pass query wiring remains opt-in"
-        : "coarse queue completion"
-    };
-    device.lost.then((info) => fail(new Error(`WebGPU device lost: ${info.message}`)));
-    // Draw-time validation errors were never captured: the existing error
-    // scopes only wrap pipeline and buffer creation. A draw whose bound vertex
-    // range does not cover baseVertex+indexCount is rejected by the browser and
-    // produces no fragments -- silently, with a clean log and a correct-looking
-    // draw call. Terrain issues valid draws and renders nothing, so this is the
-    // gap that has to be closed before blaming anything else.
-    device.addEventListener?.("uncapturederror", (event) => {
-      const sink = (globalThis.mcWebGpu._gpuErrors ||= {count: 0, byMessage: {}});
-      sink.count++;
-      const message = String(event.error?.message ?? event.error).slice(0, 220);
-      noteTextureValidation(message, _lastSubmitTextureCandidate);
-      sink.byMessage[message] = (sink.byMessage[message] || 0) + 1;
-      if (sink.count <= 5) console.error("[GPU-ERROR]", message);
-    });
-    globalThis.mcWebGpu = globalThis.mcWebGpu || {};
-    globalThis.mcWebGpu._limits = {
-      maxBindGroups: device.limits?.maxBindGroups,
-      maxBindingsPerBindGroup: device.limits?.maxBindingsPerBindGroup
-    };
-    context = canvas.getContext("webgpu");
-
-    globalThis.mcWebCanvas.resizeBackingStore();
-    setText("gpu-status", `adapter ready: ${globalThis.mcWebGpu.adapterName()}`);
-
-    // Main-thread heartbeat, independent of requestAnimationFrame. setInterval
-    // only fires when the main thread is idle between tasks; if a synchronous
-    // Java call (the constructor's trailing boot, or runTick) blocks the thread,
-    // the beats stop. So "beats keep climbing but no [pump] enter / no further
-    // [MC-INIT]" â‡’ boot LOGIC is stalled (thread free); "beats stop" â‡’ the
-    // thread is BLOCKED in a synchronous call. globalThis.mcWebGpu._beats is
-    // readable from the probe at any time.
-    globalThis.mcWebGpu._beats = 0;
-    setInterval(() => { globalThis.mcWebGpu._beats = (globalThis.mcWebGpu._beats || 0) + 1; }, 2000);
-
-    // ?mcweb_perf=1 -- frame-time distribution plus a per-bridge-call cost and
-    // count census. Two performance.now() calls per bridge crossing is far too
-    // expensive to leave on (a busy frame makes tens of thousands of them), so
-    // this stays opt-in and the unflagged path keeps the original functions.
-    if (new URLSearchParams(location.search).has("mcweb_perf")) {
-      installPerfProfiler();
-    }
-
-    const launchParams = new URLSearchParams(location.search);
-    if (launchParams.has("mcweb_debug")) {
-      // Keep the allocator counters next to the frame/GC markers while diagnosing
-      // WasmLM pressure. The call is opt-in: it re-enters the image and must not be
-      // part of the normal render loop.
-      setInterval(() => {
-        try {
-          const counters = globalThis.mcWebThreadRuntime?.imageCounters?.();
-          if (counters) console.log("[THREAD-COUNTERS] " + JSON.stringify(counters));
-        } catch (error) {
-          console.warn("[THREAD-COUNTERS] failed", error);
-        }
-      }, 5000);
-    }
-    // The pre-runtime auth boundary exposes only the profile name/UUID. This
-    // bounded promise normally finished while WebGPU initialised; awaiting it
-    // here guarantees Minecraft's GameConfig sees the authenticated identity,
-    // with a bounded local-identity fallback only for diagnostics.
-    await globalThis.mcWebNet?.identityReady?.();
-
-    const requestedImage = launchParams.get("image");
-    const defaultImage = globalThis.mcWebConfig?.runtime?.image || "minecraft-client";
-    let imageName = requestedImage && /^[a-z0-9.-]+$/i.test(requestedImage)
-      ? requestedImage
-      : defaultImage; // canonical WasmGC image; ?image= remains diagnostic-only
-    // mcWebServer.launch() derives the server-Worker image from this name so
-    // the Worker always runs the image that was just built from this tree.
-    globalThis.mcWebImageName = imageName;
-    globalThis.mcWebRuntimeMode = imageName.endsWith("-threaded")
-      ? "WASMLM_THREADED"
-      : imageName.includes("-lm")
-        ? "WASMLM_INLINE"
-        : "WASMGC_COOPERATIVE";
-    console.log(`[mcweb-host] runtime mode ${globalThis.mcWebRuntimeMode}`);
-    if (imageName.endsWith("-threaded")) {
-      const requestedAgents = Number(launchParams.get("mcweb_threads") || 6);
-      const agentCount = Math.max(0, Math.min(8, Number.isFinite(requestedAgents) ? requestedAgents | 0 : 6));
-      if (!globalThis.mcWebWasmLMThreads) {
-        throw new Error("WasmLM thread host was not loaded");
-      }
-      await globalThis.mcWebWasmLMThreads.prepare(imageName, agentCount);
-      console.log(`[mcweb-host] threaded WasmLM image ${imageName}, ${agentCount} agents`);
-    }
-    const script = document.createElement("script");
-    if (imageName === defaultImage) {
-      // graalWebImage patches Config.wasm_path to consume this explicit URL.
-      // Version both requests with one tag: the page must never instantiate a
-      // new Wasm binary against an older cached generated loader (or vice versa).
-      const runtimePrefix = globalThis.mcWebRuntimePrefix || "/";
-      globalThis.mcWebGraalWasmPath = new URL(
-        `${runtimePrefix}graal/${imageName}.js.wasm?v=${MCWEB_CACHE_TAG}`,
-        location.origin,
-      ).href;
-      script.src = `${runtimePrefix}graal/${imageName}.js?v=${MCWEB_CACHE_TAG}`;
-    } else {
-      // Historical diagnostic images were built before the explicit-path
-      // loader patch and retain Web Image's original sibling derivation.
-      delete globalThis.mcWebGraalWasmPath;
-      script.src = `${globalThis.mcWebRuntimePrefix || "/"}graal/${imageName}.js`;
-    }
-    script.onload = () => {
-      markPhase("generated-loader-loaded");
-      setText("jar-status", "WebAssembly runtime loaded; starting JARâ€¦");
-    };
-    script.onerror = () => fail(new Error("Could not load the GraalVM Web Image runtime"));
-    globalThis.mcWebBootOverlay.status("Starting Minecraftâ€¦");
-    globalThis.mcWebBootOverlay.stage(
-      "loading and compiling the Minecraft WebAssembly imageâ€¦");
-    // Give the page a chance to paint that message before the loader is
-    // attached, because compiling and running the image occupies this thread in
-    // long stretches. Never *wait* on it: Chrome stops delivering animation
-    // frames to an occluded window while still reporting visibilityState
-    // "visible", so a bare rAF await here parked the entire boot until the
-    // window was raised again. That is what "waited 75s, switched tabs, it
-    // loaded" looks like from the outside.
-    await paintOrGiveUp(250);
-    markPhase("generated-loader-requested");
-    document.body.append(script);
-  })().catch(fail);
-})();
+YªçŠx-®éÜj×¢ëiºÚ+Š§j[h‘éÜ¢éí×]»ïDèµ©hºÚn¶X§zÍH\ÙHÝšXÝŽÂ‚Š
+
+HOˆÂˆËÈ[\\ÈX\šÙ\ˆÚ]]™\žHÜÝÚ[™ÙHÛÈHÛÛœÛÛH›Ý™\ÈH]™BˆËÈ™\œÚ[Ûˆ
+H]ˆÙ\™\ˆ\È›Ë\ÝÜ™K]XœÈØ[ˆÚ]ÛˆHØXÚYÛÜJK‚ˆÛÛœÝPÕÑP—Ð•RSHŒŒ‹LLŒ‹Z[ÜË\Ý™X[Z[™ÌˆŽÈËÈ[\Ûˆ]™\žHÜÝÚ[™ÙHÛÈHÛÛœÛÛH›Ý™\ÈH]™H™\œÚ[Û‚ˆËÈHÙ[™\˜]YØY\ˆ\È^XÝ\]ÚYžHÜ˜X[ÙX’[XYÙHÈXØÙ\[‚ˆËÈ^XÚ]Ø\ÛHT“ˆ[\\ÈZ\ˆYÈÚ]]™\žHØ[›ÛšXØ[[XYÙHÛÈ[ˆÛˆËÈÙ\šXÙHÛÜšÙ\ˆØ[ˆ™]™\ˆZ^HØXÚY”ÈØY\ˆÚ]Hœ™\ÚHÙ\™YØ\ÛK‚ˆÛÛœÝPÕÑP—ÐÐPÒWÕQÈH˜Z[\Ý™X[LˆŽÂˆÛØ˜[\Ë›XÕÙX’ÜÝZ[HPÕÑP—Ð•RSÂˆÛÛœÛÛK›ÙÊ–ÛXÝÙX‹ZÜÝHZ[ˆ
+ÈPÕÑP—Ð•RS
+NÂˆÛÛœÝØ[˜\ÈHØÝ[Y[™Ù][[Y[žRY
+›Z[™XÜ˜YXØ[˜\ÈŠNÂˆÛÛœÝ˜Z[\™HHØÝ[Y[™Ù][[Y[žRY
+™˜Z[\™HŠNÂ‚ˆËÈKKH›ÛÝ\›ÙÜ™\ÜÈÝ\™˜XÙHKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKBˆËÈHYÚÙZYÚ][˜Ú\ˆÝÛœÈHš\ÚX›H›ÛÝ^\šY[˜ÙKˆÙY\[™È\ÂˆËÈÛX[[\™˜XÙH\™H]ÈHÛ™ÈÞ[˜Ú›Û›Ý\ÈÙXˆ[XYÙH›ÛÝ™\Ü]ÂˆËÈ™X[ÝYÙ\ÈÚ[HH[˜Ú[[™ËYÛ\ÚYÛ˜[™\XÙ\ÈHÛÜ[›™\‹‚ˆÛÛœÝ][˜Ú\“Ý™\›^HHÛØ˜[\Ë›XÕÙX“][˜Ú\ŽÂˆÛÛœÝX\šÔ\ÙHH
+\ÙK]Z[HˆŠHOˆÂˆžHÈ™]\›ˆÛØ˜[\Ë›XÕÙX‘]‘XYÛ›ÜÝXÜÏË›X\šÏËŠ\ÙK]Z[
+NÈBˆØ]ÚÈ™]\›ˆ[ÈBˆNÂˆËÈØY\ˆ[œÝ[Y[][Ûˆ\È[X™\˜][H™\ÝYY™›ÜˆHXYÛ›ÜÝXÜÈÜš]BˆËÈ]\Ý™]™\ˆ™XÛÛYHH™]È™X\ÛÛˆ›ÜˆHÙ[™\˜]Y˜]˜H[XYÙHÈ˜Z[‚ˆÛØ˜[\Ë›XÕÙX”Ý™X[Z[™Ô\ÙHH
+\ÙK]Z[HˆŠHOˆÂˆžHÈX\šÔ\ÙJÝš[™Ê\ÙJK]Z[
+NÈHØ]ÚÈÊˆXYÛ›ÜÝXÜÈ\™HÜ[Û˜[
+‹ÈBˆNÂˆËÈÛ‹\YÙHXYÛ›ÜÝXÈ™\™XÝ8 %š\ÚX›H[ˆHØÜ™Y[œÚÝ›ÈÛÛœÛÛH™YYY‚ˆÛÛœÝ›Ø™U™\™XÝHØÝ[Y[˜Ü™X]Q[[Y[
+™]ˆŠNÂˆ›Ø™U™\™XÝšYH›XÝÙX‹\›Ø™K]™\™XÝŽÂˆ›Ø™U™\™XÝœÝ[K˜ÜÜÕ^HœÜÚ][ÛŽ™š^YÝÜÛYÞ‹Z[™^ŒŒMÍÍÎØ˜XÚÙÜ›Ý[™œ™Ø˜JNŽLŠNØÛÛÜŽˆÙ™™ŽÙ›ÛŒLœÌK[Û›ÜÜXÙNÜY[™ÎœLÛX^]ÚYLŒÝÚ]K\ÜXÙNœ™K]Ü˜\ÜÚ[\‹Y]™[Î››Û™NØ›Ü™\ŽŒ\ÛÛYÙØ›Ü™\‹\˜Y]\ÎÈŽÂˆ›Ø™U™\™XÝ^ÛÛ[H”“Ð‘NˆØZ][™ø )ˆŽÂˆËÈÙY\HXYÛ›ÜÝXÈ]˜Z[X›HÚ]Ý]ÛÝ™\š[™ÈH™X[]HRH\š[™ÂˆËÈ›Ü›X[[œËˆYÛXÝÙX—ÙXYÈÚ[ˆØÜ™Y[œÚÝ]š\ÚX›H›Ø™H]šY[˜ÙH\ÂˆËÈ™YYYYØZ[‹‚ˆYˆ
+™]ÈT“ÙX\˜Ú\˜[\ÊØØ][Û‹œÙX\˜Ú
+Kš\Ê›XÝÙX—ÙXYÈŠJHÂˆØÝ[Y[˜›ÙK˜\[™Ú[
+›Ø™U™\™XÝ
+NÂˆBˆ]XØ’Y[ˆH˜[ÙNÂˆÛØ˜[\Ë›XÕÙX›ÛÝÝ™\›^HHÂˆÝ]\Îˆ
+ÊHOˆÈYˆ
+[XØ’Y[ŠH][˜Ú\“Ý™\›^OËœÝ]\ÏËŠÊNÈKˆÝYÙNˆ
+ÊHOˆÈYˆ
+[XØ’Y[ŠH][˜Ú\“Ý™\›^OËœÝYÙOËŠÊNÈKˆ›ÝNˆ
+ÊHOˆÈYˆ
+[XØ’Y[ŠH][˜Ú\“Ý™\›^OË››ÝOËŠÊNÈKˆYNˆ
+
+HOˆÂˆXØ’Y[ˆHYNÂˆ][˜Ú\“Ý™\›^OËœ™]™X[Ø[YOËŠ
+NÂˆKˆÙ]Y[Š
+HÈ™]\›ˆXØ’Y[ŽÈBˆNÂˆËÈPQÎˆ›Ø™HY™™\œÈXÛ\™Y‘Q“Ô‘HHÛÛœÛÛK›ÙÈÜ˜\\ˆ™[ÝËˆHÜ˜\\‚ˆËÈØ\\™\È˜]˜K\ÚYH[›Ü˜[XKØ]\ËÙ\œ›Üˆ[™\È[ÈÚ˜]˜Q\œYŽÈXÛ\š[™È]\™BˆËÈ
+›ÝŒLL[™\ÈÝÛŠHÝX\˜[Y\È›È[\Ü˜[YXY^›Û™H™Y™\™[˜ÙQ\œ›ÜˆYˆ[žHÙÂˆËÈ[™H[Z]Y\š[™ÈX\›HØÜš\]˜[X][ÛˆX]Ú\ÈHÜ˜\\‰ÜÈš[\‹‚ˆÛÛœÝØ[š[Tš[™ÈH×NÈËÈ[š[X]WÜÜš]H]\ËX\ÜÙ[X›Nˆ\™Ù]
+ÈX]šXÙ\È
+ÈÜš]H\ˆ˜]ÂˆÛÛœÝÙÝZP]\Ôš[™ÈH×NÈËÈ[š[X]WÜÜš]H˜]ÜÈÜXÚYšXØ[H\™Ù][™ÈHÕRH]\ÂˆÛÛœÝØ[š[U\™Ù]ÛÝ[ÈH™]ÈX\
+
+NÂˆÛÛœÝÚ˜]˜Q\œYˆH×NÈËÈY™™\™YÓP×KÑ^Ù\[Û‹Ü[›Ü˜[XKØ]\ÈÙÈ[™\Âˆ]Ü›Ø™L‘[\YH˜[ÙNÂˆËÈPQÎˆØØ]\ˆ›Ø™H
+“Ð‘LÊKˆH™]š[Ý\È[š[Tš[™Èš[Y]ÈÛÝÈÛˆBˆËÈT•PÓTÈ]\È
+Üš]\ÊH[™™]™\ˆØœÙ\™YHÕRH]\È\ÜÙ[X›KÛÈ]ˆËÈÛÝ[›ÝØØ[\ÙHHØØ]\™YÚÝ™[ÙÛØ™KÙ^YHÜš]\Ëˆ\ÙHÛÈš[™ÜÈ\™BˆËÈ[[][™HÈ]ˆØ\ÛP˜Y™XÛÜ™È[žH[š[X]WÜÜš]H\ÜÙ[X›H˜]ÈÚÜÙH™[™\‚ˆËÈ\™Ù]\È“Õ[ˆ]\È
+HZ\Ë]\™Ù]Y\ÜÙ[X›HÜš]\ÈÜš]\ÈÛÈHØÜ™Y[‚ˆËÈS‘X]™\ÈH]\È[\HKHÛ™HØ]\ÙK›ÝÞ[\Û\ÊNÈÜØØ]\‘˜]ÜÈ™XÛÜ™ÂˆËÈ[žH˜]ÈÛÈHØÜ™Y[‹\Ú^™YXZ[ˆ\™Ù]]Ø[\\ÈH\‹\Üš]HÓÕTÑBˆËÈ^\™H
+ÚYÙ]Êˆ]ËŠH˜]\ˆ[ˆH]\ÈÜˆHÝ[™[Û™H]H[XYÙK‚ˆËÈKKKH˜]ÈÙ[œÝ\È
+XYÛ›ÜÝXËÜZ[ŠHKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKBˆËÈØØ][Ûˆ^\ÝÈ[ˆHÔHÛÜšÙ\ˆÛÈ
+ÛÜšÙ\“ØØ][ÛŠK[™™KšœÈ\ÜÙ\ÂˆËÈHYÙIÜÈ]Y\žHÝš[™È›ÝYÚÚ[ˆ]Ý\ÈHÛÜšÙ\‹‚ˆÛÛœÝÙ˜]ÐÙ[œÝ\ÈH
+
+
+HOˆÂˆžHÈ™]\›ˆ™]ÈT“ÙX\˜Ú\˜[\ÊØØ][Û‹œÙX\˜Ú
+Kš\Ê›XÝÙX—Ù˜]ØÙ[œÝ\ÈŠNÈBˆØ]ÚÈ™]\›ˆ˜[ÙNÈBˆJJ
+NÂˆžHÂˆÛÛœÛÛK›ÙÊ–Ù˜]ËXÙ[œÝ\×H[˜X›YHˆ
+ÈÙ˜]ÐÙ[œÝ\Âˆ
+ÈˆÙX\˜ÚHˆ
+È
+\[ÙˆØØ][ÛˆOOH[™Yš[™YˆÈ››Ë[ØØ][ÛˆˆˆØØ][Û‹œÙX\˜Ú
+JNÂˆHØ]ÚßBˆÛÛœÝÙ˜]ÐÙ[œÝ\ÐÛÝ[ÈH™]ÈX\
+
+NÂˆ]Ù˜]ÐÙ[œÝ\Ð]HÂˆÛÛœÝÙœ˜[YT\ÜÕ˜XÙHH×NÂˆ]Ý\œ˜Z[•™\Ñ[\YH˜[ÙNÂˆ]Ý\œ˜Z[‘\[\YH˜[ÙNÂˆ]Ý\œ˜Z[•[šY›Ü›Q[\YH˜[ÙNÂˆ]Ý[šY›Ü›TÛ˜\ÚÝ[\YH˜[ÙNÂˆ]Ýš\ÚX›TÛ˜\ÚÝ[\YH˜[ÙNÂˆ]ÝÜš]T›Ø™Q[\YH˜[ÙNÂˆÛÛœÝÙ\Ý]SÙÙÙYH™]ÈÙ]
+
+NÂˆÛÛœÝØ›[™ÙÙÙYH™]ÈÙ]
+
+NÂˆ[˜Ý[ÛˆÛ›ÝQ˜]ÐÙ[œÝ\ÊÝ]K™\^ÛÝ[[œÝ[˜ÙPÛÝ[
+HÂˆYˆ
+Ý]K—Ý˜XÙQ[žJHÂˆÝ]K—Ý˜XÙQ[žK™˜]ÜÊÊÎÂˆËÈÚXÚ\[[™\È˜[ˆ[ˆ\È\ÜË[ˆ\ÜÈÜ™\‹ˆYˆHÚÞH\ÜÈ[œÂˆËÈY\ˆH\œ˜Z[ˆ\ÜÈ[™Üš]\ÈÜ\]Y[K\œ˜Z[ˆ\ÈZ[YÝ™\ˆBˆËÈÚXÚÛÚÜÈ^XÝHZÙH\œ˜Z[ˆ™]™\ˆ™]È‹‚ˆÛÛœÝÚÜHÝš[™Ê
+Ý]Kœ\[[™H	‰ˆÝ]Kœ\[[™KœÜXÂˆ	‰ˆÝ]Kœ\[[™KœÜXË›X™[
+HÈŠKœ™\XÙJ›Z[™XÜ˜Yœ\[[™KÈ‹ˆŠNÂˆÝ]K—Ý˜XÙQ[žKœ\\ÈH™]ÈÙ]
+
+NÂˆYˆ
+Ý]K—Ý˜XÙQ[žKœ\\ËœÚ^™HŠHÝ]K—Ý˜XÙQ[žKœ\\Ë˜Y
+ÚÜ
+NÂˆËÈHØÚ\ÜÛÜˆ]^ÛY\ÈHØÜ™Y[ˆÛ\ÈH˜]È]Ø^H\Ý\ÂˆËÈY™™XÝ]™[H\È™]™\ˆ\ÜÝZ[™È]ˆ™XÛÜ™H™XÝ[ˆ›Ü˜ÙH]BˆËÈš\œÝ˜]ÈÙˆH\ÜË‚ˆYˆ
+Ý]K—Ý˜XÙQ[žKœØÚ\ÜÛÜˆOOH[™Yš[™Y
+HÂˆÝ]K—Ý˜XÙQ[žKœØÚ\ÜÛÜˆHÝ]K—ÜØÚ\ÜÛÜˆÈÝ]K—ÜØÚ\ÜÛÜ‹š›Ú[Š‹ŠHˆ››Û™HŽÂˆÝ]K—Ý˜XÙQ[žK˜\™XHHÝ]K˜\™XHÈÝ]K˜\™XKš›Ú[Š‹ŠHˆ››Û™HŽÂˆBˆBˆÛÛœÝX™[HÝ]Kœ\[[™H	‰ˆÝ]Kœ\[[™KœÜXÂˆÈ
+Ý]Kœ\[[™KœÜXË›X™[ÈŠHˆ››Ë\\[[™HŽÂˆËÈY›Ý\ÝHX™[ˆÛÈ\Ý[˜Ý™[™\ˆ\™Ù]ÈØ[ˆÚ\™HH˜[YBˆËÈ“XZ[ˆÈÛÛÜˆ‹[™HÛÛ\ÜÚ]HØ[ˆÛ›H›]Û™HÙˆ[K‚ˆÛÛœÝÙ^HH
+Ý]K—ÜÝ\™\ÜÙYÈ”ÕT‘TÔÑQˆˆˆŠH
+ÈX™[ˆ
+ÈˆOˆˆ
+È
+Ý]K—Ý\™Ù]X™[ÈŠH
+Èˆˆ
+È
+Ý]K—Ý\™Ù]ÒˆŠBˆ
+ÈˆYHˆ
+È
+Ý]K—Ý\™Ù]YÏÈÈŠNÂˆÛÛœÝ[žHHÙ˜]ÐÙ[œÝ\ÐÛÝ[Ë™Ù]
+Ù^JHÈ˜]ÜÎˆ™\ÎˆNÂˆ[žK™˜]ÜÊÊÎÂˆ[žK™\È
+ÏH
+™\^ÛÝ[
+H
+ˆX]›X^
+K[œÝ[˜ÙPÛÝ[JNÂˆÙ˜]ÐÙ[œÝ\ÐÛÝ[ËœÙ]
+Ù^K[žJNÂˆÛÛœÝ›ÝÈH]K››ÝÊ
+NÂˆYˆ
+›ÝÈHÙ˜]ÐÙ[œÝ\Ð]L
+H™]\›ŽÂˆÙ˜]ÐÙ[œÝ\Ð]H›ÝÎÂˆÛÛœÝ›ÝÜÈHË‹‹—Ù˜]ÐÙ[œÝ\ÐÛÝ[Ë™[šY\Ê
+WBˆœÛÜ
+
+KŠHOˆ–ÌWK™˜]ÜÈHVÌWK™˜]ÜÊKœÛXÙJM
+NÂˆ›Üˆ
+ÛÛœÝÛ˜[YK˜[YWHÙˆ›ÝÜÊHÂˆÛÛœÛÛK›ÙÊ–Ù˜]ËXÙ[œÝ\×Hˆ
+È˜[YK™˜]ÜÈ
+Èžˆ
+È˜[YK™\È
+Èˆˆ
+È˜[YJNÂˆBˆÛÛœÛÛK›ÙÊ–Ù˜]ËXÙ[œÝ\×H\Ý[˜ÝHˆ
+ÈÙ˜]ÐÙ[œÝ\ÐÛÝ[ËœÚ^™Bˆ
+Èˆ™\Ù[ÏHˆ
+ÈÜ™\Ù[ÛÝ[ˆ
+ÈˆÚ[˜ÙS\Ý™\Ù[Hˆ
+È
+Û\Ý™\Ù[]È
+›ÝÈHÛ\Ý™\Ù[]
+H
+È›\Èˆˆ›™]™\ˆŠJNÂˆÙ˜]ÐÙ[œÝ\ÐÛÝ[Ë˜ÛX\Š
+NÂˆB‚ˆÛÛœÝÜØØ]\‘˜]ÜÈH×NÂˆÛÛœÝØ\ÛP˜YH×NÂˆ]Ü›Ø™LÑ[\YH˜[ÙNÂˆÛÛœÝÔÐÐUT—ÓÒÈHØ]\×ß[Ú˜[™ÜÝY[Üß]WÛZ[™XÜ˜Yœ™ß]WÙY][Û—œ™ßY[WØ˜XÚÙÜ›Ý[™[›Ü˜[XWÛÝ™\›^KÎÂˆ[˜Ý[ÛˆÛ›ÝTØØ]\ŠÝ]JHÂˆYˆ
+ÜØØ]\‘˜]ÜË›[™ÝHMˆ\Ý]K—Ý\™Ù]X™[
+H™]\›ŽÂˆÛÛœÝÚHÝ]K—Ý\™Ù]ÒˆŽÂˆÛÛœÝÈH\œÙR[
+ÚL
+HÂˆYˆ
+ÈHML
+H™]\›ŽÈËÈ]\ÈÈÝX™H\™Ù]È\™HLLÈÛ›HHXZ[ˆ\™Ù]\ÈÚY\‚ˆYˆ
+×Ø]\×ËË\Ý
+Ý]K—Ý\™Ù]X™[
+JH™]\›ŽÈËÈ\ÜÙ[X›H˜]ÜÈÛÈ[ˆ]\È\™H“ÕØÜ™Y[ˆØØ]\ˆ
+^HÙ\™HH˜[ÙHÜÚ]]™\È]˜[[YYHØ\
+BˆÛÛœÝØ[\YH×NÂˆ›Üˆ
+ÛÛœÝÛ›K—HÙˆÝ]Kœ™\ÛÝ\˜Ù\ÊHYˆ
+ˆ	‰ˆ‹šÚ[™OOH^\™Hˆ	‰ˆ‹—Ý^[žJHØ[\Yœ\Ú
+‹—Ý^[žK—ÛX™[ÈŠNÂˆYˆ
+\Ø[\Y›[™Ý
+H™]\›ŽÂˆÛÛœÝ[›ÛX[HHØ[\Y™š[\Š
+
+HOˆWÔÐÐUT—ÓÒË\Ý
+
+JNÂˆYˆ
+X[›ÛX[K›[™Ý
+H™]\›ŽÂˆÛÛœÝ˜[HHÝ]Kœ\[[™H	‰ˆÝ]Kœ\[[™KœÜXÈÈÚY\‘˜[Z[JÝ]Kœ\[[™KœÜXË™\^ÚY\ˆˆŠHˆÈŽÂˆÛÛœÝHHÝ]Kœ™\ÛÝ\˜Ù\Ë™Ù]
+”›Ú™XÝ[ÛˆŠNÈ]HH[ÂˆYˆ
+H	‰ˆKšÚ[™OOH[šY›Ü›HŠHÈÛÛœÝˆHØš™XÝË™Ù]
+K˜Y™™\’[™JNÈYˆ
+ˆ	‰ˆ‹—ÜÚYÝÊHÈÛÛœÝˆH™]È›Ø]Ì\œ˜^J‹—ÜÚYÝË˜Y™™\‹
+‹—ÜÚYÝË˜ž]SÙ™œÙ]
+H
+ÈK›Ù™œÙ]MŠNÈHHÙ–ÌK–ÍWWNÈHBˆÜØØ]\‘˜]ÜËœ\Ú
+È˜[KÝˆÝ]K—Ý\™Ù]X™[ÝÒˆÚK[›ÛNˆ[›ÛX[K›X\
+
+
+HOˆœÜ]
+‹ÈŠKœÜ
+
+JHJNÂˆBˆËÈÜ˜\ÛÛœÛÛK›ÙÈÛÈH˜]˜H›ÛÝ˜XÙH
+ÓPËRS’UHÈ[›[™K]\ÚÈÈÓP×JBˆËÈš]™\ÈHÝ™\›^H\ÈÙ[\È]•ÛÛË‚ˆÛÛœÝÜšYÚ[˜[ÛÛœÛÛSÙÈHÛÛœÛÛK›ÙË˜š[™
+ÛÛœÛÛJNÂˆÛÛœÛÛK›ÙÈH
+‹‹˜[Y\ÊHOˆÂˆÜšYÚ[˜[ÛÛœÛÛSÙÊ‹‹˜[Y\ÊNÂˆžHÂˆÛÛœÝH˜[Y\Ë›X\
+
+ŠHOˆ
+\[ÙˆˆOOHœÝš[™ÈˆÈˆˆ
+ˆ	‰ˆ‹›Y\ÜØYÙJHÈ‹›Y\ÜØYÙHˆ”ÓÓ‹œÝš[™ÚYžJŠJJKš›Ú[ŠˆŠNÂˆYˆ
+Ü[›Ü˜[X_]\ß^Ù\[ÛŸ˜Z[YÝX™_™[ØYÚK\Ý
+
+H	‰ˆK×—ÊV_ÕRKQUßS“Ë_S’SK_“Ð‘_XÝÙXŠKË\Ý
+
+H	‰ˆK×”Ó‹Ë\Ý
+
+H	‰ˆÚ˜]˜Q\œY‹›[™ÝÌ
+HÚ˜]˜Q\œY‹œ\Ú
+œÛXÙJŒŒ
+JNÂˆYˆ
+XØ’Y[ŠH™]\›ŽÂˆÛÛœÝHH›X]Ú
+×—ÓPËRS’UWÊŠŠŠIÊNÂˆYˆ
+JHÈÛØ˜[\Ë›XÕÙX›ÛÝÝ™\›^KœÝYÙJVÌWH
+NÈ™]\›ŽÈBˆÛÛœÝ]H›X]Ú
+Ú[›[™K]\ÚÈÊ
+ÊNŠÊÊKÊNÂˆYˆ
+]
+HÈÛØ˜[\Ë›XÕÙX›ÛÝÝ™\›^KœÝ]\Ê”™[ØY[™È\ÜÙ]ø )ˆ\ÚÈÈˆ
+È]ÌWJNÈÛØ˜[\Ë›XÕÙX›ÛÝÝ™\›^K››ÝJ]Ì—JNÈ™]\›ŽÈBˆYˆ
+×—ÓP×KË\Ý
+
+H	‰ˆK×”Ó‹Ë\Ý
+
+JHÛØ˜[\Ë›XÕÙX›ÛÝÝ™\›^K››ÝJœÛXÙJMŠJNÂˆHØ]ÚßBˆNÂˆÛÛœÝØš™XÝÈH™]ÈX\
+
+NÂˆ]™^[™HHNÂˆ]Y\\ŽÂˆ]]šXÙNÂˆ]ÛÛ^ÂˆÛÛœÝXYÛ›ÜÝXÜÈHÛ\ÝØ[ˆšÜÝÙ]\‹Ø[ÎˆßKÝYÙ\Îˆ×KÝYÙS\Îˆ×K™[ØY›Ø™Nˆ×_NÂ‚ˆËÈØ[˜\ÈÚ^š[™ËˆH˜XÚÚ[™ÈÝÜ™H]\Ý˜XÚÈHÔÔÈ›ÞÝ\Ú\ÙHBˆËÈœ›ÝÜÙ\ˆÚ[\HØØ[\ÈHÝ[Hœ˜[YXY™™\ˆÈH™]È[[Y[Ú^™HKH]ˆËÈ\ÈHœ™\Ú^š[™ÈÝ™]Ú\ÈH[XYÙHˆÞ[\ÛKˆ™\Ú^š[™È]\ÈÛ›H[ˆBˆËÈš^ˆZ[™XÜ˜Y[ÛÈ\ÈÈX\ˆX›Ý]]ÜˆÕRHØØ[K›Ú™XÝ[Ûˆ[™ˆËÈ™[™\ˆ\™Ù]È[Ý^H]H›ÛÝÚ^™KˆH\Ü]ÚÛÙ\È›ÝYÚBˆËÈØ[YHÚ[™ÛH[œ]œšYÙHHÙ^X›Ø\™[™[Ý\ÙH\ÙK‚ˆÛØ˜[\Ë›XÕÙXØ[˜\ÈHÂˆ[™[™ÎˆYK‚ˆ\™Ù]Ú^™J
+HÂˆÛÛœÝ˜][ÈHX]›Z[Š]šXÙT^[˜][ÈKŠNÂˆÛÛœÝ™XÝHØ[˜\Ë™Ù]›Ý[™[™ÐÛY[™XÝ
+
+NÂˆÛÛœÝÜÜÕÚYH™XÝÚY[›™\•ÚYÂˆÛÛœÝÜÜÒZYÚH™XÝšZYÚ[›™\’ZYÚÂˆ™]\›ˆÂˆX]›X^
+KX]œ›Ý[™
+ÜÜÕÚY
+ˆ˜][ÊJKˆX]›X^
+KX]œ›Ý[™
+ÜÜÒZYÚ
+ˆ˜][ÊJBˆNÂˆK‚ˆ™\Ú^™P˜XÚÚ[™ÔÝÜ™J
+HÂˆÛÛœÝÝÚYZYÚHH\Ë\™Ù]Ú^™J
+NÂˆYˆ
+Ø[˜\ËÚYOOHÚY	‰ˆØ[˜\ËšZYÚOOHZYÚ
+H™]\›ˆ˜[ÙNÂˆØ[˜\ËÚYHÚYÂˆØ[˜\ËšZYÚHZYÚÂˆYˆ
+ÛÛ^	‰ˆ]šXÙJHÂˆÛÛ^˜ÛÛ™šYÝ\™JÂˆ]šXÙKˆ›Ü›X]ˆœ™Ø˜N[›Ü›H‹ˆ\ØYÙNˆÔU^\™U\ØYÙK”‘S‘T—ÐUPÒQS•ÔU^\™U\ØYÙKÓÔWÑÕˆ[S[ÙNˆ›Ü\]YH‚ˆJNÂˆBˆ™]\›ˆYNÂˆK‚ˆ\T[™[™Ô™\Ú^™J
+HÂˆYˆ
+]\Ëœ[™[™ÊH™]\›ŽÂˆÛÛœÝÚ[™ÙYH\Ëœ™\Ú^™P˜XÚÚ[™ÔÝÜ™J
+NÂˆÛÛœÝœšYÙHHÛØ˜[\Ë›XÕÙX’[œ]	‰ˆÛØ˜[\Ë›XÕÙX’[œ]˜œšYÙNÂˆYˆ
+XœšYÙJHÂˆËÈÝ^H\›YYˆ™Y›Ü™HHœšYÙH^\ÝËÚ[™ÝÈÝ[™XYÈHÚ^™BˆËÈ›ÝYÚÛÑÙ]œ˜[YXY™™\”Ú^™K]H]\ˆ™\Ú^™H]\Ý›Ý™HÜÝ‚ˆ™]\›ŽÂˆBˆ\Ëœ[™[™ÈH˜[ÙNÂˆYˆ
+Ú[™ÙY
+HÛØ˜[\Ë›XÕÙX’[œ]˜Ø[
+œ™\Ú^™H‹Ø[˜\ËÚYØ[˜\ËšZYÚ
+NÂˆBˆNÂ‚ˆY]™[\Ý[™\Šœ™\Ú^™H‹
+
+HOˆÈÛØ˜[\Ë›XÕÙXØ[˜\Ëœ[™[™ÈHYNÈJNÂˆYˆ
+ÛØ˜[\Ëš\ÝX[šY]ÜÜ
+HÂˆÛØ˜[\Ëš\ÝX[šY]ÜÜ˜Y]™[\Ý[™\Šœ™\Ú^™H‹
+
+HOˆÂˆÛØ˜[\Ë›XÕÙXØ[˜\Ëœ[™[™ÈHYNÂˆJNÂˆB‚ˆÊŠˆ\˜X›H]˜Ø[Y\^K\XÚÙ]ÛÝ[\œËˆHY[žHÝYÙHš[™È\Âˆ
+ˆ]šXÝYžHHÛÜ›Ù[ˆXÚÙ]›ÛÙÛÈÚ[™ÝÙYÛÝ[È™XYœ›ÛHBˆ
+ˆš[™È[™\˜ÛÝ[È™\›ËˆÛÝ[\œÈ™]™\ˆ]šXÝˆ
+‹ÂˆÛÛœÝÙ]ÛÝ[ÈH™]ÈX\
+
+NÂ‚ˆÊŠ‚ˆ
+ˆX\šÙ\œÈ[Z]Y\ˆXÚÙ]\ˆœ˜[YHÜˆ\ˆXÚËˆ]™\ž][™È[ÙH8 %›ÛÝˆ
+ˆÝYÙ\ËØÜ™Y[ˆÚ[™Ù\ËÛ™K\ÚÝXYÛ›ÜÝXÜÈ8 %ÙY\ÈHÛÛœÛÛH[™H[™ˆ
+ˆHÛ‹\YÙHÝ]\È^ÚXÚ\ÈÚ]XZÙ\ÈHÝ[Y›ÛÝš\ÚX›K‚ˆ
+‹ÂˆÛÛœÝÐÒUWÔÕQÑHBˆ×Š]ŸXÚÙ]Ÿ\œ˜Z[ŽŸØ[Y\^K\Ý]NŸ™XYÎŸÚ[šÎŸ[\ÛÝÎŸ]™[ØYŸÙ\™\ŽXÚÊKÎÂˆÛÛœÝÛÙÐ[ÝYÙ\ÈH™]ÈT“ÙX\˜Ú\˜[\ÊØØ][Û‹œÙX\˜Ú
+Kš\Ê›XÝÙX—ÛÙ×Ø[ŠNÂ‚ˆÛÛœÝ™XÛÜ™ÝYÙHH
+ÝYÙJHOˆÂˆÛÛœÝÝYÙ\ÈHXYÛ›ÜÝXÜËœÝYÙ\ÎÂˆÝYÙ\Ëœ\Ú
+ÝYÙJNÂˆËÈÛÛœÛÛH[]™\žH[Y\Ý[\È\™H\Ù[\ÜÈ›ÜˆH›ØÚÚ[™È›ÛÝˆ]™\žH[™BˆËÈ[Z]YÚ[HHXZ[ˆ™XY\È\ÞH\È[]™\™Y[ˆÛ™H\œÝÚ[ˆ]ˆËÈœ™Y\È\ÛÈHÛË[Z[]HÛÛœÝXÝÜˆÛÚÜÈ[œÝ[[™[Ý\È[ˆ]•ÛÛË‚ˆËÈÝ[\[™È\™H\ÈHÛ›HØ^HÈ]šX]H][YHÈHÝYÙK‚ˆXYÛ›ÜÝXÜËœÝYÙS\Ëœ\Ú
+X]œ›Ý[™
+\™›Ü›X[˜ÙK››ÝÊ
+JJNÂˆYˆ
+ÝYÙ\Ë›[™Ýˆ
+HÂˆÝYÙ\ËœÜXÙJÝYÙ\Ë›[™ÝH
+NÂˆXYÛ›ÜÝXÜËœÝYÙS\ËœÜXÙJXYÛ›ÜÝXÜËœÝYÙS\Ë›[™ÝH
+NÂˆBˆYˆ
+\[ÙˆÝYÙHOOHœÝš[™Èˆ	‰ˆÝYÙKœÝ\ÕÚ]
+™]ˆŠJHÂˆÛÛœÝ›ÝÈHÙ]ÛÝ[Ë™Ù]
+ÝYÙJHÈŽˆš\œÝ\Îˆ\Ý\ÎˆÎˆ×HNÂˆ›ÝË›ŠÊÎÂˆÛÛœÝ›ÝÈH\™›Ü›X[˜ÙK››ÝÊ
+NÂˆYˆ
+\›ÝË™š\œÝ\ÊH›ÝË™š\œÝ\ÈH›ÝÎÂˆ›ÝË›\Ý\ÈH›ÝÎÂˆËÈÙY\H\ÝÌˆ[™]šYX[[Y\Ý[\Îˆ\‹Z]][˜ÞHÛÜœ™[][Û‚ˆËÈ™YYÈXXÚÜ›ÜÜÚ[™ÉÜÈ[YK›Ý\Ýš\œÝÛ\Ý‚ˆ›ÝËËœ\Ú
+X]œ›Ý[™
+›ÝÈ
+ˆL
+HÈL
+NÂˆYˆ
+›ÝËË›[™ÝˆÌŠH›ÝËËœÚY
+
+NÂˆÙ]ÛÝ[ËœÙ]
+ÝYÙK›ÝÊNÂˆBˆNÂ‚ˆÛÛœÝÜ™XÙ[Ø[ÈH×NÂˆ]Ü™[™\ÛÛ[X[™™\^Q\HÂ‚ˆÊŠˆØ[˜[YH\ÈÛ›HH\™ÜÈ]ØØ]HH˜Z[\™KÙ\ÚÜˆ
+‹ÂˆÛÛœÝÜÝ[[X\š\ÙHH
+˜[YK]Z[
+HOˆÂˆYˆ
+Y]Z[
+H™]\›ˆ˜[YNÂˆYˆ
+˜[YHOOH˜Ü™X]PY™™\ˆŠHÂˆ™]\›ˆÜ™X]PY™™\Š	Ù]Z[›X™[KÞIÙ]Z[œÚ^™_K\ÙOIÙ]Z[\ØYÙ_JXÂˆBˆYˆ
+˜[YHOOHÜš]PY™™\ˆŠHÂˆÛÛœÝ˜[œÜÜH]Z[œXÚÙYÚ\œÈOH[ˆÈIÙ]Z[˜˜\ÙM[™ÝXˆˆž]\ÏIÙ]Z[˜ž]S[™ÝKÚ\œÏIÙ]Z[œXÚÙYÚ\œßXÂˆ™]\›ˆÜš]PY™™\ŠIÙ]Z[š[™_K	Ù]Z[™\Ý[˜][Û“Ù™œÙ]K	Ý˜[œÜÜJXÂˆBˆYˆ
+˜[YHOOHÜš]PY™™\”˜]ÈŠHÂˆ™]\›ˆÜš]PY™™\”˜]ÊIÙ]Z[š[™_K	Ù]Z[™\Ý[˜][Û“Ù™œÙ]Kž]\ÏIÙ]Z[˜ž]S[™ÝJXÂˆBˆYˆ
+˜[YHOOHÜš]U^\™T˜]ÈŠHÂˆ™]\›ˆÜš]U^\™T˜]ÊIÙ]Z[š[™_Kž]\ÏIÙ]Z[˜ž]S[™ÝJXÂˆBˆYˆ
+˜[YHOOHœ™\Ü›ÙÜ™\ÜÈŠH™]\›ˆ™\Ü›ÙÜ™\ÜÊ	Ù]Z[œÝYÙHÏÈˆŸJXÂˆ™]\›ˆ˜[YNÂˆNÂ‚ˆËÈH]\Ù]Z\œ›Üˆ\È\Ü^K[Û›H
+›Ý[™È™XYÈ]›ÙÜ˜[[X]XØ[H8 %ˆËÈH˜Z[\™Hš[™È[™\‹XØ[ÛÝ[\œÈ]™H[ˆÜ™XÙ[Ø[ËÙXYÛ›ÜÝXÜÂˆËÈ[™Ý^H^XÝ
+KˆÛØ[\ØÚ[™È]È›Û›HÚ[ˆHØ[˜[YHÚ[™Ù\ÈˆØ\ÂˆËÈ›Ý[›ÝYÚˆH™[™\ˆ][\›˜]\ÈÛÈØ[˜[Y\È\ˆ\ÜËÛÈBˆËÈ˜[YHÚ[™ÙYÛˆ]™\žHØ[ˆ]\È[YK]›ÝY[œÝXYÚXÚÙY\ÈBˆËÈÛ‹\YÙHÚ]\ÈHÔHÚ[™ÈˆZ\œ›Üˆ\ÙY[\š[™ÈHÝ[‚ˆ]Û\ÝX\šÐØ[ÛHH[Âˆ]Û\ÝX\šÐØ[ÛS\ÈHÂˆ]ÛX\šÐØ[ÛT[™[™ÈH˜[ÙNÂˆÛÛœÝÜ\™“›ÝÈH\[Ùˆ\™›Ü›X[˜ÙHOOH[™Yš[™Y‚ˆÈ
+
+HOˆ\™›Ü›X[˜ÙK››ÝÊ
+Hˆ
+
+HOˆ]K››ÝÊ
+NÂˆÛÛœÝX\šÐØ[H
+˜[YK]Z[H[
+HOˆÂˆËÈÛ™HÝ]\ˆœÛÛ[X[™Ý™X[HØ[™\™\Ù[ÈH˜]˜KÒ”È›Ý[™\žKˆ]ÂˆËÈ[\›˜[Ü\˜][ÛœÈ]\Ý›Ý\™›Ü›HÝ\Ø[™ÈÙˆXYÛ›ÜÝXÈÓHÜš]\ÂˆËÈÜˆX\Ü]Y\˜YH\ÈY][Û˜[œšYÙHÜ›ÜÜÚ[™ÜË‚ˆYˆ
+Ü™[™\ÛÛ[X[™™\^Q\OOH
+H™]\›ŽÂˆËÈH˜\™HØ[˜[YHœ˜XÚÙ]ÈH˜Z[\™HÈH™YÚ[Ûˆ]Ø[››ÝØ^HÚ\™BˆËÈ[œÚYHHÛÜ]\[™YˆHLŽZPˆX™\‹XY™™\ˆ\ÈÙYYYžHŒMÌˆËÈY[XØ[Üš]PY™™\ˆÚ[šÜË[™™YY\š[™ÈÜš]PY™™\ˆˆ\ÈYBˆËÈÚ]\ˆ]YYÛˆHš\œÝÚ[šÈ
+HšYÈ[ØØ][ÛŠHÜˆHL
+BˆËÈ˜[œÚY[ÜZÙJKˆÙY\[™ÈHÚ^™KÛÙ™œÙ]\™ÜÈ\Ý[™ÝZ\Ú\ÈÜÙK‚ˆÜ™XÙ[Ø[Ëœ\Ú
+ÜÝ[[X\š\ÙJ˜[YK]Z[
+JNÂˆYˆ
+Ü™XÙ[Ø[Ë›[™ÝˆŒ
+HÜ™XÙ[Ø[ËœÚY
+
+NÂˆXYÛ›ÜÝXÜË›\ÝØ[H˜[YNÂˆXYÛ›ÜÝXÜË›\Ý]Z[H]Z[ÂˆXYÛ›ÜÝXÜË˜Ø[ÖÛ˜[YWHH
+XYÛ›ÜÝXÜË˜Ø[ÖÛ˜[YWH
+H
+ÈNÂˆËÈHÓHZ\œ›Üˆ^\ÝÈÛÈH[X[ˆÜˆH›Ø™HØ[ˆ™XYH\ÝØ[ˆËÈÚ]Ý]HYÙH]˜[X]NÈ›Ý[™ÈÛÛœÝ[Y\È]]œ˜[YH˜]KˆÜš][™È]ˆËÈÛˆ]™\žHÚ[™ÙHÙˆ˜[YXYˆH™X[Ù\™\ˆœ˜[YH[\›˜]\ÂˆËÈ™YÚ[”™[™\”\ÜÈÚ]œÛÛ[X[™Ý™X[HŽ[Y\ËÛÈ\ÈÜ›ÝH™YBˆËÈ]\Ù]›Ü\Y\È8 %Û™HÙˆ[HH”ÓÓ‹œÝš[™ÚYžHÙˆH™[™\‹\\ÜÂˆËÈ\ØÜš\Üˆ8 %X›Ý]L‹Ì[Y\ÈHÙXÛÛ™ˆZ\œ›ÜˆÛˆH[Y\ˆ[œÝXY[™ˆËÈHš[™ÈX›Ý™HÝ^\È^XÝ‚ˆYˆ
+˜[YHOOHÛ\ÝX\šÐØ[ÛJHÂˆÛ\ÝX\šÐØ[ÛHH˜[YNÂˆÛX\šÐØ[ÛT[™[™ÈHYNÂˆBˆÛÛœÝ›ÝÈHÜ\™“›ÝÊ
+NÂˆYˆ
+ÛX\šÐØ[ÛT[™[™È	‰ˆ›ÝÈHÛ\ÝX\šÐØ[ÛS\ÈHL
+HÂˆÛ\ÝX\šÐØ[ÛS\ÈH›ÝÎÂˆÛX\šÐØ[ÛT[™[™ÈH˜[ÙNÂˆØÝ[Y[˜›ÙK™]\Ù]›\ÝÜPØ[H˜[YNÂˆØÝ[Y[˜›ÙK™]\Ù]›\ÝÜPØ[ÛÝ[HÝš[™ÊXYÛ›ÜÝXÜË˜Ø[ÖÛ˜[YWJNÂˆYˆ
+]Z[
+HØÝ[Y[˜›ÙK™]\Ù]›\ÝÜQ]Z[H”ÓÓ‹œÝš[™ÚYžJ]Z[
+NÂˆBˆNÂ‚ˆËÈ^ÜÙHH\˜X›H]ÛÝ[\œÈ›Üˆ›Ø™\È]™YYÚ[™ÝÙYÛÝ[ÈBˆËÈ]šXÝ[™Èš[™ÈØ[››Ý›ÝšYK‚ˆÛØ˜[\Ë›XÕÙX‘]ÛÝ[ÈH
+
+HOˆØš™XÝ™œ›ÛQ[šY\ÊÙ]ÛÝ[ÊNÂ‚ˆÛÛœÝ™\ÛÛ™Pš[™[™Ó˜[YHH
+˜[YKÚ[™
+HOˆÂˆËÈÛ\ˆÝYÙY[XYÙ\ÈÝ[\ÜÈZ\ˆ™KZ[\›š[™È˜]˜HÝš[™ÈØš™XÝ‚ˆËÈ™]\›š[™È][ÝXÚY]›ÚYÈH™XÝ\œÚ]™H›ÞHÝš[™ÈÛÛ™\œÚ[Ûˆ]ˆËÈØ]\ÙYHØ\ÛSHÝXÚÈÝ™\™›ÝËˆ[Y\šXÈQÈ]\Ý™\ÛÛ™H^XÝK‚ˆYˆ
+\[Ùˆ˜[YHOOH›[X™\ˆŠH™]\›ˆ˜[YNÂˆÛÛœÝ˜[YHHÛØ˜[\Ë›XÕÙX‘ÜOË—Øš[™[™Ó˜[Y\ÏË–Ý˜[YWNÂˆYˆ
+\[Ùˆ˜[YHOOHœÝš[™ÈŠH›ÝÈ™]È\œ›ÜŠ[šÛ›ÝÛˆ	ÚÚ[™Hš[™[™È˜[YH	Ý˜[Y_X
+NÂˆ™]\›ˆ˜[YNÂˆNÂ‚ˆÛÛœÝÙ]^H
+Y˜[YJHOˆÂˆÛÛœÝ›ÙHHØÝ[Y[™Ù][[Y[žRY
+Y
+NÂˆYˆ
+›ÙJH›ÙK^ÛÛ[H˜[YNÂˆNÂ‚ˆÛÛœÝ˜Z[H
+\œ›ÜŠHOˆÂˆÛÛœÝY\ÜØYÙHH\œ›ÜËœÝXÚÈÝš[™Ê\œ›ÜŠNÂˆ˜Z[\™KšY[ˆH˜[ÙNÂˆ˜Z[\™K^ÛÛ[HY\ÜØYÙNÂˆYˆ
+\œ›ÜË˜ÛÙJHÂˆØÝ[Y[˜›ÙK™]\Ù]›XÝÙX‘˜Z[\™PÛÙHHÝš[™Ê\œ›Ü‹˜ÛÙJNÂˆBˆÙ]^
+š˜\‹\Ý]\È‹™˜Z[YŠNÂˆÙ]^
+™ÜK\Ý]\È‹\œ›ÜË›Y\ÜØYÙHÝš[™Ê\œ›ÜŠJNÂˆX\šÔ\ÙJ˜›ÛÝY˜Z[Y‹\œ›ÜË˜ÛÙHœ[[YKY\œ›ÜˆŠNÂˆÛÛœÛÛK™\œ›ÜŠ\œ›ÜŠNÂˆNÂ‚ˆËÈœ˜[Y\È›ÝÚ[™ÈYX[œÈHÛY[\ÈX[NÈœ›ÛH[ˆÛ‹ÛÛœÛÛH›Ú\ÙBˆËÈ
+›ÝX›HXY\ÜËTÝÚYÚY\‰ÜÈ’[œÝ[˜ÙH›ÜY[ˆÜ\œ›Ü”ØÛÜHŠH]\ÝˆËÈ›Ý™K\ÚÝÈH˜Z[\™HÝ™\›^H[™YHH™[™\™YØ[˜\Ë‚ˆ]œ˜[Y\Ñ›ÝÚ[™ÈH˜[ÙNÂˆ]š\œÝ˜Y”™XÛÜ™YH˜[ÙNÂˆ]š\œÝœ˜[YT™\ÜYH˜[ÙNÂˆÛÛœÝÜšYÚ[˜[ÛÛœÛÛQ\œ›ÜˆHÛÛœÛÛK™\œ›Ü‹˜š[™
+ÛÛœÛÛJNÂˆÛÛœÛÛK™\œ›ÜˆH
+‹‹˜[Y\ÊHOˆÂˆÜšYÚ[˜[ÛÛœÛÛQ\œ›ÜŠ‹‹˜[Y\ÊNÂˆYˆ
+œ˜[Y\Ñ›ÝÚ[™ÊH™]\›ŽÂˆËÈ™[šYÛˆÝ\\Ø\›š[™ÜÈ
+K™ËˆÓˆ“Ô
+H]\Ý›ÝX\ÚÈHX[H[‹‚ˆÛÛœÝ^H˜[Y\Ë›X\
+
+˜[YJHOˆÝš[™Ê˜[YOË›Y\ÜØYÙHÏÈ˜[YJJKš›Ú[ŠˆŠNÂˆYˆ
+^œÝ\ÕÚ]
+”ÓˆŠJH™]\›ŽÂˆÛÛœÝš\œÝ\œ›ÜˆH˜[Y\Ë™š[™
+
+˜[YJHOˆ˜[YH[œÝ[˜Ù[Ùˆ\œ›ÜŠNÂˆÛÛœÝY\ÜØYÙHH˜[Y\Ë›X\
+
+˜[YJHOˆ˜[YOËœÝXÚÈÝš[™Ê˜[YJJKš›Ú[Š—ˆŠNÂˆ˜Z[\™KšY[ˆH˜[ÙNÂˆ˜Z[\™K^ÛÛ[Hš\œÝ\œ›ÜËœÝXÚÈY\ÜØYÙNÂˆÙ]^
+š˜\‹\Ý]\È‹œ[[YH\œ›ÜˆŠNÂˆNÂ‚ˆÛÛœÝ]H
+Øš™XÝ
+HOˆÂˆÛÛœÝ[™HH™^[™JÊÎÂˆYˆ
+Øš™XÝ	‰ˆ\[ÙˆØš™XÝOOH›Øš™XÝŠHØš™XÝ—Ú[™HH[™NÂˆØš™XÝËœÙ]
+[™KØš™XÝ
+NÂˆ™]\›ˆ[™NÂˆNÂ‚ˆËÈ˜]˜Hž]H\œ˜^\ÈÜ›ÜÜÈHÙXˆ[XYÙH[\›Ü›Ý[™\žH\È˜\ÙM^ÂˆËÈY™™\”ÛÝ\˜ÙHÛÛ™\œÚ[Ûˆ™Z™XÝÈH˜]È[\›Ü›ÞK‚ˆÛÛœÝ˜\ÙMÐž]\ÈH
+˜\ÙM
+HOˆÂˆÛÛœÝš[˜\žHH]ØŠ˜\ÙM
+NÂˆÛÛœÝž]\ÈH™]ÈZ[\œ˜^Jš[˜\žK›[™Ý
+NÂˆ›Üˆ
+]HHÈHš[˜\žK›[™ÝÈJÊÊHÂˆž]\ÖÚWHHš[˜\žK˜Ú\ÛÙP]
+JNÂˆBˆ™]\›ˆž]\ÎÂˆNÂ‚ˆËÈØ\ÛQÐÈ\È›È^ÜY[™X\ˆY[[ÜžKˆXÚÈÛÈ^[ØYž]\È[ÈXXÚˆËÈU‹LMˆÛÙH[š]ÛÈÙXˆ[XYÙIÜÈ[˜]›ÚYX›H˜]˜KTÝš[™ÈÛÛ™\œÚ[ÛˆØ[ÜÂˆËÈËÎ\ÈX[žHÚ\˜XÝ\œÈ\È˜\ÙM[ˆ™XÛÛœÝXÝH^XÝž]HšY]Ë‚ˆÛÛœÝXÚÙY^Ðž]\ÈH
+^ž]S[™Ý
+HOˆÂˆYˆ
+\[Ùˆ^OOHœÝš[™ÈˆS[X™\‹š\Ò[YÙ\Šž]S[™Ý
+Hž]S[™Ýˆ^›[™ÝOOHX]˜ÙZ[
+ž]S[™ÝÈŠJHÂˆ›ÝÈ™]È\œ›ÜŠ[˜[YXÚÙY\ØY[™ÝÚ\œÏIÝ^Ë›[™ÝHž]\ÏIØž]S[™ÝX
+NÂˆBˆÛÛœÝž]\ÈH™]ÈZ[\œ˜^Jž]S[™Ý
+NÂˆ›Üˆ
+]HHÈH^›[™ÝÈJÊÊHÂˆÛÛœÝZ\ˆH^˜Ú\ÛÙP]
+JNÂˆÛÛœÝ]HH
+ˆŽÂˆž]\ÖØ]HHZ\ˆ	ˆ™ŽÂˆYˆ
+]
+ÈHž]S[™Ý
+Hž]\ÖØ]
+ÈWHHZ\ˆˆÂˆBˆ™]\›ˆž]\ÎÂˆNÂ‚ˆÛÛœÝÙ]H
+[™KÚ[™
+HOˆÂˆÛÛœÝØš™XÝHØš™XÝË™Ù]
+[™JNÂˆYˆ
+[Øš™XÝ
+H›ÝÈ™]È\œ›ÜŠ[šÛ›ÝÛˆ	ÚÚ[™H[™H	Ú[™_X
+NÂˆ™]\›ˆØš™XÝÂˆNÂ‚ˆÛÛœÝZ[™XÜ˜Y^\™U\ØYÙHH
+\ØYÙJHOˆÂˆ]™\Ý[HÂˆYˆ
+\ØYÙH	ˆJH™\Ý[HÔU^\™U\ØYÙKÓÔWÑÕÂˆYˆ
+\ØYÙH	ˆŠH™\Ý[HÔU^\™U\ØYÙKÓÔWÔÔÎÂˆYˆ
+\ØYÙH	ˆ
+H™\Ý[HÔU^\™U\ØYÙK•VT‘WÐ’S‘S‘ÎÂˆYˆ
+\ØYÙH	ˆ
+H™\Ý[HÔU^\™U\ØYÙK”‘S‘T—ÐUPÒQS•Âˆ™]\›ˆ™\Ý[ÂˆNÂ‚ˆÛÛœÝZ[™XÜ˜YY™™\•\ØYÙHH
+\ØYÙJHOˆÂˆ]™\Ý[HÂˆYˆ
+\ØYÙH	ˆ
+H™\Ý[HÔPY™™\•\ØYÙKÓÔWÑÕÂˆYˆ
+\ØYÙH	ˆMŠH™\Ý[HÔPY™™\•\ØYÙKÓÔWÔÔÎÂˆYˆ
+\ØYÙH	ˆÌŠH™\Ý[HÔPY™™\•\ØYÙK•‘T•VÂˆYˆ
+\ØYÙH	ˆ
+H™\Ý[HÔPY™™\•\ØYÙK’S‘VÂˆYˆ
+\ØYÙH	ˆLŽ
+H™\Ý[HÔPY™™\•\ØYÙK•S’Q“Ô“NÂˆYˆ
+\ØYÙH	ˆLLŠH™\Ý[HÔPY™™\•\ØYÙK’S‘T‘PÕÂˆËÈ[Ú˜[™È\›Z]ÈPTÕÔ’U_S’Q“Ô“KˆÙX‘ÔHÙ\È›ÝÛÈ˜]˜HX\ÈBˆËÈÔHÚYÝÈ[™›\Ú\È][ÈHÓÔWÑÕY™™\ˆ[œÝXY‚ˆYˆ
+\ØYÙH	ˆŠH™\Ý[HÔPY™™\•\ØYÙKÓÔWÑÕÂˆYˆ
+\ØYÙH	ˆJH™\Ý[HÔPY™™\•\ØYÙKÓÔWÔÔÎÂˆYˆ
+\ØYÙH	ˆMŠHÂˆËÈ[Ú˜[™ÉÜÈTÐQÑWÕS’Q“Ô“WÕVSÐ•Q‘‘Tˆ\ÈH[Ø[ˆÛÛ˜Ù\Ú]›ÈÙX‘ÔBˆËÈ\]Z]˜[[ÈH™X\™\Ý\ÈH™XY[Û›HÝÜ˜YÙHY™™\‹ˆ›ÝÚ[™È\™BˆËÈX›ÜYHÚÛH™[™\ˆœ˜[YK[™H›ÝÈÛ›H™XØ[YH™XXÚX›BˆËÈÛ˜ÙHH‘Èš^]]\ÈÝ]Ú[™ÈÛÛ\]Kˆ\›Þ[X][™È\ÂˆËÈÝšXÝH™]\ŽˆYˆHÚY\ˆ™X[H™YYÈ^[XY™™\ˆÙ[X[XÜÈ]ÂˆËÈ\[[™H˜Z[ÈÈZ[[™\ÈÚÚ\Y
+HYÜ˜YY™X]\™JK[œÝXYˆËÈÙˆZÚ[™ÈH[\™Hœ˜[YHKH[™HÛY[KHÝÛˆÚ]]‚ˆ™\Ý[HÔPY™™\•\ØYÙK”ÕÔQÑNÂˆBˆYˆ
+\™\Ý[
+H›ÝÈ™]È\œ›ÜŠ[œÝ\ÜYZ[™XÜ˜YY™™\ˆ\ØYÙH	Ý\ØYÙ_X
+NÂˆ™]\›ˆ™\Ý[ÂˆNÂ‚ˆÛÛœÝZ[™XÜ˜Y›Ü›X]H
+›Ü›X]
+HOˆÂˆÛÛœÝ›Ü›X]ÈHÂˆ‘ÐNÕS“Ô“Nˆœ™Ø˜N[›Ü›H‹ˆ‘ÐNÔÓ“Ô“Nˆœ™Ø˜NÛ›Ü›H‹ˆ‘ÐNÕRS•ˆœ™Ø˜NZ[‹ˆ‘ÐNÔÒS•ˆœ™Ø˜NÚ[‹ˆ‘ÔNÕS“Ô“Nˆ˜™Ü˜N[›Ü›H‹ˆŽÕS“Ô“NˆœŽ[›Ü›H‹ˆŽÔÓ“Ô“NˆœŽÛ›Ü›H‹ˆŽÕRS•ˆœŽZ[‹ˆŽÔÒS•ˆœŽÚ[‹ˆ‘ÎÕS“Ô“Nˆœ™Î[›Ü›H‹ˆ‘ÎÔÓ“Ô“Nˆœ™ÎÛ›Ü›H‹ˆ‘ÎÕRS•ˆœ™ÎZ[‹ˆ‘ÎÔÒS•ˆœ™ÎÚ[‹ˆ‘ÐLM—ÕS“Ô“Nˆœ™Ø˜LM[›Ü›H‹ˆ‘ÐLM—ÔÓ“Ô“Nˆœ™Ø˜LMœÛ›Ü›H‹ˆ‘ÐLM—ÕRS•ˆœ™Ø˜LMZ[‹ˆ‘ÐLM—ÔÒS•ˆœ™Ø˜LMœÚ[‹ˆ‘ÐLM—Ñ“ÐUˆœ™Ø˜LM™›Ø]‹ˆ‘ÐLÌ—Ñ“ÐUˆœ™Ø˜LÌ™›Ø]‹ˆ‘ÌM—Ñ“ÐUˆœ™ÌM™›Ø]‹ˆ‘ÌÌ—Ñ“ÐUˆœ™ÌÌ™›Ø]‹ˆŒM—Ñ“ÐUˆœŒM™›Ø]‹ˆŒÌ—Ñ“ÐUˆœŒÌ™›Ø]‹ˆ‘ÌLPŒLÑ“ÐUˆœ™ÌLXŒLY›Ø]‹ˆ‘ÐŒLL—ÕS“Ô“Nˆœ™ØŒLL[›Ü›H‹ˆ‘ÐŒLL—ÕRS•ˆœ™ØŒLLZ[‹ˆÌ—Ñ“ÐUˆ™\Ì™›Ø]‹ˆÌ—Ñ“ÐUÔÎÕRS•ˆ™\Ì™›Ø]\Ý[˜Ú[‹ˆÕS“Ô“WÔÎÕRS•ˆ™\\Ë\Ý[˜Ú[‹ˆM—ÕS“Ô“Nˆ™\M[›Ü›H‚ˆNÂˆÛÛœÝX\YH›Ü›X]ÖÙ›Ü›X]NÂˆYˆ
+[X\Y
+H›ÝÈ™]È\œ›ÜŠZ[™XÜ˜Y^\™H›Ü›X]	Ù›Ü›X]H\È›ÝÜYY]
+NÂˆ™]\›ˆX\YÂˆNÂ‚ˆËÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKBˆËÈ\[[™\Îˆ[Ú˜[™È™[™\”\[[™HÜXÈOˆÔT™[™\”\[[™KˆÚY\œÈ\™HBˆËÈ[™]Üš][ˆÑÔÓ˜[Z[HÙ^YYžH˜[š[HÛÜ™HÚY\ˆQÈH›ÛÝÙ]ˆËÈ
+]HØÜ™Y[ŠH\È[HÛÝ™\™Y[šÛ›ÝÛˆÚY\œÈZY[[˜[Y\[[™\Ë‚ˆËÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKB‚ˆÛÛœÝS’Q“Ô“WÔÕ•PÕÈHÂˆ[˜[ZXÕ˜[œÙ›Ü›\ÎˆÂˆ[Ù[šY]ÓX]ˆX]ŒÌ‹ˆÛÛÜ“[Ù[]ÜŽˆ™XÍŒÌ‹ˆ[Ù[Ù™œÙ]ˆ™XÌÏŒÌ‹ˆ^\™SX]ˆX]ŒÌ‹ŸXˆ›Ú™XÝ[ÛŽˆÂˆ›Ú“X]ˆX]ŒÌ‹ŸXˆËÈÚY\œËÚ[˜ÛYKÛYÚ™ÛÛˆ[Ú˜[™ÉÜÈÝMÜš]\ˆš[™ÈŽž]\Î‚ˆËÈ™XÌÈXž]H[YÛ›Y[Ø\™XÌÈM‹ˆØØ[\œÈ™\Ù\™HÜÙH^XÝˆËÈÙ™œÙ]ÈÚ]Ý]XZÚ[™ÈÑÔÓ›Ý[™H™\]Z\™Yš[™[™ÈÚ^™HÈÌ‹‚ˆYÚ[™ÎˆÂˆYÚˆŒÌ‹ˆYÚNˆŒÌ‹ˆYÚŽˆŒÌ‹ˆÛYÚ[™ÔYˆŒÌ‹ˆYÚVˆŒÌ‹ˆYÚVNˆŒÌ‹ˆYÚVŽˆŒÌ‹ŸXˆËÈ[Ú˜[™Èš[™È\È›ØÚÈ\È]Èž]\ÈÙˆY[X™\ˆ]KˆÙY\[™È›ÙÐÛÛÜ‚ˆËÈ\ÈHÑÔÓ™XÍÚ]™\ÈHÝXÝM‹Xž]H[YÛ›Y[[™›Ý[™È]È™\]Z\™YˆËÈš[™[™ÈÚ^™H\È[˜[Y][™È]™\žHÛÜ›™[™\ˆÝX›Z]ˆØØ[\œÂˆËÈ™\Ù\™HH™XÍ	ÜÈÙ™œÙ]ÈÚ[HÙY\[™ÈHÚY\‹]š\ÚX›HÚ^™H]‚ˆ›ÙÎˆÂˆ›ÙÐÛÛÜ”ŽˆŒÌ‹ˆ›ÙÐÛÛÜ‘ÎˆŒÌ‹ˆ›ÙÐÛÛÜŽˆŒÌ‹ˆ›ÙÐÛÛÜNˆŒÌ‹ˆ›ÙÑ[š\›Û›Y[[Ý\ˆŒÌ‹ˆ›ÙÑ[š\›Û›Y[[[™ˆŒÌ‹ˆ›ÙÔ™[™\‘\Ý[˜ÙTÝ\ˆŒÌ‹ˆ›ÙÔ™[™\‘\Ý[˜ÙQ[™ˆŒÌ‹ˆ›ÙÔÚÞQ[™ˆŒÌ‹ˆ›ÙÐÛÝYÑ[™ˆŒÌ‹ŸXˆËÈ\‹\ÙXÝ[Ûˆ›ØÚÈ›Üˆ\œ˜Z[ˆ
+ÚY\œËÚ[˜ÛYKØÚ[šÜÙXÝ[Û‹™ÛÛ
+K‚ˆËÈ\œ˜Z[ˆ\ÈHÛ›H˜[Z[H]Ø\œšY\È]È[Ù[]šY]È\™H˜]\ˆ[‚ˆËÈ[ˆ[˜[ZXÕ˜[œÙ›Ü›\ËÚXÚ\ÈÚHHÙ[™\šXÈ™\^˜[˜XÚÈÚ[[BˆËÈ\ÙY[ˆY[]HX]š^[™Û\Y]™\žHÚ[šË‚ˆÚ[šÔÙXÝ[ÛŽˆÂˆ[Ù[šY]ÓX]ˆX]ŒÌ‹ˆÚ[šÕš\ÚXš[]NˆŒÌ‹ˆ^\™TÚ^™Nˆ™XÌLÌ‹ˆÚ[šÔÜÚ][ÛŽˆ™XÌÏLÌ‹ŸXˆËÈÛÜ™KÜ™[™\\WØÛÝYËœÚˆ™XÍ™XÌÈM‹™XÌÈÌ‹ˆ\ÈÚ]ˆËÈYÚ[™ËØØ[\ˆY[X™\œÈÙY\[Ú˜[™ÉÜÈ[œ›Ý[™YXž]Hš[™[™È˜[Y‚ˆÛÝY[™›ÎˆÂˆÛÝYÛÛÜ”ŽˆŒÌ‹ˆÛÝYÛÛÜ‘ÎˆŒÌ‹ˆÛÝYÛÛÜŽˆŒÌ‹ˆÛÝYÛÛÜNˆŒÌ‹ˆÛÝYÙ™œÙ]ˆŒÌ‹ˆÛÝYÙ™œÙ]NˆŒÌ‹ˆÛÝYÙ™œÙ]ŽˆŒÌ‹ˆØÛÝY[™›ÔYˆŒÌ‹ˆÙ[Ú^™VˆŒÌ‹ˆÙ[Ú^™VNˆŒÌ‹ˆÙ[Ú^™VŽˆŒÌ‹ŸXˆËÈXÛ\™YÚ]ØØ[\ˆY[X™\œÈÓ“K[X™\˜][KˆH™XÌÈÛÝ[Ú]™HBˆËÈÝXÝM‹Xž]H[YÛ›Y[[™ÑÔÓ›Ý[™ÈHÝXÝ	ÜÈÚ^™H\È]ÂˆËÈ[YÛ›Y[ˆMˆOˆˆ[Ú˜[™È[ØØ]\È\ÈY™™\ˆ]H[‹\›Ý[™YM‹ˆËÈ[™H›Ý[™˜[™ÙH\ÈØ\Y]HY™™\ˆÚ^™KÛÈHXž]HÚY\‚ˆËÈÝXÝØ[ˆ™]™\ˆ™HØ]\ÙšYYKH]™\žHÝX›Z]˜Z[ÈÚ]˜›Ý[™Ú]Ú^™BˆËÈMˆ‹‹ˆ™\]Z\™\È]X\Ýˆ[™HØÜ™Y[ˆœ™Y^™\Ëˆ[\ØØ[\ˆY[X™\œÂˆËÈÚ]™H[YÛ›Y[[™Ú^™H^XÝHM‹Ú[H[™[™ÈÛˆHØ[YHÙ™œÙ]ÂˆËÈÝM\Ù\È
+]™XÌÈ
+ÜY™XÌÈMˆ
+ÜY™XÌˆÌ‹[ˆØØ[\œÊK‚ˆÛØ˜[ÎˆÂˆØ[Y\˜P›ØÚÔÜÖˆLÌ‹ˆØ[Y\˜P›ØÚÔÜÖNˆLÌ‹ˆØ[Y\˜P›ØÚÔÜÖŽˆLÌ‹ˆÙÛØ˜[ÔYˆLÌ‹ˆØ[Y\˜SÙ™œÙ]ˆŒÌ‹ˆØ[Y\˜SÙ™œÙ]NˆŒÌ‹ˆØ[Y\˜SÙ™œÙ]ŽˆŒÌ‹ˆÙÛØ˜[ÔYNˆŒÌ‹ˆØÜ™Y[”Ú^™VˆŒÌ‹ˆØÜ™Y[”Ú^™VNˆŒÌ‹ˆÛ[[NˆŒÌ‹ˆØ[YU[YNˆŒÌ‹ˆY[P›\”˜Y]\ÎˆLÌ‹ˆ\ÙT™ÜÜÎˆLÌ‹ŸXˆËÈÜÝXÚZ[ˆ[šY›Ü›H›ØÚÜÈ
+XÛ\™Y[ˆHT‰ÜÈÜÝÊ‹™œÚÈHÚ^™\ÂˆËÈUTÕX]Ú[Ú˜[™ÉÜÈÝMY™™\œÈÜˆÜ™X]Pš[™Ü›Ý\˜Z[È˜[Y][Ûˆ8 %ˆËÈHš[™[™ÈÛX[\ˆ[ˆHÚY\‹YXÛ\™YÝXÝ\È™Z™XÝY
+Kˆ^[Ý]ÂˆËÈ™\šYšYYYØZ[œÝ\ÜÙ]ËÛZ[™XÜ˜YÜÚY\œËÜÜÝÞØ›ÞØ›\‹›]K™œÚ‚ˆØ[\\’[™›ÎˆÂˆÝ]Ú^™Nˆ™XÌŒÌ‹ˆ[”Ú^™Nˆ™XÌŒÌ‹ŸXˆ›\ÛÛ™šYÎˆÂˆ›\‘\Žˆ™XÌŒÌ‹ˆ˜Y]\ÎˆŒÌ‹ŸXˆ›]ÛÛ™šYÎˆÂˆÛÛÜ“[Ù[]Nˆ™XÍŒÌ‹ŸXˆËÈÜš]KX]\È\ÜÙ[X›H
+ÚY\œËØÛÜ™KØ[š[X]WÜÜš]KœÚšXBˆËÈ[š[X][Û—ÜÜš]K™ÛÛ
+Kˆ^\™P]\ÈXÚÜÈ]™\žHÜš]IÜÈ^[È[ÈBˆËÈšYÈP“Ë[ˆ˜]ÜÈXXÚÜš]H[ÈH]\ÈÚ]\È›ØÚÎˆBˆËÈÜš]SX]š^X\ÈH[š]]XYÈHÜš]IÜÈ]\È™YÚ[Û‹‚ˆÜš]P[š[X][Û’[™›ÎˆÂˆ›Ú™XÝ[Û“X]š^ˆX]ŒÌ‹ˆÜš]SX]š^ˆX]ŒÌ‹ˆTY[™ÎˆŒÌ‹ˆ”Y[™ÎˆŒÌ‹ˆZ\X\]™[ˆLÌ‹ŸXˆNÂ‚ˆÛÛœÝ‘T•VÑÔWÑ“Ô“PUÈHÂˆŒÌ—Ñ“ÐUˆÙÜNˆ™›Ø]Ìˆ‹[NˆKÚ[™ˆ™ˆŸKˆ‘ÌÌ—Ñ“ÐUˆÙÜNˆ™›Ø]Ìžˆ‹[Nˆ‹Ú[™ˆ™ˆŸKˆ‘ÐŒÌ—Ñ“ÐUˆÙÜNˆ™›Ø]Ìž‹[NˆÚ[™ˆ™ˆŸKˆ‘ÐLÌ—Ñ“ÐUˆÙÜNˆ™›Ø]Ìž‹[NˆÚ[™ˆ™ˆŸKˆŒM—Ñ“ÐUˆÙÜNˆ™›Ø]Mžˆ‹[Nˆ‹Ú[™ˆ™ˆŸKˆ‘ÌM—Ñ“ÐUˆÙÜNˆ™›Ø]Mžˆ‹[Nˆ‹Ú[™ˆ™ˆŸKˆ‘ÐŒM—Ñ“ÐUˆÙÜNˆ™›Ø]Mž‹[NˆÚ[™ˆ™ˆŸKˆ‘ÐLM—Ñ“ÐUˆÙÜNˆ™›Ø]Mž‹[NˆÚ[™ˆ™ˆŸKˆŽÕS“Ô“NˆÙÜNˆ[›Ü›Nˆ‹[Nˆ‹Ú[™ˆ™ˆŸKˆ‘ÎÕS“Ô“NˆÙÜNˆ[›Ü›Nˆ‹[Nˆ‹Ú[™ˆ™ˆŸKˆ‘ÐŽÕS“Ô“NˆÙÜNˆ[›Ü›N‹[NˆÚ[™ˆ™ˆŸKˆ‘ÐNÕS“Ô“NˆÙÜNˆ[›Ü›N‹[NˆÚ[™ˆ™ˆŸKˆŽÔÓ“Ô“NˆÙÜNˆœÛ›Ü›Nˆ‹[Nˆ‹Ú[™ˆ™ˆŸKˆ‘ÎÔÓ“Ô“NˆÙÜNˆœÛ›Ü›Nˆ‹[Nˆ‹Ú[™ˆ™ˆŸKˆ‘ÐŽÔÓ“Ô“NˆÙÜNˆœÛ›Ü›N‹[NˆÚ[™ˆ™ˆŸKˆ‘ÐNÔÓ“Ô“NˆÙÜNˆœÛ›Ü›N‹[NˆÚ[™ˆ™ˆŸKˆŽÕRS•ˆÙÜNˆZ[ˆ‹[Nˆ‹Ú[™ˆHŸKˆ‘ÎÕRS•ˆÙÜNˆZ[ˆ‹[Nˆ‹Ú[™ˆHŸKˆ‘ÐNÕRS•ˆÙÜNˆZ[‹[NˆÚ[™ˆHŸKˆŒM—ÕRS•ˆÙÜNˆZ[Mžˆ‹[Nˆ‹Ú[™ˆHŸKˆ‘ÌM—ÕRS•ˆÙÜNˆZ[Mžˆ‹[Nˆ‹Ú[™ˆHŸKˆ‘ÐLM—ÕRS•ˆÙÜNˆZ[Mž‹[NˆÚ[™ˆHŸKˆŒÌ—ÕRS•ˆÙÜNˆZ[Ìˆ‹[NˆKÚ[™ˆHŸKˆ‘ÌÌ—ÕRS•ˆÙÜNˆZ[Ìžˆ‹[Nˆ‹Ú[™ˆHŸKˆ‘ÐLÌ—ÕRS•ˆÙÜNˆZ[Ìž‹[NˆÚ[™ˆHŸKˆŽÔÒS•ˆÙÜNˆœÚ[ˆ‹[Nˆ‹Ú[™ˆšHŸKˆ‘ÎÔÒS•ˆÙÜNˆœÚ[ˆ‹[Nˆ‹Ú[™ˆšHŸKˆ‘ÐNÔÒS•ˆÙÜNˆœÚ[‹[NˆÚ[™ˆšHŸKˆŒM—ÔÒS•ˆÙÜNˆœÚ[Mžˆ‹[Nˆ‹Ú[™ˆšHŸKˆ‘ÌM—ÔÒS•ˆÙÜNˆœÚ[Mžˆ‹[Nˆ‹Ú[™ˆšHŸKˆ‘ÐLM—ÔÒS•ˆÙÜNˆœÚ[Mž‹[NˆÚ[™ˆšHŸKˆŒÌ—ÔÒS•ˆÙÜNˆœÚ[Ìˆ‹[NˆKÚ[™ˆšHŸKˆ‘ÌÌ—ÔÒS•ˆÙÜNˆœÚ[Ìžˆ‹[Nˆ‹Ú[™ˆšHŸKˆ‘ÐLÌ—ÔÒS•ˆÙÜNˆœÚ[Ìž‹[NˆÚ[™ˆšHŸBˆNÂ‚ˆÛÛœÝÙÜÛØØ[\ˆH
+Ú[™
+HOˆ
+Ú[™OOHHˆÈLÌˆˆˆÚ[™OOHšHˆÈšLÌˆˆˆ™ŒÌˆŠNÂˆÛÛœÝÙÜÛ™XÕ\HH
+›]
+HOˆÂˆÛÛœÝ[™›ÈH‘T•VÑÔWÑ“Ô“PUÖÙ›]NÂˆYˆ
+Z[™›ÊH™]\›ˆ[ÂˆYˆ
+[™›Ë™[HOOHJH™]\›ˆÙÜÛØØ[\Š[™›ËšÚ[™
+NÂˆ™]\›ˆ™XÉÚ[™›Ë™[_O	ÝÙÜÛØØ[\Š[™›ËšÚ[™
+_O˜ÂˆNÂ‚ˆÛÛœÝÔÓÑÖHHÂˆ’PS‘ÓTÎˆšX[™ÛK[\Ý‹ˆUPQÎˆšX[™ÛK[\Ý‹ˆ’PS‘ÓWÑSŽˆšX[™ÛK[\Ý‹ˆ’PS‘ÓWÔÕ’TˆšX[™ÛK\Ýš\‹ˆS‘TÎˆ›[™K[\Ý‹ˆP•Q×ÓS‘TÎˆ›[™K[\Ý‹ˆP•Q×ÓS‘WÔÕ’Tˆ›[™K\Ýš\‹ˆÒS•ÎˆœÚ[[\Ý‚ˆNÂ‚ˆÛÛœÝ“S‘ÑPÕÔˆHÂˆ‘T“Îˆž™\›È‹ˆÓ‘Nˆ›Û™H‹ˆÔ×ÐÓÓÔŽˆœÜ˜È‹ˆÓ‘WÓRS•T×ÔÔ×ÐÓÓÔŽˆ›Û™K[Z[\Ë\Ü˜È‹ˆÕÐÓÓÔŽˆ™Ý‹ˆÓ‘WÓRS•T×ÑÕÐÓÓÔŽˆ›Û™K[Z[\ËYÝ‹ˆÔ×ÐSNˆœÜ˜ËX[H‹ˆÓ‘WÓRS•T×ÔÔ×ÐSNˆ›Û™K[Z[\Ë\Ü˜ËX[H‹ˆÕÐSNˆ™ÝX[H‹ˆÓ‘WÓRS•T×ÑÕÐSNˆ›Û™K[Z[\ËYÝX[H‹ˆÓÓ”ÕS•ÐÓÓÔŽˆ˜ÛÛœÝ[‹ˆÓ‘WÓRS•T×ÐÓÓ”ÕS•ÐÓÓÔŽˆ›Û™K[Z[\ËXÛÛœÝ[‹ˆÓÓ”ÕS•ÐSNˆ˜ÛÛœÝ[X[H‹ˆÓ‘WÓRS•T×ÐÓÓ”ÕS•ÐSNˆ›Û™K[Z[\ËXÛÛœÝ[X[H‹ˆÔ×ÐSWÔÐUTUNˆœÜ˜ËX[K\Ø]\˜]Y‚ˆNÂ‚ˆÛÛœÝ“S‘ÓÔHÂˆQˆ˜Y‹ˆÕP•PÕˆœÝX˜XÝ‹ˆ‘U‘T”ÑWÔÕP•PÕˆœ™]™\œÙK\ÝX˜XÝ‹ˆRSŽˆ›Z[ˆ‹ˆPVˆ›X^‚ˆNÂ‚ˆÛÛœÝÙ›Ü˜ÙQ\[Ø^\ÈH
+\[ÙˆØØ][ÛˆOOH[™Yš[™YŠBˆ	‰ˆ™]ÈT“ÙX\˜Ú\˜[\ÊØØ][Û‹œÙX\˜Ú
+K™Ù]
+›XÝÙX—ÙXYÈŠHOOH™\[Ø^\ÈŽÂ‚ˆÛÛœÝÓÓTT‘WÓÔHÂˆSÐVT×ÔTÔÎˆ˜[Ø^\È‹ˆTÔ×ÕSŽˆ›\ÜÈ‹ˆTÔ×ÕS—ÓÔ—ÑTUPSˆ›\ÜËY\]X[‹ˆTUPSˆ™\]X[‹ˆ“ÕÑTUPSˆ››ÝY\]X[‹ˆÔ‘PUT—ÕS—ÓÔ—ÑTUPSˆ™Ü™X]\‹Y\]X[‹ˆÔ‘PUT—ÕSŽˆ™Ü™X]\ˆ‹ˆ‘U‘T—ÔTÔÎˆ›™]™\ˆ‚ˆNÂ‚ˆÛÛœÝÚY\‘˜[Z[HH
+Y
+HOˆÂˆÛÛœÝZ[HYœ™\XÙJ×›Z[™XÜ˜Y‹ËˆŠKœ™\XÙJ×˜ÛÜ™WËËˆŠNÂˆ™]\›ˆZ[ÂˆNÂ‚ˆËÈ]šX]H\ØYÙH\ˆ˜[Z[NˆÚXÚ™\^[[Y[˜[Y\ÈHÚY\ˆ™XYË‚ˆÛÛœÝZ[œÈH
+˜[Z[KÜXËÜ›Ý\ËÜ›Ý\™[X\
+HOˆÂˆÛÛœÝ›Ü›X]HÜXË™\^›Ü›X]ÖÌNÂˆYˆ
+Y›Ü›X]
+H™]\›ˆ[ÂˆËÈÚ\™YÚ]Z[\[[™HÛÈHÑÔÓØØ][ÛœÈ[™HÔBˆËÈÚY\“ØØ][ÛœÈ[™H\
+Ü]‘ÐŠˆ[[Y[ÈÛÛœÝ[YHÛÈØØ][ÛœÊK‚ˆÛÛœÝ›^[Ý]HÛÛ\[U™\^^[Ý]
+›Ü›X]
+NÂˆÛÛœÝžS˜[YHH›^[Ý]˜žS˜[YNÂˆÛÛœÝ[œ]Y[X™\œÈH›^[Ý]š[œ]Y[X™\œÎÂ‚ˆÛÛœÝÙ]H
+˜[YKÝÚ^ž›JHOˆÂˆÛÛœÝ]ˆHžS˜[YK™Ù]
+˜[YJNÂˆYˆ
+X]ŠH›ÝÈ™]È\œ›ÜŠÚY\ˆ	Ù˜[Z[_H™YYÈZ\ÜÚ[™È]šX]H	Û˜[Y_X
+NÂˆËÈHÜ]ËXÛÛ\Û™[[[Y[\È™XY\È™XÌˆ
+ÈØØ[\ŽÈ™XZ[H™XÌË‚ˆÛÛœÝ˜\ÙHH]‹œÜ]ÂˆÈ™XÌÏ	Ø]‹œØØ[\ŸOŠ[œ]‰Ø]‹šS˜[Y_K[œ]‰Ø]‹›Ó˜[Y_JXˆˆ[œ]‰Ø]‹›˜[Y_XÂˆYˆ
+\ÝÚ^ž›JH™]\›ˆ˜\ÙNÂˆYˆ
+X]‹œÜ]È	‰ˆ]‹™[HOOHJH™]\›ˆ˜\ÙNÂˆ™]\›ˆ	Ø˜\Ù_K‰ÜÝÚ^ž›_XÂˆNÂ‚ˆÛÛœÝ[šY›Ü›SØÈH™]ÈX\
+
+NÂˆÜ›Ý\Ë™›Ü‘XXÚ
+
+ËÚJHOˆË[šY›Ü›\Ë™›Ü‘XXÚ
+
+KZJHOˆÂˆYˆ
+][šY›Ü›SØËš\ÊK›˜[YJJH[šY›Ü›SØËœÙ]
+K›˜[YKÈÎˆÜ›Ý\™[X\ÙÚWK›™ËŽˆÜ›Ý\™[X\ÙÚWK˜˜\ÙUH
+ÈZHJNÂˆJJNÂˆËÈHÜ›Ý\Ðš[™[™È
+™[X\Y
+H]™HÛˆH[Ù[K\ØÛÜHXÛ\˜][Ûˆ[‚ˆËÈ[šY›Ü›QXÛÈH›ÙH\Ý™Y™\™[˜Ù\È]˜\šXX›HžH˜[YK‚ˆÛÛœÝ[šY›Ü›HH
+˜[YKY[X™\ŠHOˆ	ÜØ[š]^™S˜[YJ˜[YJ_K‰ÛY[X™\ŸXÂˆÛÛœÝ\Õ[šY›Ü›HH
+˜[YJHOˆ[šY›Ü›SØËš\Ê˜[YJNÂ‚ˆËÈÚ›ÛYIÜÈ[™Z™XÝÈHXYÛÛ˜[\Ü]X]ŒÌŠKŒ
+XÛÛœÝXÝÜ‹ˆËÈÛÈÜ[HY[]HÝ]
+Û›H\ÙYÚ[ˆH\[[™HXÚÜÈH›ØÚÊK‚ˆÛÛœÝQS•UMH›X]ŒÌŠKŒŒŒŒŒKŒŒŒŒŒKŒŒŒŒŒKŒ
+HŽÂˆÛÛœÝ]ˆH\Õ[šY›Ü›J‘[˜[ZXÕ˜[œÙ›Ü›\ÈŠHÈ[šY›Ü›J‘[˜[ZXÕ˜[œÙ›Ü›\È‹“[Ù[šY]ÓX]ŠHˆQS•UMÂˆÛÛœÝ›ÚˆH\Õ[šY›Ü›J”›Ú™XÝ[ÛˆŠHÈ[šY›Ü›J”›Ú™XÝ[Ûˆ‹”›Ú“X]ŠHˆQS•UMÂ‚ˆ]˜\žZ[™ÜÈHˆŽÂˆ]›ÙHHˆŽÂˆËÈ˜[Z[Y\ÈÚÜÙHÛ\ÜÚ][Ûˆ\È›ÝÚ[\H›Úˆ
+ˆ]ˆ
+ˆÜÚ][ÛˆÙ]\Ë‚ˆ]ÜÚ][Û‘^ˆH[ÂˆËÈÛÛYHYXØ]Y]\È\ÜÙ[X›HÚY\œÈ™YY[ˆ^XÚ]Û\\ÜXÙBˆËÈÛÜœ™XÝ[Û‹ˆÈ›Ý\H\ÈÈ[Ù[™[™\š[™Îˆ][H™\XÙ\È[™ˆËÈZ\ˆ\‹\ÛÝØÚ\ÜÛÜœÈ\™H[™XYH^™\ÜÙY[ˆHØ[YHÜ[YˆËÈ\™Ù]ÛÛÜ™[˜]\ÈY\ˆH›Ú™XÝ[Ûˆ˜[œÙ›Ü›K‚ˆ]›\Û\HH˜[ÙNÂˆËÈ^˜HÛÜ›\ÜXÙH˜[œÛ][Ûˆ›ÛY[ÈÛÜ›ÜÈ
+\œ˜Z[‰ÜÈÚ[šÈÙ™œÙ]
+K‚ˆ]\œ˜Z[“Ù™œÙ]^ˆHˆŽÂˆÝÚ]Ú
+˜[Z[JHÂˆØ\ÙHœÜÚ][Û—ØÛÛÜˆŽ‚ˆØ\ÙH^Ø˜XÚÙÜ›Ý[™Ž‚ˆØ\ÙH™ÝZHŽ‚ˆ˜\žZ[™ÜÈHˆØØ][ÛŠ
+H™\^ÛÛÜŽˆ™XÍŒÌ‹ˆŽÂˆ›ÙHHÝ]]™\^ÛÛÜˆH	ÙÙ]
+ÛÛÜˆŠ_NØÂˆœ™XZÎÂˆØ\ÙHœÜÚ][Û—Ý^Ž‚ˆ˜\žZ[™ÜÈHˆØØ][ÛŠ
+H^ÛÛÜ™ˆ™XÌŒÌ‹ˆŽÂˆ›ÙHHÝ]]^ÛÛÜ™H	ÙÙ]
+•UŒ‹žHŠ_NØÂˆœ™XZÎÂˆØ\ÙHœÜÚ][Û—Ý^ØÛÛÜˆŽ‚ˆ˜\žZ[™ÜÈHˆØØ][ÛŠ
+H^ÛÛÜ™ˆ™XÌŒÌ‹ˆØØ][ÛŠJH™\^ÛÛÜŽˆ™XÍŒÌ‹ˆŽÂˆ›ÙHHÝ]]^ÛÛÜ™H	ÙÙ]
+•UŒ‹žHŠ_N×ˆÝ]]™\^ÛÛÜˆH	ÙÙ]
+ÛÛÜˆŠ_NØÂˆœ™XZÎÂˆØ\ÙH^ŽˆÂˆ˜\žZ[™ÜÈHˆØØ][ÛŠ
+H™\^ÛÛÜŽˆ™XÍŒÌ‹ˆØØ][ÛŠJH^ÛÛÜ™ˆ™XÌŒÌ‹ˆŽÂˆ›ÙHHÝ]]™\^ÛÛÜˆH	ÙÙ]
+ÛÛÜˆŠ_N×ˆÝ]]^ÛÛÜ™H	ÙÙ]
+•UŒ‹žHŠ_NØÂˆœ™XZÎÂˆBˆØ\ÙH\œ˜Z[ˆŽˆÂˆËÈÚY\œËØÛÜ™KÝ\œ˜Z[‹œÚ‚ˆËÈÜÈHÜÚ][Ûˆ
+È
+Ú[šÔÜÚ][ÛˆHØ[Y\˜P›ØÚÔÜÊH
+ÈØ[Y\˜SÙ™œÙ]ˆËÈÛÔÜÚ][ÛˆH›Ú“X]
+ˆ[Ù[šY]ÓX]
+ˆ™XÍ
+ÜËJBˆËÈHÚ[šÈ˜[œÛ][Ûˆ\ÈÚ]HÙ[™\šXÈ˜[˜XÚÈ›ÜYˆYÚ[™ÂˆËÈ\ÈY™\œ™YÈHœ˜YÛY[ÝYÙNˆH™\^ÚY\ˆÛÝ[Ý\Ú\ÙBˆËÈ™YYØ[\\Œˆ›Ý[™Ú]‘T•Vš\ÚXš[]KÚXÚ\ÈÜ	ÜÈš[™ˆËÈÜ›Ý\^[Ý]ÈÈ›ÝÜ˜[‚ˆÛÛœÝÜÈH\Õ[šY›Ü›JÚ[šÔÙXÝ[ÛˆŠHÈÚ[šÔÙXÝ[Ûˆˆˆ[ÂˆÛÛœÝÛH\Õ[šY›Ü›J‘ÛØ˜[ÈŠHÈ‘ÛØ˜[Èˆˆ[ÂˆÛÛœÝ]•\œ˜Z[ˆHÜÈÈ	ØÜßK“[Ù[šY]ÓX]ˆQS•UMÂˆÛÛœÝÙ™œÙ]H
+ÜÈ	‰ˆÛ
+BˆÈ™XÌÏŒÌŠ	ØÜßKÚ[šÔÜÚ][ÛˆH™XÌÏLÌŠ	ÙÛKØ[Y\˜P›ØÚÔÜÖˆ
+È	ÙÛKØ[Y\˜P›ØÚÔÜÖK	ÙÛKØ[Y\˜P›ØÚÔÜÖŠJHˆ
+È
+È™XÌÏŒÌŠ	ÙÛKØ[Y\˜SÙ™œÙ]	ÙÛKØ[Y\˜SÙ™œÙ]K	ÙÛKØ[Y\˜SÙ™œÙ]ŠXˆˆ™XÌÏŒÌŠŒ
+HŽÂˆ˜\žZ[™ÜÈHˆØØ][ÛŠ
+H^ÛÛÜ™ˆ™XÌŒÌ‹ˆ‚ˆ
+ÈˆØØ][ÛŠJH™\^ÛÛÜŽˆ™XÍŒÌ‹ˆ‚ˆ
+ÈˆØØ][ÛŠŠHYÚÛÛÜ™ˆ™XÌŒÌ‹ˆ‚ˆ
+ÈˆØØ][ÛŠÊHÜ\šXØ[™\^\Ý[˜ÙNˆŒÌ‹ˆ‚ˆ
+ÈˆØØ][ÛŠ
+HÞ[[™šXØ[™\^\Ý[˜ÙNˆŒÌ‹ˆŽÂˆ\œ˜Z[“Ù™œÙ]^ˆH
+È	ÛÙ™œÙ]XÂˆÜÚ][Û‘^ˆH	Ü›ÚŸH
+ˆ	Û]•\œ˜Z[ŸH
+ˆ™XÍŒÌŠÛÜ›ÜËKŒ
+XÂˆ›ÙHHÝ]]^ÛÛÜ™H	ÙÙ]
+•UŒ‹žHŠ_NÂˆÝ]]™\^ÛÛÜˆH	ÙÙ]
+ÛÛÜˆŠ_NÂˆÝ]]›YÚÛÛÜ™HÛ[\
+ˆ™XÌŒÌŠ	ÙÙ]
+•UŒˆ‹žHŠ_JHÈM‹Œ
+È™XÌŒÌŠŒÌLJKˆ™XÌŒÌŠŒÌLJK™XÌŒÌŠŽMŽÍJJNÂˆÝ]]œÜ\šXØ[™\^\Ý[˜ÙHH[™Ý
+ÛÜ›ÜÊNÂˆÝ]]˜Þ[[™šXØ[™\^\Ý[˜ÙHHX^
+[™Ý
+ÛÜ›ÜËžŠKXœÊÛÜ›ÜËžJJNØÂˆœ™XZÎÂˆBˆØ\ÙH˜›ØÚÈŽ‚ˆØ\ÙHœ\XÛHŽ‚ˆØ\ÙHš][HŽ‚ˆØ\ÙH™[]HŽˆÂˆËÈ\™XÝ˜[œÛ][ÛœÈÙˆÛÜ™KÞØ›ØÚË\XÛK][K[]_KœÚˆÙY\ˆËÈ^\™HØ[\[™È[ˆHœ˜YÛY[ÝYÙH™XØ]\ÙHÙX‘ÔHš[™YÜ›Ý\ˆËÈ^[Ý]È^ÜÙH[Ú˜[™ÉÜÈØ[\\œÈ\™NÈØ\œžZ[™ÈH[YÙ\ˆ^\™BˆËÈÛÛÜ™[˜]\È\È˜\žZ[™ÜÈ\È\]Z]˜[[[™]›ÚYÈÚY[š[™È]™\žBˆËÈØ[\\ˆš[™[™ÈÈ‘T•Vš\ÚXš[]K‚ˆÛÛœÝ\Ð›ØÚÈH˜[Z[HOOH˜›ØÚÈŽÂˆÛÛœÝ\ÓÝ™\›^HH
+˜[Z[HOOHš][Hˆ˜[Z[HOOH™[]HŠH	‰ˆžS˜[YKš\Ê•UŒHŠNÂˆËÈ[]KœÚ\È™YHYÚ[™Èœ˜[˜Ú\ÈHÜ™]š[Ý\ÛHÚÚ\YˆËÈ›Üˆ[]Y\È
+Û›H][\ÈÙ\™HÚYY
+KX]š[™È[ØœÈ[šY›Ü›[BˆËÈ[œšYÚYØZ[œÝSË\ÚYY\œ˜Z[Ž‚ˆËÈHT—ÑPÑWÓQÒS‘Îˆœ›ÛØ˜XÚÈÛÛÜœÈœ›ÛHH›Ü›X[XÚÙYžBˆËÈÛÑœ›Û˜XÚ[™È[ˆHœ˜YÛY[ÝYÙH
+[˜Ý[Y˜[œÛXÙ[ÚÚ[œÊNÂˆËÈH“×ÐÐT‘SSÓQÒS‘ÎˆZ[ˆÛÛÜˆ
+œ™Y^™HÚ[™
+NÂˆËÈHY˜][ˆZ[™XÜ˜YÛZ^ÛYÚ\ˆ™\^ˆ][\È[Ø^\ÈZ^ÛYÚ‚ˆÛÛœÝœÑYš[™\ÈH™]ÈÙ]
+
+NÂˆ›Üˆ
+ÛÛœÝ˜]ÈÙˆÜXË™Yš[™\È×JHÂˆÛÛœÝÈHÝš[™Ê˜]ÊNÂˆÛÛœÝ\HHËš[™^ÙŠHŠNÂˆœÑYš[™\Ë˜Y
+\HÈÈˆËœÛXÙJ\JJNÂˆBˆÛÛœÝYÚ[™Ò[œ]H\Õ[šY›Ü›J“YÚ[™ÈŠH	‰ˆžS˜[YKš\Ê“›Ü›X[ŠNÂˆÛÛœÝ\‘˜XÙSYÚ[™ÈH˜[Z[HOOH™[]H‚ˆ	‰ˆœÑYš[™\Ëš\Ê”T—ÑPÑWÓQÒS‘ÈŠH	‰ˆYÚ[™Ò[œ]ÂˆÛÛœÝØ\™[˜[YÚ[™ÈH
+˜[Z[HOOHš][Hˆ	‰ˆYÚ[™Ò[œ]
+Bˆ
+˜[Z[HOOH™[]Hˆ	‰ˆYÚ[™Ò[œ]ˆ	‰ˆ]œÑYš[™\Ëš\Ê”T—ÑPÑWÓQÒS‘ÈŠBˆ	‰ˆ]œÑYš[™\Ëš\Ê““×ÐÐT‘SSÓQÒS‘ÈŠJNÂˆÛÛœÝ\ÈHÂˆˆØØ][ÛŠ
+H^ÛÛÜ™ˆ™XÌŒÌ‹ˆ‹ˆˆØØ][ÛŠJH™\^ÛÛÜŽˆ™XÍŒÌ‹ˆ‹ˆˆØØ][ÛŠŠHYÚÛÛÜ™ˆ™XÌŒÌ‹ˆ‹ˆˆØØ][ÛŠÊHÜ\šXØ[™\^\Ý[˜ÙNˆŒÌ‹ˆ‹ˆˆØØ][ÛŠ
+HÞ[[™šXØ[™\^\Ý[˜ÙNˆŒÌ‹ˆ‚ˆNÂˆYˆ
+\‘˜XÙSYÚ[™ÊHÂˆ\Ëœ\Ú
+ˆØØ][ÛŠJH™\^ÛÛÜ˜XÚÎˆ™XÍŒÌ‹ˆŠNÂˆBˆYˆ
+\ÓÝ™\›^JHÂˆ\Ëœ\Ú
+ØØ][ÛŠ	Ü\‘˜XÙSYÚ[™ÈÈˆˆ_JHÝ™\›^PÛÛÜ™ˆ™XÌŒÌ‹˜
+NÂˆBˆ˜\žZ[™ÜÈH\Ëš›Ú[ŠˆŠNÂˆYˆ
+\Ð›ØÚÈ	‰ˆ\Õ[šY›Ü›J‘[˜[ZXÕ˜[œÙ›Ü›\ÈŠJHÂˆ\œ˜Z[“Ù™œÙ]^ˆH
+È	Ý[šY›Ü›J‘[˜[ZXÕ˜[œÙ›Ü›\È‹“[Ù[Ù™œÙ]Š_XÂˆBˆÛÛœÝYXÙ\ÈHÂˆÝ]]^ÛÛÜ™H	ÙÙ]
+•UŒ‹žHŠ_NØˆNÂˆYˆ
+\‘˜XÙSYÚ[™ÊHÂˆYXÙ\Ëœ\Ú
+]›Ü›X[H›Ü›X[^™J	ÙÙ]
+“›Ü›X[‹ž^ˆŠ_JNÂˆ]YÚHÝ
+ˆ™XÌÏŒÌŠYÚ[™Ë“YÚYÚ[™Ë“YÚKYÚ[™Ë“YÚŠK›Ü›X[
+NÂˆ]YÚHHÝ
+ˆ™XÌÏŒÌŠYÚ[™Ë“YÚVYÚ[™Ë“YÚVKYÚ[™Ë“YÚVŠK›Ü›X[
+NÂˆ]˜]Õ™\^ÛÛÜˆH	ÙÙ]
+ÛÛÜˆŠ_NÂˆ]œ›ÛXØÝ[HHZ[ŠKŒ
+X^
+YÚŒ
+H
+ÈX^
+YÚKŒ
+JH
+ˆˆ
+È
+NÂˆ]˜XÚÐXØÝ[HHZ[ŠKŒ
+X^
+[YÚŒ
+H
+ÈX^
+[YÚKŒ
+JH
+ˆˆ
+È
+NÂˆÝ]]™\^ÛÛÜˆH™XÍŒÌŠ˜]Õ™\^ÛÛÜ‹œ™Øˆ
+ˆœ›ÛXØÝ[K˜]Õ™\^ÛÛÜ‹˜JNÂˆÝ]]™\^ÛÛÜ˜XÚÈH™XÍŒÌŠ˜]Õ™\^ÛÛÜ‹œ™Øˆ
+ˆ˜XÚÐXØÝ[K˜]Õ™\^ÛÛÜ‹˜JNØ
+NÂˆH[ÙHYˆ
+Ø\™[˜[YÚ[™ÊHÂˆYXÙ\Ëœ\Ú
+]›Ü›X[H›Ü›X[^™J	ÙÙ]
+“›Ü›X[‹ž^ˆŠ_JNÂˆ]YÚHX^
+Ý
+ˆ™XÌÏŒÌŠYÚ[™Ë“YÚYÚ[™Ë“YÚKYÚ[™Ë“YÚŠK›Ü›X[
+KŒ
+NÂˆ]YÚHHX^
+Ý
+ˆ™XÌÏŒÌŠYÚ[™Ë“YÚVYÚ[™Ë“YÚVKYÚ[™Ë“YÚVŠK›Ü›X[
+KŒ
+NÂˆ]YÚXØÝ[HHZ[ŠKŒ
+YÚ
+ÈYÚJH
+ˆˆ
+È
+NÂˆ]˜]Õ™\^ÛÛÜˆH	ÙÙ]
+ÛÛÜˆŠ_NÂˆÝ]]™\^ÛÛÜˆH™XÍŒÌŠ˜]Õ™\^ÛÛÜ‹œ™Øˆ
+ˆYÚXØÝ[K˜]Õ™\^ÛÛÜ‹˜JNØ
+NÂˆH[ÙHÂˆYXÙ\Ëœ\Ú
+Ý]]™\^ÛÛÜˆH	ÙÙ]
+ÛÛÜˆŠ_NØ
+NÂˆBˆYXÙ\Ëœ\Ú
+ˆžS˜[YKš\Ê•UŒˆŠBˆÈÝ]]›YÚÛÛÜ™HÛ[\
+ˆ™XÌŒÌŠ	ÙÙ]
+•UŒˆ‹žHŠ_JHÈM‹Œ
+È™XÌŒÌŠŒÌLJKˆ™XÌŒÌŠŒÌLJK™XÌŒÌŠŽMŽÍJJNØˆˆˆÝ]]›YÚÛÛÜ™H™XÌŒÌŠJNÈ‹ˆˆÝ]]œÜ\šXØ[™\^\Ý[˜ÙHH[™Ý
+ÛÜ›ÜÊNÈ‹ˆˆÝ]]˜Þ[[™šXØ[™\^\Ý[˜ÙHHX^
+[™Ý
+ÛÜ›ÜËžŠKXœÊÛÜ›ÜËžJJNÈ‚ˆ
+NÂˆYˆ
+\ÓÝ™\›^JHÂˆYXÙ\Ëœ\Ú
+Ý]]›Ý™\›^PÛÛÜ™H™XÌŒÌŠ	ÙÙ]
+•UŒH‹žHŠ_JNØ
+NÂˆBˆ›ÙHHYXÙ\Ëš›Ú[Š—ˆŠNÂˆœ™XZÎÂˆBˆØ\ÙHœ[›Ü˜[XHŽ‚ˆ˜\žZ[™ÜÈHˆØØ][ÛŠ
+H^ÛÛÜ™ˆ™XÌÏŒÌ‹ˆŽÂˆ›ÙHHÝ]]^ÛÛÜ™H	ÙÙ]
+”ÜÚ][Ûˆ‹ž^ˆŠ_NØÂˆœ™XZÎÂˆØ\ÙHœÜÚ][ÛˆŽ‚ˆØ\ÙHœÚÞHŽ‚ˆØ\ÙHœÝ\œÈŽ‚ˆ˜\žZ[™ÜÈHˆØØ][ÛŠ
+HÜ\šXØ[™\^\Ý[˜ÙNˆŒÌ‹ˆØØ][ÛŠJHÞ[[™šXØ[™\^\Ý[˜ÙNˆŒÌ‹ˆŽÂˆ›ÙHH][Ù[ÜÈH	ÙÙ]
+”ÜÚ][Ûˆ‹ž^ˆŠ_NÂˆÝ]]œÜ\šXØ[™\^\Ý[˜ÙHH[™Ý
+[Ù[ÜÊNÂˆÝ]]˜Þ[[™šXØ[™\^\Ý[˜ÙHHX^
+[™Ý
+[Ù[ÜËžŠKXœÊ[Ù[ÜËžJJNØÂˆœ™XZÎÂˆY˜][ˆÂˆËÈÙ[™\šXÈ˜[˜XÚÈÛÈ]™\žH™YÚ\Ý\™Y\[[™HÛÛ\[\Îˆ[Ú˜[™ÉÜÂˆËÈÝ\\™XÛÛ\[HØ]H™\]Z\™\ÈS\[[™\ÈÈØYÚ[HBˆËÈ]HØÜ™Y[ˆÛ›H˜]ÜÈH[™[Ùˆ˜[Z[Y\Ëˆ[]šX]\È\™BˆËÈXÛ\™Y
+H™\^^[Ý]]\ÝX]ÚHY™™\ŠKÜÚ][Ûˆ\ÂˆËÈ˜[œÙ›Ü›YY›Ü›X[K[™UŒÐÛÛÜˆ\ÜÈ›ÝYÚÚ[ˆ™\Ù[‚ˆÛÛœÝ\ÈH×NÂˆÛÛœÝYXÙ\ÈH×NÂˆYˆ
+žS˜[YKš\Ê•UŒŠJHÂˆ\Ëœ\Ú
+ˆØØ][ÛŠ
+H^ÛÛÜ™ˆ™XÌŒÌ‹ˆŠNÂˆYXÙ\Ëœ\Ú
+Ý]]^ÛÛÜ™H	ÙÙ]
+•UŒ‹žHŠ_NØ
+NÂˆBˆYˆ
+žS˜[YKš\ÊÛÛÜˆŠJHÂˆ\Ëœ\Ú
+ØØ][ÛŠ	Ü\Ë›[™ÝJH™\^ÛÛÜŽˆ™XÍŒÌ‹˜
+NÂˆYXÙ\Ëœ\Ú
+Ý]]™\^ÛÛÜˆH	ÙÙ]
+ÛÛÜˆŠ_NØ
+NÂˆBˆ˜\žZ[™ÜÈH\Ëš›Ú[ŠˆŠNÂˆ›ÙHHYXÙ\Ëš›Ú[Š—ˆŠNÂˆœ™XZÎÂˆBˆB‚ˆ™]\›ˆÝXÝœÒ[œ]Â‰Ú[œ]Y[X™\œßBŸNÂ‚œÝXÝœÓÝ]]ÂˆZ[[ŠÜÚ][ÛŠHÜÚ][ÛŽˆ™XÍŒÌ‹‰Ý˜\žZ[™Üß_NÂ‚™\^™›ˆœ×ÛXZ[Š[œ]ˆœÒ[œ]
+HOˆœÓÝ]]Âˆ˜\ˆÝ]]ˆœÓÝ]]Âˆ]ÛÜ›ÜÈH	ÙÙ]
+”ÜÚ][Ûˆ‹ž^ˆŠ_IÝ\œ˜Z[“Ù™œÙ]^ŸNÂˆÝ]]œÜÚ][ÛˆH	ÜÜÚ][Û‘^ˆ	Ü›ÚŸH
+ˆ	Û]ŸH
+ˆ™XÍŒÌŠÛÜ›ÜËKŒ
+XNÂ‰Ù›\Û\HÈˆÝ]]œÜÚ][Û‹žHH[Ý]]œÜÚ][Û‹žNÈˆˆˆŸB‰Ø›Ù_Bˆ™]\›ˆÝ]]ÂŸXÂˆNÂ‚ˆÛÛœÝZ[œÈH
+˜[Z[KÜXËÜ›Ý\ËÜ›Ý\™[X\Ø[\\“X\
+HOˆÂˆËÈÚY\‘Yš[™\ÈØ\œšY\È›Ý›YÜÈ
+’T×ÑÕRHŠH[™˜[Y\ÂˆËÈ
+SWÐÕUÕULŒHŠKˆ™X][™ÈHÙ\šX[^™YÝš[™ÜÈ\ÈHÙ]XYBˆËÈ]™\žH˜[YKX™X\š[™ÈYš[™HÛÚÈXœÙ[[ÜÝš\ÚX›H\›š[™È˜[œÜ\™[ˆËÈ›ÛXYÙH^[È[ÈÜ\]YH›XÚÈ^[Ë‚ˆÛÛœÝYš[™\ÈH™]ÈX\
+
+NÂˆ›Üˆ
+ÛÛœÝ˜]ÈÙˆÜXË™Yš[™\È×JHÂˆÛÛœÝÜ]HÝš[™Ê˜]ÊKš[™^ÙŠHŠNÂˆYˆ
+Ü]
+HÂˆYš[™\ËœÙ]
+Ýš[™Ê˜]ÊKYJNÂˆH[ÙHÂˆYš[™\ËœÙ]
+Ýš[™Ê˜]ÊKœÛXÙJÜ]
+KÝš[™Ê˜]ÊKœÛXÙJÜ]
+ÈJJNÂˆBˆBˆÛÛœÝ\ÑYš[™HH
+˜[YJHOˆYš[™\Ëš\Ê˜[YJNÂˆÛÛœÝ[Y\šXÑYš[™HH
+˜[YK˜[˜XÚÊHOˆÂˆYˆ
+YYš[™\Ëš\Ê˜[YJJH™]\›ˆ[ÂˆÛÛœÝ\œÙYH[X™\‹œ\œÙQ›Ø]
+Yš[™\Ë™Ù]
+˜[YJJNÂˆ™]\›ˆ[X™\‹š\Ñš[š]J\œÙY
+HÈ\œÙYˆ˜[˜XÚÎÂˆNÂˆÛÛœÝ\Õ[šY›Ü›HH
+˜[YJHOˆÜ›Ý\ËœÛÛYJ
+ÊHOˆË[šY›Ü›\ËœÛÛYJ
+JHOˆK›˜[YHOOH˜[YJJNÂˆÛÛœÝ\ÔØ[\\ˆH
+˜[YJHOˆÜ›Ý\ËœÛÛYJ
+ÊHOˆËœØ[\\œËš[˜ÛY\Ê˜[YJJNÂˆÛÛœÝÛÛÜ“[ÙH\Õ[šY›Ü›J‘[˜[ZXÕ˜[œÙ›Ü›\ÈŠHÈ‘[˜[ZXÕ˜[œÙ›Ü›\ËÛÛÜ“[Ù[]Üˆˆˆ™XÍŒÌŠKŒ
+HŽÂ‚ˆËÈØ[\\‹Ý^\™HÜ›Ý\Ðš[™[™ÈÛÛYHœ›ÛHHY\™ÙY™[X\ÛÈ^HX]ÚˆËÈH\[[™H^[Ý]Y\ˆÜ›Ý\›Û[™Ë‚ˆÛÛœÝØ[\\‘XÛH
+˜[YKÝX™JHOˆÂˆÛÛœÝØÈHØ[\\“X\™Ù]
+˜[YJNÂˆ™]\›ˆÜ›Ý\
+	ÛØË™ßJHš[™[™Ê	ÛØË˜ŸJH˜\ˆ	ÜØ[š]^™S˜[YJ˜[YJ_WÜÎˆØ[\\ŽÂÜ›Ý\
+	ÛØË™ßJHš[™[™Ê	ÛØË˜ˆ
+È_JH˜\ˆ	ÜØ[š]^™S˜[YJ˜[YJ_Nˆ	ØÝX™HÈ^\™WØÝX™Hˆˆ^\™WÌ™ŸOŒÌŽØÂˆNÂ‚ˆ]Ø[\\œÈHˆŽÂˆ›Üˆ
+ÛÛœÝÈÙˆÜ›Ý\ÊHÂˆ›Üˆ
+ÛÛœÝÈÙˆËœØ[\\œÊHÂˆØ[\\œÈ
+ÏHØ[\\‘XÛ
+Ë˜[Z[HOOHœ[›Ü˜[XHŠH
+È—ˆŽÂˆBˆB‚ˆËÈ]\ÝØ]HÛˆHØ[YH[œ]ÈZ[œÈÚXÚÜÈ
+YÚ[™È[šY›Ü›H
+È›Ü›X[ˆËÈ]šX]JNˆH\‹Y˜XÙH”È^XÝ[™È™\^ÛÛÜ˜XÚÈÚ[HH”ÈY›ÝˆËÈ[Z]]˜Z[ÈÑÔÓ[\™˜XÙH˜[Y][Ûˆ]\[[™HÜ™X][Û‹ˆXÛ\™YˆËÈ™Y›Ü™HHÝÚ]Ú™XØ]\ÙHH[]HØ\ÙH™[ÝÈÙ[XÝÈ˜XÙHÛÛÜˆÛˆ]‚ˆÛÛœÝÝ\™˜XÙT\‘˜XÙHH˜[Z[HOOH™[]Hˆ	‰ˆ\ÑYš[™J”T—ÑPÑWÓQÒS‘ÈŠBˆ	‰ˆ\Õ[šY›Ü›J“YÚ[™ÈŠBˆ	‰ˆ
+ÜXË™\^›Ü›X]ÖÌOË™[[Y[È×JKœÛÛYJ
+JHOˆK›˜[YHOOH“›Ü›X[ŠNÂˆ]XZ[ˆH[Âˆ]Ù[™\šXÕ˜\žZ[™ÜÈH[ÂˆÝÚ]Ú
+˜[Z[JHÂˆØ\ÙHœÜÚ][Û—ØÛÛÜˆŽ‚ˆØ\ÙH™ÝZHŽ‚ˆXZ[ˆH˜\ˆÛÛÜˆH[œ]™\^ÛÛÜŽÂˆYˆ
+ÛÛÜ‹˜HOHŒ
+HÂˆ\ØØ\™ÂˆBˆ™]\›ˆÛÛÜˆ
+ˆ	ØÛÛÜ“[ÙNØÂˆœ™XZÎÂˆØ\ÙH\œ˜Z[ˆŽˆÂˆËÈÚY\œËØÛÜ™KÝ\œ˜Z[‹™œÚˆ[Ú˜[™È[X™\˜][HÙ\È›Ý\ÙHHZ[‚ˆËÈš[\™Y^\™TØ[\H\™Nˆ]È\š]˜]]™KX]Ø\™HØ[\S™X\™\ÝˆËÈÙY\È™X\˜žH›ØÚÈ^[ÈÜš\ÜÚ[HÝ[Ù[XÝ[™ÈZ\]™[È›Ü‚ˆËÈ\Ý[˜XÙ\ËˆHÙ[™\šXÈØ[\HØ\ÈHÛÝ\˜ÙHÙˆHX]žH›\‹‚ˆËÈÛÛÜˆH]\ÔØ[\H
+ˆ™\^ÛÛÜˆ
+ˆYÚX\ˆËÈÛÛÜˆHZ^
+›ÙÐÛÛÜˆ
+ˆ™XÍ
+KKKÛÛÜ‹˜JKÛÛÜ‹Ú[šÕš\ÚXš[]JBˆËÈ\ØØ\™Ú[ˆÛÛÜ‹˜HÝ]Ý][ˆ\H\Ý[˜ÙH›ÙË‚ˆÛÛœÝ]\ÈH\ÔØ[\\Š”Ø[\\ŒŠHÈØ[š]^™S˜[YJ”Ø[\\ŒŠHˆ[ÂˆÛÛœÝYÚH\ÔØ[\\Š”Ø[\\ŒˆŠHÈØ[š]^™S˜[YJ”Ø[\\ŒˆŠHˆ[ÂˆÛÛœÝÝ]Ý]H[Y\šXÑYš[™JSWÐÕUÕU‹ŒJNÂˆÛÛœÝš\ÈH\Õ[šY›Ü›JÚ[šÔÙXÝ[ÛˆŠHÈÚ[šÔÙXÝ[Û‹Ú[šÕš\ÚXš[]HˆˆŒKŒŽÂˆÛÛœÝ›ÙÐÛÛÜˆH\Õ[šY›Ü›J‘›ÙÈŠBˆÈ™XÍŒÌŠ›ÙË‘›ÙÐÛÛÜ”‹›ÙË‘›ÙÐÛÛÜ‘Ë›ÙË‘›ÙÐÛÛÜ‹›ÙË‘›ÙÐÛÛÜJH‚ˆˆ™XÍŒÌŠKŒ
+HŽÂˆÛÛœÝ[™\ÈH×NÂˆ[™\Ëœ\Ú
+]\ÂˆÈ˜\ˆÛÛÜˆHØ[\S™X\™\Ý
+ˆ	Ø]\ßK	Ø]\ßWÜË[œ]^ÛÛÜ™ˆ™XÌŒÌŠKŒ
+HÈX^
+™XÌŒÌŠÚ[šÔÙXÝ[Û‹•^\™TÚ^™JK™XÌŒÌŠKŒ
+JJH
+ˆ[œ]™\^ÛÛÜŽØˆˆˆ˜\ˆÛÛÜˆH[œ]™\^ÛÛÜŽÈŠNÂˆYˆ
+YÚ
+HÂˆ[™\Ëœ\Ú
+ÛÛÜˆHÛÛÜˆ
+ˆ^\™TØ[\J	ÛYÚK	ÛYÚWÜË[œ]›YÚÛÛÜ™
+NØ
+NÂˆBˆ[™\Ëœ\Ú
+]›ÙÐÛÛÜˆH	Ù›ÙÐÛÛÜŸNØ
+NÂˆ[™\Ëœ\Ú
+ÛÛÜˆHZ^
+›ÙÐÛÛÜˆ
+ˆ™XÍŒÌŠKŒKŒKŒÛÛÜ‹˜JKÛÛÜ‹	Ýš\ßJNØ
+NÂˆYˆ
+Ý]Ý]OOH[
+HÂˆ[™\Ëœ\Ú
+Yˆ
+ÛÛÜ‹˜H	ØÝ]Ý]Ñš^Y
+Š_JH×ˆ\ØØ\™×ˆX
+NÂˆBˆYˆ
+\Õ[šY›Ü›J‘›ÙÈŠJHÂˆ[™\Ëœ\Ú
+]›ÙÑ˜XÝÜˆHÛ[\
+ˆ
+[œ]œÜ\šXØ[™\^\Ý[˜ÙHH›ÙË‘›ÙÔ™[™\‘\Ý[˜ÙTÝ\
+BˆÈX^
+›ÙË‘›ÙÔ™[™\‘\Ý[˜ÙQ[™H›ÙË‘›ÙÔ™[™\‘\Ý[˜ÙTÝ\ŒJKˆŒKŒ
+NÂˆÛÛÜˆH™XÍŒÌŠZ^
+ÛÛÜ‹œ™Ø‹›ÙÐÛÛÜ‹œ™Ø‹›ÙÑ˜XÝÜˆ
+ˆ›ÙÐÛÛÜ‹˜JKÛÛÜ‹˜JNØ
+NÂˆBˆ[™\Ëœ\Ú
+ˆ™]\›ˆÛÛÜŽÈŠNÂˆXZ[ˆH[™\Ëš›Ú[Š—ˆŠNÂˆœ™XZÎÂˆBˆØ\ÙH˜›ØÚÈŽ‚ˆØ\ÙHœ\XÛHŽ‚ˆØ\ÙHš][HŽ‚ˆØ\ÙH™[]HŽˆÂˆÛÛœÝ]\ÈH\ÔØ[\\Š”Ø[\\ŒŠHÈØ[š]^™S˜[YJ”Ø[\\ŒŠHˆ[ÂˆÛÛœÝYÚH\ÔØ[\\Š”Ø[\\ŒˆŠHÈØ[š]^™S˜[YJ”Ø[\\ŒˆŠHˆ[ÂˆÛÛœÝÝ™\›^HH\ÔØ[\\Š”Ø[\\ŒHŠH	‰ˆ
+˜[Z[HOOHš][Hˆ˜[Z[HOOH™[]HŠBˆÈØ[š]^™S˜[YJ”Ø[\\ŒHŠHˆ[ÂˆÛÛœÝÝ]Ý]H˜[Z[HOOHœ\XÛH‚ˆÈŒBˆˆ[Y\šXÑYš[™JSWÐÕUÕU‹ŒJNÂˆÛÛœÝ›ÙÐÛÛÜˆH\Õ[šY›Ü›J‘›ÙÈŠBˆÈ™XÍŒÌŠ›ÙË‘›ÙÐÛÛÜ”‹›ÙË‘›ÙÐÛÛÜ‘Ë›ÙË‘›ÙÐÛÛÜ‹›ÙË‘›ÙÐÛÛÜJH‚ˆˆ™XÍŒÌŠKŒ
+HŽÂˆÛÛœÝ[™\ÈH×NÂˆ[™\Ëœ\Ú
+]\ÂˆÈ˜\ˆÛÛÜˆH^\™TØ[\J	Ø]\ßK	Ø]\ßWÜË[œ]^ÛÛÜ™
+NØˆˆˆ˜\ˆÛÛÜˆH™XÍŒÌŠKŒ
+NÈŠNÂˆYˆ
+Ý]Ý]OOH[
+HÂˆ[™\Ëœ\Ú
+Yˆ
+ÛÛÜ‹˜H	ØÝ]Ý]Ñš^Y
+
+_JH×ˆ\ØØ\™×ˆX
+NÂˆBˆ[™\Ëœ\Ú
+Ý\™˜XÙT\‘˜XÙBˆÈ]˜XÙU™\^ÛÛÜˆHÙ[XÝ
+[œ]™\^ÛÛÜ˜XÚË[œ]™\^ÛÛÜ‹[œ]™œ›Û˜XÚ[™ÊNÂˆÛÛÜˆHÛÛÜˆ
+ˆ˜XÙU™\^ÛÛÜˆ
+ˆ	ØÛÛÜ“[ÙNØˆˆÛÛÜˆHÛÛÜˆ
+ˆ[œ]™\^ÛÛÜˆ
+ˆ	ØÛÛÜ“[ÙNØ
+NÂˆYˆ
+Ý™\›^JHÂˆ[™\Ëœ\Ú
+]Ý™\›^PÛÛÜˆH^\™SØY
+ˆ	ÛÝ™\›^_K™XÌLÌŠ›Ý[™
+[œ]›Ý™\›^PÛÛÜ™
+JK
+NÂˆÛÛÜˆH™XÍŒÌŠZ^
+Ý™\›^PÛÛÜ‹œ™Ø‹ÛÛÜ‹œ™Ø‹Ý™\›^PÛÛÜ‹˜JKÛÛÜ‹˜JNØ
+NÂˆBˆYˆ
+YÚ
+HÂˆ[™\Ëœ\Ú
+ÛÛÜˆHÛÛÜˆ
+ˆ^\™TØ[\J	ÛYÚK	ÛYÚWÜË[œ]›YÚÛÛÜ™
+NØ
+NÂˆBˆYˆ
+\Õ[šY›Ü›J‘›ÙÈŠJHÂˆ[™\Ëœ\Ú
+]›ÙÐÛÛÜˆH	Ù›ÙÐÛÛÜŸNÂˆ]›ÙÑ˜XÝÜˆHÛ[\
+ˆ
+[œ]œÜ\šXØ[™\^\Ý[˜ÙHH›ÙË‘›ÙÔ™[™\‘\Ý[˜ÙTÝ\
+BˆÈX^
+›ÙË‘›ÙÔ™[™\‘\Ý[˜ÙQ[™H›ÙË‘›ÙÔ™[™\‘\Ý[˜ÙTÝ\ŒJKˆŒKŒ
+NÂˆÛÛÜˆH™XÍŒÌŠZ^
+ÛÛÜ‹œ™Ø‹›ÙÐÛÛÜ‹œ™Ø‹›ÙÑ˜XÝÜˆ
+ˆ›ÙÐÛÛÜ‹˜JKÛÛÜ‹˜JNØ
+NÂˆBˆ[™\Ëœ\Ú
+ˆ™]\›ˆÛÛÜŽÈŠNÂˆXZ[ˆH[™\Ëš›Ú[Š—ˆŠNÂˆœ™XZÎÂˆBˆØ\ÙH^Ø˜XÚÙÜ›Ý[™Ž‚ˆXZ[ˆH˜\ˆÛÛÜˆH[œ]™\^ÛÛÜˆ
+ˆ	ØÛÛÜ“[ÙNÂˆYˆ
+ÛÛÜ‹˜HŒJHÂˆ\ØØ\™ÂˆBˆ™]\›ˆÛÛÜŽØÂˆœ™XZÎÂˆØ\ÙHœÜÚ][Û—Ý^Ž‚ˆXZ[ˆH˜\ˆÛÛÜˆH^\™TØ[\JØ[\\ŒØ[\\ŒÜË[œ]^ÛÛÜ™
+NÂˆYˆ
+ÛÛÜ‹˜HOHŒ
+HÂˆ\ØØ\™ÂˆBˆ™]\›ˆÛÛÜˆ
+ˆ	ØÛÛÜ“[ÙNØÂˆœ™XZÎÂˆØ\ÙHœÜÚ][Û—Ý^ØÛÛÜˆŽ‚ˆËÈÝZR][P]\Ë”ÛÝšY]È[X™\˜][HX›\Ú\ÈÜ[‘Ó\Ý[H‚ˆËÈÛÛÜ™[˜]\È
+›ÝÈ™\›È\ÈLJKˆH]\È]Ù[ˆ\È™[™\™Y[ÈBˆËÈÙX‘ÔH\™Ù]Ú\™H›ÝÈ™\›È\È\ÚXØ[H]HÜÛÈÛ›H\ÂˆËÈ™[][\YYX[H]\È›]™YYÈˆ[™\YÚ[HØ[\[™Ë‚ˆËÈ›\[™ÈH][H[Ù[	ÜÈÛ\H[œÝXYZ\œ›ÜœÈXXÚ[Ù[]Ø^BˆËÈœ›ÛH]ÈÛÝØÚ\ÜÛÜˆ[™X]™\È]™\žH›ÝÈ^Ù\HZYH›[šË‚ˆÛÛœÝØ[\PÛÛÜ™HÙÝZWÝ^\™YÜ™[][\YYØ[KË\Ý
+ÜXË›X™[ˆŠBˆÈ™XÌŒÌŠ[œ]^ÛÛÜ™žKŒH[œ]^ÛÛÜ™žJH‚ˆˆš[œ]^ÛÛÜ™ŽÂˆXZ[ˆH˜\ˆÛÛÜˆH^\™TØ[\JØ[\\ŒØ[\\ŒÜË	ÜØ[\PÛÛÜ™JH
+ˆ[œ]™\^ÛÛÜŽÂˆYˆ
+ÛÛÜ‹˜HOHŒ
+HÂˆ\ØØ\™ÂˆBˆ™]\›ˆÛÛÜˆ
+ˆ	ØÛÛÜ“[ÙNØÂˆœ™XZÎÂˆØ\ÙH^ŽˆÂˆÛÛœÝÝZHH\ÑYš[™J’T×ÑÕRHŠH\ÑYš[™J’T×ÔÑQWÕ“ÕQÒŠNÂˆÛÛœÝÜ˜^\ØØ[HH\ÑYš[™J’T×ÑÔVTÐÐSHŠNÂˆÛÛœÝ›Ü˜ÙTÛÛYH\[ÙˆØØ][ÛˆOOH[™Yš[™Y‚ˆ	‰ˆ™]ÈT“ÙX\˜Ú\˜[\ÊØØ][Û‹œÙX\˜Ú
+Kš\Ê›XÝÙX—Ý^ÛÛYŠNÂˆÛÛœÝØ[\HHÜ˜^\ØØ[BˆÈ^\™TØ[\JØ[\\ŒØ[\\ŒÜË[œ]^ÛÛÜ™
+Kœœœœˆ‚ˆˆ^\™TØ[\JØ[\\ŒØ[\\ŒÜË[œ]^ÛÛÜ™
+HŽÂˆYˆ
+›Ü˜ÙTÛÛY
+HÂˆËÈPQÎˆ\Ý[™ÝZ\Ú™Z™XÝY^Ù[ÛY]žKÙ\œ›ÛHÛ\^\™BˆËÈØ[\[™ËØ[Kˆ[˜X›YÛ›HžHÛXÝÙX—Ý^ÛÛY‚ˆXZ[ˆH™]\›ˆ™XÍŒÌŠKŒŒKŒKŒ
+NØÂˆH[ÙHYˆ
+ÝZJHÂˆXZ[ˆH]^ÛÛÜˆH	ÜØ[\_NÂˆ˜\ˆÛÛÜˆH^ÛÛÜˆ
+ˆ[œ]™\^ÛÛÜŽÂˆYˆ
+ÛÛÜ‹˜HŒJHÂˆ\ØØ\™ÂˆBˆ™]\›ˆÛÛÜŽØÂˆH[ÙHÂˆXZ[ˆH]^ÛÛÜˆH	ÜØ[\_NÂˆ˜\ˆÛÛÜˆH^ÛÛÜˆ
+ˆ[œ]™\^ÛÛÜˆ
+ˆ	ØÛÛÜ“[ÙNÂˆYˆ
+ÛÛÜ‹˜HŒJHÂˆ\ØØ\™ÂˆBˆ™]\›ˆÛÛÜŽØÂˆBˆœ™XZÎÂˆBˆØ\ÙHœ[›Ü˜[XHŽ‚ˆXZ[ˆH™]\›ˆ^\™TØ[\JØ[\\ŒØ[\\ŒÜË[œ]^ÛÛÜ™
+NØÂˆœ™XZÎÂˆØ\ÙHœÜÚ][ÛˆŽ‚ˆØ\ÙHœÚÞHŽ‚ˆØ\ÙHœÝ\œÈŽ‚ˆXZ[ˆH™]\›ˆ	ØÛÛÜ“[ÙNØÂˆœ™XZÎÂˆØ\ÙHœØÜ™Y[œ]XYŽ‚ˆXZ[ˆH™]\›ˆ^\™TØ[\J[”Ø[\\‹[”Ø[\\—ÜË[œ]œÜÚ][Û‹žHÈKŒ
+NØÂˆœ™XZÎÂˆY˜][ˆÂˆËÈÙ[™\šXÈ˜[˜XÚÈ
+ÙYHZ[œÊNˆØ[\HHš\œÝ›Ý[™^\™HÚ]ˆËÈUŒÚ[ˆH›Ü›X]\È][Ù[]HžH™\^ÛÛÜˆ[™ˆËÈÛÛÜ“[Ù[]ÜŽÈ›]ÛÛÜˆÝ\Ú\ÙKˆ˜\žZ[™ÜÈZ\œ›ÜˆZ[œÉÜÂˆËÈÙ[™\šXÈœ˜[˜Ú^XÝK‚ˆÛÛœÝ˜[Y\ÈH™]ÈÙ]
+
+ÜXË™\^›Ü›X]ÖÌOË™[[Y[È×JK›X\
+
+JHOˆK›˜[YJJNÂˆÛÛœÝ\ÈH×NÂˆYˆ
+˜[Y\Ëš\Ê•UŒŠJH\Ëœ\Ú
+ˆØØ][ÛŠ
+H^ÛÛÜ™ˆ™XÌŒÌ‹ˆŠNÂˆYˆ
+˜[Y\Ëš\ÊÛÛÜˆŠJH\Ëœ\Ú
+ØØ][ÛŠ	Ü\Ë›[™ÝJH™\^ÛÛÜŽˆ™XÍŒÌ‹˜
+NÂˆÙ[™\šXÕ˜\žZ[™ÜÈH\Ëš›Ú[ŠˆŠNÂˆ]š\œÝØ[\\ˆH[Âˆ›Üˆ
+ÛÛœÝÈÙˆÜ›Ý\ÊHÂˆYˆ
+ËœØ[\\œË›[™Ý
+HÂˆš\œÝØ[\\ˆHØ[š]^™S˜[YJËœØ[\\œÖÌJNÂˆœ™XZÎÂˆBˆBˆYˆ
+˜[Y\Ëš\Ê•UŒŠH	‰ˆš\œÝØ[\\ŠHÂˆXZ[ˆH˜\ˆÛÛÜˆH^\™TØ[\J	Ùš\œÝØ[\\ŸK	Ùš\œÝØ[\\ŸWÜË[œ]^ÛÛÜ™
+NÉÂˆ˜[Y\Ëš\ÊÛÛÜˆŠHÈ—ˆÛÛÜˆ
+H[œ]™\^ÛÛÜŽÈˆˆˆ‚ˆBˆ™]\›ˆÛÛÜˆ
+ˆ	ØÛÛÜ“[ÙNØÂˆH[ÙHYˆ
+˜[Y\Ëš\ÊÛÛÜˆŠJHÂˆXZ[ˆH™]\›ˆ[œ]™\^ÛÛÜˆ
+ˆ	ØÛÛÜ“[ÙNØÂˆH[ÙHÂˆXZ[ˆH™]\›ˆ	ØÛÛÜ“[ÙNØÂˆBˆœ™XZÎÂˆBˆB‚ˆÛÛœÝ\ÔÝ\™˜XÙHH˜[Z[HOOH˜›ØÚÈˆ˜[Z[HOOHœ\XÛH‚ˆ˜[Z[HOOHš][Hˆ˜[Z[HOOH™[]HŽÂˆÛÛœÝÝ\™˜XÙR\ÓÝ™\›^HH
+˜[Z[HOOHš][Hˆ˜[Z[HOOH™[]HŠBˆ	‰ˆ
+ÜXË™\^›Ü›X]ÖÌOË™[[Y[È×JKœÛÛYJ
+JHOˆK›˜[YHOOH•UŒHŠNÂˆÛÛœÝ˜\žZ[™ÓY[X™\œÈHÙ[™\šXÕ˜\žZ[™ÜÈOOH[ˆÈÙ[™\šXÕ˜\žZ[™ÜÂˆˆ˜[Z[HOOH\œ˜Z[ˆ‚ˆËÈ]\ÝZ\œ›ÜˆZ[œÉÜÈ\œ˜Z[ˆ˜\žZ[™ÜÈ^XÝK[ˆÜ™\‹‚ˆÈˆØØ][ÛŠ
+H^ÛÛÜ™ˆ™XÌŒÌ‹ˆ‚ˆ
+ÈˆØØ][ÛŠJH™\^ÛÛÜŽˆ™XÍŒÌ‹ˆ‚ˆ
+ÈˆØØ][ÛŠŠHYÚÛÛÜ™ˆ™XÌŒÌ‹ˆ‚ˆ
+ÈˆØØ][ÛŠÊHÜ\šXØ[™\^\Ý[˜ÙNˆŒÌ‹ˆ‚ˆ
+ÈˆØØ][ÛŠ
+HÞ[[™šXØ[™\^\Ý[˜ÙNˆŒÌ‹ˆ‚ˆˆ\ÔÝ\™˜XÙBˆÈˆØØ][ÛŠ
+H^ÛÛÜ™ˆ™XÌŒÌ‹ˆ‚ˆ
+ÈˆØØ][ÛŠJH™\^ÛÛÜŽˆ™XÍŒÌ‹ˆ‚ˆ
+ÈˆØØ][ÛŠŠHYÚÛÛÜ™ˆ™XÌŒÌ‹ˆ‚ˆ
+ÈˆØØ][ÛŠÊHÜ\šXØ[™\^\Ý[˜ÙNˆŒÌ‹ˆ‚ˆ
+ÈˆØØ][ÛŠ
+HÞ[[™šXØ[™\^\Ý[˜ÙNˆŒÌ‹ˆ‚ˆ
+È
+Ý\™˜XÙT\‘˜XÙHÈˆØØ][ÛŠJH™\^ÛÛÜ˜XÚÎˆ™XÍŒÌ‹ˆˆˆˆŠBˆ
+È
+Ý\™˜XÙR\ÓÝ™\›^BˆÈØØ][ÛŠ	ÜÝ\™˜XÙT\‘˜XÙHÈˆˆ_JHÝ™\›^PÛÛÜ™ˆ™XÌŒÌ‹˜ˆˆˆŠBˆˆ˜[Z[HOOHœÜÚ][Û—Ý^ˆ˜[Z[HOOHœÜÚ][Û—Ý^ØÛÛÜˆ‚ˆÈˆØØ][ÛŠ
+H^ÛÛÜ™ˆ™XÌŒÌ‹ˆˆ
+Âˆ
+˜[Z[HOOHœÜÚ][Û—Ý^ØÛÛÜˆˆÈˆØØ][ÛŠJH™\^ÛÛÜŽˆ™XÍŒÌ‹ˆˆˆˆŠBˆˆ˜[Z[HOOHœ[›Ü˜[XH‚ˆÈˆØØ][ÛŠ
+H^ÛÛÜ™ˆ™XÌÏŒÌ‹ˆ‚ˆˆ˜[Z[HOOHœÜÚ][Ûˆˆ˜[Z[HOOHœÚÞHˆ˜[Z[HOOHœÝ\œÈ‚ˆÈˆØØ][ÛŠ
+HÜ\šXØ[™\^\Ý[˜ÙNˆŒÌ‹ˆØØ][ÛŠJHÞ[[™šXØ[™\^\Ý[˜ÙNˆŒÌ‹ˆ‚ˆˆ˜[Z[HOOH^‚ˆÈˆØØ][ÛŠ
+H™\^ÛÛÜŽˆ™XÍŒÌ‹ˆØØ][ÛŠJH^ÛÛÜ™ˆ™XÌŒÌ‹ˆ‚ˆˆˆØØ][ÛŠ
+H™\^ÛÛÜŽˆ™XÍŒÌ‹ˆŽÂ‚ˆÛÛœÝ\œ˜Z[’[\œÈH˜[Z[HOOH\œ˜Z[ˆˆÈ™›ˆØ[\S™X\™\Ý
+ˆÛÝ\˜ÙNˆ^\™WÌ™ŒÌ‹ˆÛÝ\˜ÙTØ[\\ŽˆØ[\\‹ˆ]’[Žˆ™XÌŒÌ‹ˆ^[Ú^™Nˆ™XÌŒÌ‚ŠHOˆ™XÍŒÌˆÂˆ]HH
+]’[ŠNÂˆ]ˆHJ]’[ŠNÂˆ]^[ØÜ™Y[”Ú^™HHX^
+Ü\
+H
+ˆH
+Èˆ
+ˆŠK™XÌŒÌŠŒJJNÂˆ]]•^[ÛÛÜ™ÈH]’[ˆÈ^[Ú^™NÂˆ]^[Ù[\ˆH›Ý[™
+]•^[ÛÛÜ™ÊHH™XÌŒÌŠJNÂˆ˜\ˆ^[Ù™œÙ]H]•^[ÛÛÜ™ÈH^[Ù[\ŽÂˆ^[Ù™œÙ]H
+^[Ù™œÙ]H™XÌŒÌŠJJH
+ˆ^[Ú^™HÈ^[ØÜ™Y[”Ú^™Bˆ
+È™XÌŒÌŠJNÂˆ^[Ù™œÙ]HÛ[\
+^[Ù™œÙ]™XÌŒÌŠŒ
+K™XÌŒÌŠKŒ
+JNÂˆ]]ˆH
+^[Ù[\ˆ
+È^[Ù™œÙ]
+H
+ˆ^[Ú^™NÂˆ™]\›ˆ^\™TØ[\QÜ˜Y
+ÛÝ\˜ÙKÛÝ\˜ÙTØ[\\‹]‹KŠNÂŸB˜ˆˆŽÂ‚ˆ™]\›ˆÝXÝœÒ[œ]ÂˆZ[[ŠÜÚ][ÛŠHÜÚ][ÛŽˆ™XÍŒÌ‹‰ÜÝ\™˜XÙT\‘˜XÙHÈˆZ[[Šœ›ÛÙ˜XÚ[™ÊHœ›Û˜XÚ[™Îˆ›ÛÛˆˆˆˆŸIÝ˜\žZ[™ÓY[X™\œß_NÂ‚‰ÜØ[\\œßB‰Ý\œ˜Z[’[\œßBœ˜YÛY[™›ˆœ×ÛXZ[Š[œ]ˆœÒ[œ]
+HOˆØØ][ÛŠ
+H™XÍŒÌˆÂ‰ÛXZ[ŸBŸXÂˆNÂ‚ˆÛÛœÝØ[š]^™S˜[YHH
+˜[YJHOˆ˜[YKœ™\XÙJÖ×˜K^KVŒNW×KÙË—ÈŠNÂˆËÈÓÓ^ÜÙ\ÈÛÛÜˆ[™\]XÚY[È›ÝYÚØ[\\Œ‘]ÙX‘ÔBˆËÈ™\]Z\™\ÈH\Ì™›Ø]šY]ÈÈ\ÙHH\Ý[˜Ý\Ø[\H\K‚ˆÛÛœÝ\Ñ\Ø[\\“˜[YHH
+˜[YJHOˆÑ\
+Î”Ø[\\ŠOÉÚK\Ý
+Ýš[™Ê˜[YJJNÂ‚ˆËÈÙX‘ÔH\È“ÈËXÛÛ\Û™[™\^›Ü›X]
+Û›HKÞ‹Þ
+KˆHËXÛÛ\Û™[ˆËÈ[[Y[
+‘ÐŠŠHÚÜÙHY™™\ˆ\ÈYÚHXÚÙY]HË]ÚYHÝšYHÝ™\œ[œÂˆËÈÚ[ˆ™XYÚ]H]ÚYHÔH›Ü›X]
+]šX]HÙ™œÙ]
+È›Ü›X]Ú^™H‚ˆËÈÝšYHŠH8 %^XÝHÚ]Ú[ÈÚÞKÜÝ\œËÜ[›Ü˜[XKÙ[™ÙØ]]Ø^H
+[™šXHBˆËÈÚY\“X[˜YÙ\ˆ™XÛÛ\[HØ]K[™ÜÈHÚÛHÛY[
+KˆH]K\™\Ù\š[™ÂˆËÈš^ˆÜ]H[[Y[[ÈH‹]ÚYH
+ÈK]ÚYH]šX]HZ\ˆ
+›ÝÚ][‚ˆËÈHÝšYJH[™™XÛÛœÝXÝH™XÌÈ[ˆHÚY\‹ˆÚ\™YžHZ[œÂˆËÈ
+ÑÔÓXÛÈ
+ÈÙ]
+
+JH[™Z[\[[™H
+ÔH]šX]\ÊHÛÈBˆËÈÚY\“ØØ][ÛœÈÝ^HY[XØ[Ûˆ›ÝÚY\Ë‚ˆÛÛœÝÔU×Ô‘ÐˆHÂˆ‘ÐŒÌ—Ñ“ÐUˆÚNˆ™›Ø]Ìžˆ‹Îˆ™›Ø]Ìˆ‹Pž]\ÎˆØØ[\Žˆ™ŒÌˆ‹Ú[™ˆ™ˆŸKˆ‘ÐŒM—Ñ“ÐUˆÚNˆ™›Ø]Mžˆ‹Îˆ™›Ø]Mˆ‹Pž]\ÎˆØØ[\Žˆ™ŒÌˆ‹Ú[™ˆ™ˆŸKˆ‘ÐŽÕS“Ô“NˆÚNˆ[›Ü›Nˆ‹Îˆ[›Ü›N‹Pž]\Îˆ‹ØØ[\Žˆ™ŒÌˆ‹Ú[™ˆ™ˆŸKˆ‘ÐŽÔÓ“Ô“NˆÚNˆœÛ›Ü›Nˆ‹ÎˆœÛ›Ü›N‹Pž]\Îˆ‹ØØ[\Žˆ™ŒÌˆ‹Ú[™ˆ™ˆŸBˆNÂˆÛÛœÝÛÛ\[U™\^^[Ý]H
+™ŠHOˆÂˆÛÛœÝY[X™\œÈH×NÈËÈÑÔÓØØ][ÛŠ
+H˜[YNˆ\KˆÛÛœÝÜP]œÈH×NÈËÈÜÚY\“ØØ][Û‹Ù™œÙ]›Ü›X]BˆÛÛœÝžS˜[YHH™]ÈX\
+
+NÈËÈ˜]Ó˜[YHOˆÜÜ]Ë‹‹ŸBˆ]ØÈHÂˆ›Üˆ
+ÛÛœÝ[[Y[Ùˆ™‹™[[Y[ÊHÂˆÛÛœÝÜHÔU×Ô‘Ð–Ù[[Y[™›Ü›X]NÂˆYˆ
+Ü
+HÂˆÛÛœÝS˜[YHHØ[š]^™S˜[YJ[[Y[›˜[YJH
+È—ÚHŽÂˆÛÛœÝÓ˜[YHHØ[š]^™S˜[YJ[[Y[›˜[YJH
+È—ÛÈŽÂˆY[X™\œËœ\Ú
+ØØ][ÛŠ	ÛØßJH	ÚS˜[Y_Nˆ™XÌ	ÜÜœØØ[\ŸO‹
+NÂˆY[X™\œËœ\Ú
+ØØ][ÛŠ	ÛØÈ
+È_JH	ÛÓ˜[Y_Nˆ	ÜÜœØØ[\ŸK
+NÂˆÜP]œËœ\Ú
+ÜÚY\“ØØ][ÛŽˆØËÙ™œÙ]ˆ[[Y[›Ù™œÙ]›Ü›X]ˆÜš_JNÂˆÜP]œËœ\Ú
+ÜÚY\“ØØ][ÛŽˆØÈ
+ÈKÙ™œÙ]ˆ[[Y[›Ù™œÙ]
+ÈÜšPž]\Ë›Ü›X]ˆÜ›ßJNÂˆžS˜[YKœÙ]
+[[Y[›˜[YKÜÜ]ÎˆYKØØ[\ŽˆÜœØØ[\‹S˜[YKÓ˜[YKÚ[™ˆÜšÚ[™[NˆßJNÂˆØÈ
+ÏHŽÂˆH[ÙHÂˆÛÛœÝ[™›ÈH‘T•VÑÔWÑ“Ô“PUÖÙ[[Y[™›Ü›X]NÂˆYˆ
+Z[™›ÊH›ÝÈ™]È\œ›ÜŠ™\^›Ü›X]	Ù[[Y[™›Ü›X]H\È›ÝÜY
+NÂˆÛÛœÝ›HHØ[š]^™S˜[YJ[[Y[›˜[YJNÂˆY[X™\œËœ\Ú
+ØØ][ÛŠ	ÛØßJH	Û›_Nˆ	ÝÙÜÛ™XÕ\J[[Y[™›Ü›X]
+_K
+NÂˆÜP]œËœ\Ú
+ÜÚY\“ØØ][ÛŽˆØËÙ™œÙ]ˆ[[Y[›Ù™œÙ]›Ü›X]ˆ[™›Ë™Ü_JNÂˆžS˜[YKœÙ]
+[[Y[›˜[YKÜÜ]Îˆ˜[ÙK˜[YNˆ›KÚ[™ˆ[™›ËšÚ[™[Nˆ[™›Ë™[_JNÂˆØÈ
+ÏHNÂˆBˆBˆ™]\›ˆÛY[X™\œËÜP]œËžS˜[YK[œ]Y[X™\œÎˆY[X™\œËš›Ú[Š—ˆŠ_NÂˆNÂ‚ˆËÈÛÛYHÙX‘ÔH˜XÚÙ[™È
+\ÈS‘ÓKÔÝÚYÚY\ˆ]
+HØ\X^š[™Ü›Ý\È]ˆËÈ][Ú˜[™ÉÜÈ[]KÚ][KÝ\œ˜Z[‹Ý^\[[™\È\ÙHKMˆÜ›Ý\ËˆY\™ÙH]™\žBˆËÈÜ›Ý\HËLH[ÈÜ›Ý\ËLH
+ÈHX^š[™Ü›Ý\ÊHÚ]ÛÛ\Ú[Û‹Yœ™YHš[™[™ÂˆËÈ™[[X™\š[™Ë[™\HHÐSQH™[X\ÈHÑÔÓH\[[™H^[Ý][™ˆËÈHÜÝš[™Ø[ÈÛÈ^HÝ^HÛÛœÚ\Ý[ˆÜ›Ý\ÈËLH\™H[ÝXÚY‚ˆÛÛœÝÔ“ÕTÐÐTHX]›X^
+KX]›Z[Š]šXÙOË›[Z]ÏË›X^š[™Ü›Ý\È
+JNÂˆÛÛœÝÛÛ\]Pš[™Ü›Ý\™[X\H
+Ü›Ý\ÊHOˆÂˆÛÛœÝÈHX]›Z[ŠÔ“ÕTÐÐTÜ›Ý\Ë›[™ÝJNÂˆÛÛœÝX\HÜ›Ý\Ë›X\
+
+ËÚJHOˆÂˆÛÛœÝ™ÈHÚHÈHHÈÚHˆÈHNÂˆ™]\›ˆÈ™Ë˜\ÙUNˆ˜\ÙTÎˆ[šY›Ü›\ÎˆË[šY›Ü›\Ë›[™ÝœØ[\\œÎˆËœØ[\\œË›[™ÝNÂˆJNÂˆYˆ
+ÈOOHÜ›Ý\Ë›[™Ý
+H™]\›ˆÈX\ËY\™ÙYˆ˜[ÙHNÂˆËÈXÚÈXXÚQT‘ÑQÜ›Ý\ÛØ˜[Nˆ]™\žHÜšYÚ[˜[Ü›Ý\]›ÛÈ[ÈBˆËÈØ[YHY\™ÙYÜ›Ý\Ú\™\ÈÛ™Hš[™[™ÈÜXÙKÛÈÙH]\Ý^HÝ]SÙ‚ˆËÈZ\ˆ[šY›Ü›\Èš\œÝ
+ÛÛYÝ[Ý\È˜\ÙUJK[ˆSÙˆZ\ˆØ[\\ˆZ\œÂˆËÈ
+ÛÛYÝ[Ý\È˜\ÙTÈQ•TˆH[šY›Ü›\ÊKˆH™]š[Ý\È\‹YÜ›Ý\[›š[™ÂˆËÈÛÝ[™\Ù]˜\ÙTÈ™[]]™HÈÛ›HHØ[YHÜšYÚ[˜[Ü›Ý\	ÜÈ[šY›Ü›\ËÛÂˆËÈÚ[ˆÛÈÜšYÚ[˜[Ü›Ý\È›ÛYÙÙ]\ˆ
+K™ËˆH›\ˆÜÝXÚZ[‰ÜÂˆËÈØ[\\’[™›ËÐ›\ÛÛ™šYÈÜ›Ý\[™]È[”Ø[\\ˆÜ›Ý\
+HHØ[\\ˆ[™YˆËÈÛˆš[™[™È8 %ÛÛY[™ÈÚ]HÝ\ˆÜ›Ý\	ÜÈ[šY›Ü›H]š[™[™ÈˆËÈ
+˜š[™[™È[™^
+
+HØ\ÈÜXÚYšYYžHH™]š[Ý\È[žHŠH[™[˜[Y][™ÂˆËÈHÚÛH\[[™H
+[™\ÈH]K\ØÜ™Y[ˆ™[™\ŠKˆ\š]š[™È]™\žBˆËÈš[™[™Èœ›ÛH\ÈÚ[™ÛHX\ÙY\ÈHÑÔÓ[šY›Ü›HXÛËHÑÔÓˆËÈØ[\\ˆXÛÈ
+šXHØ[\\“X\
+KHš[™YÜ›Ý\^[Ý][™[œÝ\™Pš[™Ü›Ý\ÂˆËÈ\™™XÝHÛÛœÚ\Ý[[™ÛÛ\Ú[Û‹Yœ™YK‚ˆÛÛœÝPÝ\œÛÜˆH™]È\œ˜^JÊK™š[
+
+NÂˆ›Üˆ
+]ÚHHÈÚHÜ›Ý\Ë›[™ÝÈÚJÊÊHÂˆX\ÙÚWK˜˜\ÙUHHPÝ\œÛÜ–ÛX\ÙÚWK›™×NÂˆPÝ\œÛÜ–ÛX\ÙÚWK›™×H
+ÏHÜ›Ý\ÖÙÚWK[šY›Ü›\Ë›[™ÝÂˆBˆÛÛœÝÐÝ\œÛÜˆHPÝ\œÛÜ‹œÛXÙJ
+NÈËÈØ[\\œÈÝ\Y\ˆ[Y\™ÙYYÜ›Ý\[šY›Ü›\Âˆ›Üˆ
+]ÚHHÈÚHÜ›Ý\Ë›[™ÝÈÚJÊÊHÂˆX\ÙÚWK˜˜\ÙTÈHÐÝ\œÛÜ–ÛX\ÙÚWK›™×NÂˆÐÝ\œÛÜ–ÛX\ÙÚWK›™×H
+ÏHÜ›Ý\ÖÙÚWKœØ[\\œË›[™Ý
+ˆŽÂˆBˆ™]\›ˆÈX\ËY\™ÙYˆYHNÂˆNÂ‚ˆÛÛœÝZ[\[[™HH
+ÜXË\›Ü›X]
+HOˆÂˆËÈ\›Ü›X]OOH[™Yš[™Y8¡äˆØ[\ˆ
+H™XÛÛ\[HØ]JHY‰ÝÜXÚYžHBˆËÈ\ÜÈ\ÛÈ\ÙHH\ÝÜšXØ[Y˜][ˆ[ˆVPÒU[YX[œÈBˆËÈ\ÜÈ\È›È\]XÚY[ˆ[™]\Ý“ÕÞ[\Ú^™H\Ý]K‚ˆYˆ
+\›Ü›X]OOH[™Yš[™Y
+H\›Ü›X]H™\Ì™›Ø]ŽÂˆËÈÝšXÝH™Ù\ÈH\ÜÈÙH\™HZ[[™È›Üˆ]™HH\]XÚY[‹‚ˆËÈ\È™]š[Ý\ÛH[ÛÈÔ‰Ù[ˆH\ÜXË™\Ý[˜Ú[ÚXÚXYH]YH›Ü‚ˆËÈH“ËY\˜\šX[
+\›Ü›X]OOH[
+HÙˆ[žH\YXÛ\š[™ÂˆËÈ˜[Z[H[™Þ[\Ú^™Y›Ü›X]ˆ[KHH^XÝ˜Z[\™HHÝX\™Û‚ˆËÈHÜXÈœ˜[˜Ú™[ÝÈ^\ÝÈÈ™]™[ˆH\[[™H›Ý[™[ˆH\ÜÈÚ]ˆËÈ›È\]XÚY[]\ÝØ\œžH›È\Ý]KÚ]]™\ˆ]ÈÜXÈØ^\Ë‚ˆÛÛœÝ\™\]Y\ÝYH\›Ü›X]OH[ÂˆËÈÜ[ˆH˜[Y][ÛˆØÛÜH›ÜˆHÚÛHZ[ÛÈH’T”Õ˜Z[[™ÈÔBˆËÈØš™XÝ
+š[™YÜ›Ý\^[Ý]È\[[™H^[Ý]È\[[™JH\ÈÙÙÙYÚ]ˆËÈ]È™X[Y\ÜØYÙK[œÝXYÙˆÛ›HHÝÛœÝ™X[Hš[˜[YYHÈBˆËÈ™]š[Ý\È\œ›ÜˆˆØ\ØØYK‚ˆÛÛœÝÜØÛÜSÜ[ˆH\[Ùˆ]šXÙKœ\Ú\œ›Ü”ØÛÜHOOH™[˜Ý[ÛˆŽÂˆYˆ
+ÜØÛÜSÜ[ŠH]šXÙKœ\Ú\œ›Ü”ØÛÜJ˜[Y][ÛˆŠNÂˆÛÛœÝÜÜØÛÜHH
+
+HOˆÂˆYˆ
+ÜØÛÜSÜ[ŠH]šXÙKœÜ\œ›Ü”ØÛÜJ
+K[Š
+\œŠHOˆÂˆYˆ
+\œˆ	‰ˆJZ[\[[™K—ÛÙÙÙYZ[
+Z[\[[™K—ÛÙÙÙYZ[H™]ÈÙ]
+
+JJKš\ÊÜXË›X™[
+JHÂˆZ[\[[™K—ÛÙÙÙYZ[˜Y
+ÜXË›X™[
+NÂˆÛÛœÛÛK™\œ›ÜŠØZ[˜[Y][Ûˆ\œ›Ü—H	ÜÜXË›X™[Nˆ	Ù\œ‹›Y\ÜØYÙ_X
+NÂˆBˆJK˜Ø]Ú
+
+
+HOˆßJNÂˆNÂˆÛÛœÝ˜[Z[HHÚY\‘˜[Z[JÜXË™\^ÚY\ŠNÂˆÛÛœÝÜ›Ý\ÈHÜXË˜š[™Ü›Ý\È×NÂˆÛÛœÝÈX\ˆÜ›Ý\™[X\ÎˆÜ›Ý\ÛÝ[Y\™ÙYˆÜ›Ý\ÓY\™ÙYHHÛÛ\]Pš[™Ü›Ý\™[X\
+Ü›Ý\ÊNÂˆËÈ\‹\Ø[\\ˆ™[X\Y
+Ü›Ý\š[™[™ÊHÛÈHÑÔÓØ[\\‹Ý^\™HXÛÂˆËÈX]ÚHY\™ÙY^[Ý]‚ˆËÈ[Ú˜[™È[X™\œÈHÜ›Ý\	ÜÈS’Q“Ô“TÈ[™ÐSTT”È[ˆ
+œÙ\\˜]Jˆš[™[™ÂˆËÈÜXÙ\È
+›Ýœ›ÛH
+H8 %˜[Y›ÜˆÓÕ[Ø[ˆ\ØÜš\ÜˆÙ]È][YØ[[‚ˆËÈÙX‘ÔKÚ\™Hš[™[™ÜÈ]\Ý™H[š\]YHÚ][ˆHš[™Ü›Ý\ˆH›\ˆÚZ[‚ˆËÈ^ÜÙ\È\È\™XÝH
+Ü›Ý\HHØ[\\’[™›Ð›\ÛÛ™šYÐK[”Ø[\\ˆËÈ8¡¤ˆ\XØ]Hš[™[™È
+KˆÛÈÙH^HXXÚÜšYÚ[˜[Ü›Ý\	ÜÈØ[\\œÈQ•Tˆ]ÂˆËÈ[šY›Ü›\ËˆÚ[ˆÜ›Ý\È\™HY\™ÙYØ[\\œÈ]\Ý[ÛÈÛX\ˆ]™\žH›ÛYˆËÈÜ›Ý\	ÜÈ[šY›Ü›\È[ˆHØ[YHY\™ÙYÜ›Ý\[˜ÙHX^
+˜\ÙTËY\™ÙYYÜ›Ý\ˆËÈ[šY›Ü›HÛÝ[
+Kˆ˜\ÙTÈ[™XYH\]X[ÈHY\™ÙYYÜ›Ý\[šY›Ü›HÛÝ[Ú[‚ˆËÈÜ›Ý\È›Û
+ÛÛ\]Pš[™Ü›Ý\™[X\
+K[™\]X[ÈÝ\Ú\ÙKÛÈ\È\ÈBˆËÈØY™H›Ë[Ü›Üˆ›Û‹[Ý™\›\[™ÈÈY\™ÙYØ\Ù\È[™š^\ÈHÝ™\›\‚ˆÛÛœÝY\™ÙY[šY›Ü›PÛÝ[H™]È\œ˜^JÜ›Ý\ÛÝ[
+K™š[
+
+NÂˆÜ›Ý\Ë™›Ü‘XXÚ
+
+ËÚJHOˆÈY\™ÙY[šY›Ü›PÛÝ[ÙÜ›Ý\™[X\ÙÚWK›™×H
+ÏHË[šY›Ü›\Ë›[™ÝÈJNÂˆÛÛœÝØ[\\˜\ÙHH
+ÚJHOˆX]›X^
+Ü›Ý\™[X\ÙÚWK˜˜\ÙTËY\™ÙY[šY›Ü›PÛÝ[ÙÜ›Ý\™[X\ÙÚWK›™×JNÂˆÛÛœÝØ[\\“X\H™]ÈX\
+
+NÂˆÜ›Ý\Ë™›Ü‘XXÚ
+
+ËÚJHOˆËœØ[\\œË™›Ü‘XXÚ
+
+ËÚJHO‚ˆØ[\\“X\œÙ]
+ËÈÎˆÜ›Ý\™[X\ÙÚWK›™ËŽˆØ[\\˜\ÙJÚJH
+ÈÚH
+ˆˆJJJNÂˆYˆ
+Ø›\‹Ë\Ý
+ÜXË›X™[
+H	‰ˆ
+\[ÙˆØØ][ÛˆOOH[™Yš[™YŠH	‰ˆ™]ÈT“ÙX\˜Ú\˜[\ÊØØ][Û‹œÙX\˜Ú
+Kš\Ê›XÝÙX—ÙXYÈŠH	‰ˆJZ[\[[™K—Ù™Ð›\ŠJHÂˆZ[\[[™K—Ù™Ð›\ˆHYNÂˆÛÛœÛÛK›ÙÊ–Ð“UT‘SPTQ‘×H‹ÜXË›X™[ˆ™Ü›Ý\ÏH‹”ÓÓ‹œÝš[™ÚYžJÜ›Ý\Ë›X\
+
+ËÚJHOˆ
+ÈÚK™ÎˆÜ›Ý\™[X\ÙÚWK›™Ë˜\ÙUNˆÜ›Ý\™[X\ÙÚWK˜˜\ÙUK˜\ÙTÎˆÜ›Ý\™[X\ÙÚWK˜˜\ÙTËNˆË[šY›Ü›\Ë›[™ÝœÎˆËœØ[\\œË›[™Ý[šY›Ü›\ÎˆË[šY›Ü›\Ë›X\
+
+JHOˆK›˜[YJKØ[\\œÎˆËœØ[\\œÈJJJKˆ’ÏH‹Ü›Ý\ÛÝ[›Y\™ÙYH‹Ü›Ý\ÓY\™ÙYˆœØ[\\“X\H‹”ÓÓ‹œÝš[™ÚYžJË‹‹œØ[\\“X\™[šY\Ê
+WJJNÂˆB‚ˆËÈ[šY›Ü›HXÛ\˜][ÛœÈÚ\™YžH›ÝÝYÙ\ËˆVSÐ•Q‘‘Tˆ[šY\ÈÙ]BˆËÈ^[Ý]ÛÝ]›ÈÑÔÓXÛ\˜][ÛŽˆ[Ú˜[™Èš[™È[H\ÈY™™\œÈšXBˆËÈÙ][šY›Ü›H
+ÓÕ[Ø[ˆY™™\ˆ^\™\È]™H›ÈÙX‘ÔH\]Z]˜[[
+K[™BˆËÈš[™Ü›Ý\^[Ý]X^HØ\œžH[šY\ÈHÚY\ˆ™]™\ˆ™Y™\™[˜Ù\Ë‚ˆ][šY›Ü›QXÛHˆŽÂˆÛÛœÝXÛ\™Y[šY›Ü›\ÈH™]ÈÙ]
+
+NÂˆÜ›Ý\Ë™›Ü‘XXÚ
+
+Ü›Ý\Ü›Ý\[™^
+HOˆÂˆÛÛœÝˆHÜ›Ý\™[X\ÙÜ›Ý\[™^NÂˆÜ›Ý\[šY›Ü›\Ë™›Ü‘XXÚ
+
+[šY›Ü›Q\ØË[šY›Ü›R[™^
+HOˆÂˆYˆ
+[šY›Ü›Q\ØË\HOOH•VSÐ•Q‘‘TˆŠHÂˆËÈÙX‘ÔH\ÈÝÜ˜YÙHY™™\œÈ]›È›Ü›X]Y^[XY™™\ˆšY]ËˆÙY\ˆËÈH[™\›Z[™Èž]\ÈXÚÙY[ˆLÌˆÝÜ˜YÙHÛÜ™È[™]HÛ™BˆËÈÚY\ˆ]ÛÛœÝ[Y\ÈŽÔÒS•
+ÛÝY˜XÙ\ÊH\™›Ü›HH^XÝÚYÛ™YˆËÈž]H^˜XÝ[Ûˆ™[ÝËˆ[Ú˜[™ÈÜš]\È™YH–UTÈ\ˆÛÝY]XYÂˆËÈ™X][™ÈÜÙH\È™YHLÌœÈÚÚ\YXÚÙY˜[Y\È[™™XY\ÝˆËÈHY™™\ˆ›Üˆ[ÜÝ™\XÙ\Ë›ÙXÚ[™È˜[Y˜]ÜÈÚ]›È^[Ë‚ˆÛÛœÝÝÜ˜YÙTØØ[\ˆHÔŽÊÎ”ÒS•RS•
+KË\Ý
+[šY›Ü›Q\ØË™›Ü›X]ˆŠBˆÈLÌˆ‚ˆˆšLÌˆŽÂˆ[šY›Ü›QXÛ
+ÏHÜ›Ý\
+	Ü‹›™ßJHš[™[™Ê	Ü‹˜˜\ÙUH
+È[šY›Ü›R[™^JH˜\ÝÜ˜YÙK™XYˆ	ÜØ[š]^™S˜[YJ[šY›Ü›Q\ØË›˜[YJ_Nˆ\œ˜^O	ÜÝÜ˜YÙTØØ[\ŸOŽ×˜ÂˆXÛ\™Y[šY›Ü›\Ë˜Y
+[šY›Ü›Q\ØË›˜[YJNÂˆ™]\›ŽÂˆBˆÛÛœÝÝXÝHS’Q“Ô“WÔÕ•PÕÖÝ[šY›Ü›Q\ØË›˜[YWNÂˆYˆ
+\ÝXÝ
+HÂˆËÈ[šÛ›ÝÛˆ[šY›Ü›H›ØÚÎˆ^ÜÙH˜]ÈÝÜ˜YÙHÛÈ[\ÙY[šY›Ü›\ÈÝ[ˆËÈš[™ÈÚY\œÈ[ˆH›ÛÝ˜[Z[HÛ›H™XYHÛ›ÝÛˆ›ØÚÜË‚ˆ[šY›Ü›QXÛ
+ÏHÝXÝ	ÜØ[š]^™S˜[YJ[šY›Ü›Q\ØË›˜[YJ_WÝÈ]Nˆ\œ˜^O™XÍŒÌ‹MˆN×˜ÂˆH[ÙHÂˆ[šY›Ü›QXÛ
+ÏHÝXÝ	ÜØ[š]^™S˜[YJ[šY›Ü›Q\ØË›˜[YJ_WÝ	ÜÝXÝN×˜ÂˆBˆ[šY›Ü›QXÛ
+ÏHÜ›Ý\
+	Ü‹›™ßJHš[™[™Ê	Ü‹˜˜\ÙUH
+È[šY›Ü›R[™^JH˜\[šY›Ü›Oˆ	ÜØ[š]^™S˜[YJ[šY›Ü›Q\ØË›˜[YJ_Nˆ	ÜØ[š]^™S˜[YJ[šY›Ü›Q\ØË›˜[YJ_WÝ×˜ÂˆXÛ\™Y[šY›Ü›\Ë˜Y
+[šY›Ü›Q\ØË›˜[YJNÂˆJNÂˆJNÂ‚ˆ]œÈH[Âˆ]œÈH[ÂˆËÈÜš]KX]\È\ÜÙ[X›H
+[š[X]WÜÜš]H˜[Z[JNˆ^\™P]\ÈXÚÜÈ]™\žBˆËÈÜš]IÜÈ^[È[ÈHšYÈP“Ë[ˆ›]ÈXXÚÜš]H[ÈH]\È[‚ˆËÈH™[™\ˆ\ÜÈš]™[ˆžHHÜš]P[š[X][Û’[™›È[šY›Ü›H8 %Üš]SX]š^ˆËÈX\ÈH[š]]XYÛÈHÜš]IÜÈ]\È™YÚ[Û‹H™\^ÚY\‚ˆËÈZ[ÈH]XYœ›ÛH™\^Ú[™^
+˜[œÛ]Yœ›ÛHÛÜ™KØ[š[X]WÜÜš]KœÚˆËÈ
+È[š[X][Û—ÜÜš]K™ÛÛ
+Kˆ\È\ÈÕÈHÝZKÝÚYÙ]ËØ›ØÚÜÈ]\Ù\ÈÙ]ˆËÈÜ[]YÈHÙ[™\šXÈ[ØÜ™Y[ˆ›]]\ÙYÈØ]Ú\È˜[Z[BˆËÈÜ›ÝHØ\˜˜YÙH[ÈH]\È[™Y]™\žHÕRH^\™H›XÚË‚ˆÛÛœÝ\Ð[š[X]TÜš]HH˜[Z[HOOH˜[š[X]WÜÜš]HŽÂˆYˆ
+\Ð[š[X]TÜš]JHÂˆœÈHÛÛœÝS’SPUWÔÔÒUSÓ”ÈH\œ˜^O™XÌŒÌ‹Šˆ™XÌŒÌŠŒŒ
+K™XÌŒÌŠKŒŒ
+K™XÌŒÌŠŒKŒ
+Kˆ™XÌŒÌŠŒKŒ
+K™XÌŒÌŠKŒŒ
+K™XÌŒÌŠKŒKŒ
+JNÂ‚œÝXÝœÓÝ]]ÂˆZ[[ŠÜÚ][ÛŠHÜÚ][ÛŽˆ™XÍŒÌ‹ˆØØ][ÛŠ
+H^ÛÛÜ™ˆ™XÌŒÌ‹ˆØØ][ÛŠJH[š[X][Û”›ÙÜ™\ÜÎˆŒÌ‹ŸNÂ‚™\^™›ˆœ×ÛXZ[ŠZ[[Š™\^Ú[™^
+H™\^[™^ˆLÌŠHOˆœÓÝ]]ÂˆËÈHÓÓ™XYÈH‹Y[žHÜÚ][ÛˆX›HÚ]
+™\^ÚY	ˆÊNÈ[™XÙ\È‹MÂˆËÈ\™H[™Yš[™Y\™H
+Hš]™\ˆÛ[\ÊKˆÛ[\^XÚ]H[ˆÑÔÓ‚ˆ][™^HZ[Š™\^[™^	ˆÝK]JNÂˆ]œ˜[YT›ÙÜ™\ÜÈHŒÌŠ™\^[™^ˆÝJHÈLŒÂˆ]Y[™ÈH™XÌŒÌŠÜš]P[š[X][Û’[™›Ë•TY[™ËÜš]P[š[X][Û’[™›Ë•”Y[™ÊNÂˆ]]ˆHS’SPUWÔÔÒUSÓ”ÖÚ[™^NÂˆ]\™XÝ[ÛˆH]ˆ
+ˆ™XÌŒÌŠ‹Œ
+HH™XÌŒÌŠKŒKŒ
+NÂˆ˜\ˆÝ]]ˆœÓÝ]]Âˆ˜\ˆ]\ÔÜÚ][ÛˆHÜš]P[š[X][Û’[™›Ë”›Ú™XÝ[Û“X]š^
+ˆÜš]P[š[X][Û’[™›Ë”Üš]SX]š^
+ˆ™XÍŒÌŠ]‹ŒKŒ
+NÂˆËÈ[Ú˜[™ÉÜÈ]\È›Ú™XÝ[Ûˆ\È]]Ü™Y›ÜˆHÜ[‘Óœ˜[YXY™™\‚ˆËÈÛÛ™[[Û‹Ú[HÙX‘ÔIÜÈ™[™\‹]\™Ù]H\™XÝ[Ûˆ\È[™\YˆÚ]Ý]ˆËÈ\ÈÛÜœ™XÝ[Û‹ÙÚXØ[]\È›ÝÈ[™È]H›ÝÛNˆÕRHÜš]\ÂˆËÈXÚÙY[È›ÝÜÈ‹NNH\X\ˆ[ˆ\ÚXØ[›ÝÜÈK‹ŒLŒËÛÈ]™\žHÚYÙ]ˆËÈØ[\\È[ˆ[œ™[]YÜš]HÜˆ˜[œÜ\™[˜ÞH]]È^XÝYU‹‚ˆ]\ÔÜÚ][Û‹žHHX]\ÔÜÚ][Û‹žNÂˆÝ]]œÜÚ][ÛˆH]\ÔÜÚ][ÛŽÂˆÝ]]^ÛÛÜ™H]ˆ
+ÈY[™È
+ˆ\™XÝ[ÛŽÂˆÝ]]™[š[X][Û”›ÙÜ™\ÜÈHœ˜[YT›ÙÜ™\ÜÎÂˆ™]\›ˆÝ]]ÂŸXÂˆËÈÛÈœ˜YÛY[˜\šX[ÈÚ\™HH™\^ÝYÙNˆ[š[X]WÜÜš]WØ›]ˆËÈ
+ÛÜHÛ™HÜš]Hœ˜[YJH[™[š[X]WÜÜš]WÚ[\œÛ]H
+›[™Ý\œ™[ˆËÈ
+È™^œ˜[YHžHH\‹]™\^›ÙÜ™\ÜÊK‚ˆÛÛœÝ[\œÛ]HHÚ[\œÛ]KË\Ý
+
+ÜXË™œ˜YÛY[ÚY\ˆˆŠH
+Èˆˆ
+ÈÜXË›X™[
+NÂˆÛÛœÝÜ™\™YØ[\\“ØÜÈH×NÂˆÜ›Ý\Ë™›Ü‘XXÚ
+
+ÊHOˆËœØ[\\œË™›Ü‘XXÚ
+
+ÊHOˆÂˆÛÛœÝØÈHØ[\\“X\™Ù]
+ÊNÂˆYˆ
+ØÊHÜ™\™YØ[\\“ØÜËœ\Ú
+Û˜[YNˆË‹‹›ØßJNÂˆJJNÂˆÛÛœÝØÓÙˆH
+˜[YKÜ™\ŠHOˆØ[\\“X\™Ù]
+˜[YJHÜ™\™YØ[\\“ØÜÖÛÜ™\—HÙÎˆŽˆNÂˆÛÛœÝœÒ[œ]HÝXÝœÒ[œ]ÂˆZ[[ŠÜÚ][ÛŠHÜÚ][ÛŽˆ™XÍŒÌ‹ˆØØ][ÛŠ
+H^ÛÛÜ™ˆ™XÌŒÌ‹ˆØØ][ÛŠJH[š[X][Û”›ÙÜ™\ÜÎˆŒÌ‹ŸNØÂˆYˆ
+[\œÛ]JHÂˆÛÛœÝÝ\ˆHØÓÙŠÝ\œ™[Üš]H‹
+NÂˆÛÛœÝžHØÓÙŠ“™^Üš]H‹JNÂˆœÈH	ÙœÒ[œ]B‚Ü›Ý\
+	ØÝ\‹™ßJHš[™[™Ê	ØÝ\‹˜ŸJH˜\ˆÝ\œ™[Üš]WÜÎˆØ[\\ŽÂÜ›Ý\
+	ØÝ\‹™ßJHš[™[™Ê	ØÝ\‹˜ˆ
+È_JH˜\ˆÝ\œ™[Üš]Nˆ^\™WÌ™ŒÌŽÂÜ›Ý\
+	Ûž™ßJHš[™[™Ê	Ûž˜ŸJH˜\ˆ™^Üš]WÜÎˆØ[\\ŽÂÜ›Ý\
+	Ûž™ßJHš[™[™Ê	Ûž˜ˆ
+È_JH˜\ˆ™^Üš]Nˆ^\™WÌ™ŒÌŽÂ‚œ˜YÛY[™›ˆœ×ÛXZ[Š[œ]ˆœÒ[œ]
+HOˆØØ][ÛŠ
+H™XÍŒÌˆÂˆ]Z\HŒÌŠÜš]P[š[X][Û’[™›Ë“Z\X\]™[
+NÂˆ]Ý\œ™[ÛÛÜˆH^\™TØ[\S]™[
+Ý\œ™[Üš]KÝ\œ™[Üš]WÜË[œ]^ÛÛÜ™Z\
+NÂˆ]™^ÛÛÜˆH^\™TØ[\S]™[
+™^Üš]K™^Üš]WÜË[œ]^ÛÛÜ™Z\
+NÂˆ™]\›ˆZ^
+Ý\œ™[ÛÛÜ‹™^ÛÛÜ‹™XÍŒÌŠ[œ]™[š[X][Û”›ÙÜ™\ÜÊJNÂŸXÂˆH[ÙHÂˆÛÛœÝÜˆHØÓÙŠ”Üš]H‹
+NÂˆœÈH	ÙœÒ[œ]B‚Ü›Ý\
+	ÜÜ‹™ßJHš[™[™Ê	ÜÜ‹˜ŸJH˜\ˆÜš]WÜÎˆØ[\\ŽÂÜ›Ý\
+	ÜÜ‹™ßJHš[™[™Ê	ÜÜ‹˜ˆ
+È_JH˜\ˆÜš]Nˆ^\™WÌ™ŒÌŽÂ‚œ˜YÛY[™›ˆœ×ÛXZ[Š[œ]ˆœÒ[œ]
+HOˆØØ][ÛŠ
+H™XÍŒÌˆÂˆ™]\›ˆ^\™TØ[\S]™[
+Üš]KÜš]WÜË[œ]^ÛÛÜ™ŒÌŠÜš]P[š[X][Û’[™›Ë“Z\X\]™[
+JNÂŸXÂˆBˆBˆËÈ\ÜÙ]ËÛZ[™XÜ˜YÜÚY\œËØÛÜ™KÜ™[™\\WÙ[™ÜÜ[žÝœÚœÚK‚ˆËÈHÜ[›ØÚÈ[]H[™]™[ØY[™ÔØÜ™Y[‹”™X\ÛÛ‹‘S‘ÔÔ•SÚ\™BˆËÈ\È^XÝ˜[š[H\[[™Kˆ]ÈÔÒUSÓ‹[Û›H™\^›Ü›X]\È™Z]\‚ˆËÈUˆ›ÜˆÛÛÜ‹ÛÈHÙ[™\šXÈÚY\ˆ˜[˜XÚÈ™]\›™YÛÛÜ“[Ù[]Ü‚ˆËÈ
+Ü\]YHÚ]JH]™[ˆÝYÚ›Ý[Ú˜[™È^\™\ÈÙ\™H›Ý[™[™\ØYY‚ˆËÈÙY\Z[™XÜ˜Y	ÜÈ›Ú™XÝY[š[X]YMKÌM‹[^Y\ˆÚY\ˆÙ[X[XÜÈ\™NÂˆËÈÛ›HHÛÝ\˜ÙH[™ÝXYÙHÚ[™Ù\Èœ›ÛHÓÓÈÑÔÓ‚ˆÛÛœÝ\Ñ[™Ü[H˜[Z[HOOHœ™[™\\WÙ[™ÜÜ[ŽÂˆYˆ
+\Ñ[™Ü[
+HÂˆÛÛœÝÜ[^[Ý]HÛÛ\[U™\^^[Ý]
+ÜXË™\^›Ü›X]ÖÌJNÂˆÛÛœÝÜÚ][Û]šX]HHÜ[^[Ý]˜žS˜[YK™Ù]
+”ÜÚ][ÛˆŠNÂˆYˆ
+\ÜÚ][Û]šX]JH›ÝÈ™]È\œ›ÜŠœ™[™\\WÙ[™ÜÜ[™YYÈÜÚ][ÛˆŠNÂˆÛÛœÝÜ[ÜÚ][ÛˆHÜÚ][Û]šX]KœÜ]ÂˆÈ™XÌÏŒÌŠ[œ]‰ÜÜÚ][Û]šX]KšS˜[Y_K[œ]‰ÜÜÚ][Û]šX]K›Ó˜[Y_JXˆˆ[œ]‰ÜÜÚ][Û]šX]K›˜[Y_Kž^˜ÂˆÛÛœÝØ[\\ŒHØ[\\“X\™Ù]
+”Ø[\\ŒŠNÂˆÛÛœÝØ[\\ŒHHØ[\\“X\™Ù]
+”Ø[\\ŒHŠNÂˆYˆ
+\Ø[\\Œ\Ø[\\ŒJHÂˆ›ÝÈ™]È\œ›ÜŠœ™[™\\WÙ[™ÜÜ[™YYÈØ[\\Œ[™Ø[\\ŒHŠNÂˆBˆÛÛœÝÜ[^Y\œÈHX]›X^
+KX]›Z[ŠM‹ˆ[X™\‹œ\œÙR[
+Ýš[™Ê
+ÜXË™Yš[™\È×JBˆ™š[™
+
+˜[YJHOˆÝš[™Ê˜[YJKœÝ\ÕÚ]
+”Ô•SÓVQT”ÏHŠJHLMHŠBˆœÜ]
+HŠVÌWKL
+HMJJNÂˆœÈHÝXÝœÒ[œ]Â‰ÜÜ[^[Ý]š[œ]Y[X™\œßBŸNÂ‚œÝXÝœÓÝ]]ÂˆZ[[ŠÜÚ][ÛŠHÜÚ][ÛŽˆ™XÍŒÌ‹ˆØØ][ÛŠ
+H^›ÚŒˆ™XÍŒÌ‹ˆØØ][ÛŠJHÜ\šXØ[™\^\Ý[˜ÙNˆŒÌ‹ˆØØ][ÛŠŠHÞ[[™šXØ[™\^\Ý[˜ÙNˆŒÌ‹ŸNÂ‚™\^™›ˆœ×ÛXZ[Š[œ]ˆœÒ[œ]
+HOˆœÓÝ]]Âˆ][Ù[ÜÚ][ÛˆH	ÜÜ[ÜÚ][ÛŸNÂˆ]Û\ÜÚ][ÛˆH›Ú™XÝ[Û‹”›Ú“X]
+ˆ[˜[ZXÕ˜[œÙ›Ü›\Ë“[Ù[šY]ÓX]ˆ
+ˆ™XÍŒÌŠ[Ù[ÜÚ][Û‹KŒ
+NÂˆ˜\ˆ›Ú™XÝYHÛ\ÜÚ][Ûˆ
+ˆNÂˆ›Ú™XÝYžH›Ú™XÝYž
+ÈÛ\ÜÚ][Û‹ÎÂˆ›Ú™XÝYžHH›Ú™XÝYžH
+ÈÛ\ÜÚ][Û‹ÎÂˆ›Ú™XÝYžˆHÛ\ÜÚ][Û‹žŽÂˆ›Ú™XÝYÈHÛ\ÜÚ][Û‹ÎÂˆ˜\ˆÝ]]ˆœÓÝ]]ÂˆÝ]]œÜÚ][ÛˆHÛ\ÜÚ][ÛŽÂˆÝ]]^›ÚŒH›Ú™XÝYÂˆÝ]]œÜ\šXØ[™\^\Ý[˜ÙHH[™Ý
+[Ù[ÜÚ][ÛŠNÂˆÝ]]˜Þ[[™šXØ[™\^\Ý[˜ÙHHX^
+[™Ý
+[Ù[ÜÚ][Û‹žŠKXœÊ[Ù[ÜÚ][Û‹žJJNÂˆ™]\›ˆÝ]]ÂŸXÂˆœÈHÛÛœÝÔ•SÐÓÓÔ”ÈH\œ˜^O™XÌÏŒÌ‹MŠˆ™XÌÏŒÌŠŒŒŒËŒNÎNKŒLLN
+Kˆ™XÌÏŒÌŠŒLNL‹ŒMNLŒMJKˆ™XÌÏŒÌŠŒÍŒÍ‹ŒLMŽKŒLÌŠKˆ™XÌÏŒÌŠŒMŒLNËŒLMÎ
+Kˆ™XÌÏŒÌŠŒLKŒLMÍŽM‹ŒMÌNJKˆ™XÌÏŒÌŠŒŒÍÍŒKŒŽMKŒLŒÍŠKˆ™XÌÏŒÌŠŒMËŒLLNNMŒMŒÎ
+Kˆ™XÌÏŒÌŠŒMÍKŒMMLŒŒLL
+Kˆ™XÌÏŒÌŠŒLŒML‹ŒLÌLMŒNMLNLJKˆ™XÌÏŒÌŠŒMÍÌŒKŒLLNŒNÌŒŽJKˆ™XÌÏŒÌŠŒLÌÍLM‹ŒLÎÎŒMNŠKˆ™XÌÏŒÌŠŒÌ‹ŒÌÌÌ‹ŒŒÍMÎLŠKˆ™XÌÏŒÌŠŒNMÍ‹ŒMŽNKŒŒMŽMŠKˆ™XÌÏŒÌŠŒÌŽKŒÌMLÌÎŒÌŒNMÌ
+Kˆ™XÌÏŒÌŠŒŒÍKŒÎLLŒÌŒŠKˆ™XÌÏŒÌŠŒMMKŒÌMŒKŒMLJJNÂ‚˜ÛÛœÝÔ•SÔÐÐSWÕS”ÓUHHX]ŒÌŠˆKŒŒŒKˆŒKŒŒKˆŒŒKŒŒˆŒŒŒKŒ
+NÂ‚Ü›Ý\
+	ÜØ[\\Œ™ßJHš[™[™Ê	ÜØ[\\Œ˜ŸJH˜\ˆØ[\\ŒÜÎˆØ[\\ŽÂÜ›Ý\
+	ÜØ[\\Œ™ßJHš[™[™Ê	ÜØ[\\Œ˜ˆ
+È_JH˜\ˆØ[\\Œˆ^\™WÌ™ŒÌŽÂÜ›Ý\
+	ÜØ[\\ŒK™ßJHš[™[™Ê	ÜØ[\\ŒK˜ŸJH˜\ˆØ[\\ŒWÜÎˆØ[\\ŽÂÜ›Ý\
+	ÜØ[\\ŒK™ßJHš[™[™Ê	ÜØ[\\ŒK˜ˆ
+È_JH˜\ˆØ[\\ŒNˆ^\™WÌ™ŒÌŽÂ‚œÝXÝœÒ[œ]ÂˆZ[[ŠÜÚ][ÛŠHÜÚ][ÛŽˆ™XÍŒÌ‹ˆØØ][ÛŠ
+H^›ÚŒˆ™XÍŒÌ‹ˆØØ][ÛŠJHÜ\šXØ[™\^\Ý[˜ÙNˆŒÌ‹ˆØØ][ÛŠŠHÞ[[™šXØ[™\^\Ý[˜ÙNˆŒÌ‹ŸNÂ‚™›ˆ[™Ü[^Y\Š^Y\ŽˆŒÌŠHOˆX]ŒÌˆÂˆ]˜[œÛ]YHH
+‹Œ
+È^Y\ˆÈKJH
+ˆ
+ÛØ˜[Ë‘Ø[YU[YH
+ˆKJNÂˆ]˜[œÛ][ÛˆHX]ŒÌŠˆKŒŒŒMËŒÈ^Y\‹ˆŒKŒŒ˜[œÛ]YKˆŒŒKŒŒˆŒŒŒKŒ
+NÂˆ][™ÛHH˜YX[œÊ
+^Y\ˆ
+ˆ^Y\ˆ
+ˆÌŒKŒ
+È^Y\ˆ
+ˆKŒ
+H
+ˆ‹Œ
+NÂˆ]›Ý][ÛˆHX]žŒÌŠÛÜÊ[™ÛJK\Ú[Š[™ÛJKÚ[Š[™ÛJKÛÜÊ[™ÛJJNÂˆ]ØØ[U˜[YHH
+HH^Y\ˆÈŒ
+H
+ˆ‹ŒÂˆ]ØØ[HHX]žŒÌŠØØ[U˜[YKŒŒØØ[U˜[YJNÂˆ]ØØ[Y›Ý][ÛˆHØØ[H
+ˆ›Ý][ÛŽÂˆ]^Y\•˜[œÙ›Ü›HHX]ŒÌŠˆØØ[Y›Ý][Û–ÌKžØØ[Y›Ý][Û–ÌKžKŒŒˆØØ[Y›Ý][Û–ÌWKžØØ[Y›Ý][Û–ÌWKžKŒŒˆŒŒKŒŒˆŒŒŒKŒ
+NÂˆ™]\›ˆ^Y\•˜[œÙ›Ü›H
+ˆ˜[œÛ][Ûˆ
+ˆÔ•SÔÐÐSWÕS”ÓUNÂŸB‚™›ˆ›Ú™XÝY]ŠÜÚ][ÛŽˆ™XÍŒÌŠHOˆ™XÌŒÌˆÂˆ™]\›ˆÜÚ][Û‹žHÈX^
+XœÊÜÚ][Û‹ÊKŒJH
+ˆÚYÛŠÜÚ][Û‹ÊNÂŸB‚™›ˆ[™X\‘›ÙÕ˜[YJ\Ý[˜ÙNˆŒÌ‹Ý\ˆŒÌ‹[™ˆŒÌŠHOˆŒÌˆÂˆ™]\›ˆÛ[\
+
+\Ý[˜ÙHHÝ\
+HÈX^
+[™HÝ\ŒJKŒKŒ
+NÂŸB‚œ˜YÛY[™›ˆœ×ÛXZ[Š[œ]ˆœÒ[œ]
+HOˆØØ][ÛŠ
+H™XÍŒÌˆÂˆ˜\ˆÛÛÜˆH^\™TØ[\JØ[\\ŒØ[\\ŒÜË›Ú™XÝY]Š[œ]^›ÚŒ
+JKœ™Ø‚ˆ
+ˆÔ•SÐÓÓÔ”ÖÌNÂˆ›Üˆ
+˜\ˆHHÈH	ÜÜ[^Y\œßNÈHHH
+ÈJHÂˆ]›Ú™XÝYH[œ]^›ÚŒ
+ˆ[™Ü[^Y\ŠŒÌŠH
+ÈJJNÂˆÛÛÜˆHÛÛÜˆ
+È^\™TØ[\JØ[\\ŒKØ[\\ŒWÜË›Ú™XÝY]Š›Ú™XÝY
+JKœ™Ø‚ˆ
+ˆÔ•SÐÓÓÔ”ÖÚWNÂˆBˆ][š\›Û›Y[[›ÙÈH[™X\‘›ÙÕ˜[YJ[œ]œÜ\šXØ[™\^\Ý[˜ÙKˆ›ÙË‘›ÙÑ[š\›Û›Y[[Ý\›ÙË‘›ÙÑ[š\›Û›Y[[[™
+NÂˆ]™[™\‘›ÙÈH[™X\‘›ÙÕ˜[YJ[œ]˜Þ[[™šXØ[™\^\Ý[˜ÙKˆ›ÙË‘›ÙÔ™[™\‘\Ý[˜ÙTÝ\›ÙË‘›ÙÔ™[™\‘\Ý[˜ÙQ[™
+NÂˆ]›ÙÕ˜[YHHX^
+[š\›Û›Y[[›ÙË™[™\‘›ÙÊNÂˆ]›ÙÐÛÛÜˆH™XÌÏŒÌŠ›ÙË‘›ÙÐÛÛÜ”‹›ÙË‘›ÙÐÛÛÜ‘Ë›ÙË‘›ÙÐÛÛÜŠNÂˆ™]\›ˆ™XÍŒÌŠZ^
+ÛÛÜ‹›ÙÐÛÛÜ‹›ÙÕ˜[YH
+ˆ›ÙË‘›ÙÐÛÛÜJKKŒ
+NÂŸXÂˆBˆËÈÛÜ™KÜ™[™\\WØÛÝYËžÝœÚœÚKˆÛÝYÈ]™H›È™\^Y™™\Žˆ[Ú˜[™ÂˆËÈ^[™ÈÛ™H]XY\ˆ™YHÛÝY˜XÙ\È[YÙ\œÈ\Ú[™ÈÛÕ™\^QˆHÛˆËÈ›ËZ[œ]˜[˜XÚÈZ\ÝÛÚÈ]›ÜˆH[ØÜ™Y[ˆ›][™Z[YBˆËÈ[\™HÛÜ›Ü\]YHÚ]K‚ˆÛÛœÝ\ÐÛÝYÈH˜[Z[HOOHœ™[™\\WØÛÝYÈŽÂˆYˆ
+\ÐÛÝYÊHÂˆœÈHÛÛœÝÓÕQÕ‘T•PÑTÈH\œ˜^O™XÌÏŒÌ‹Šˆ™XÌÏŒÌŠKŒŒŒ
+K™XÌÏŒÌŠKŒŒKŒ
+K™XÌÏŒÌŠŒŒKŒ
+K™XÌÏŒÌŠŒŒŒ
+Kˆ™XÌÏŒÌŠŒKŒŒ
+K™XÌÏŒÌŠŒKŒKŒ
+K™XÌÏŒÌŠKŒKŒKŒ
+K™XÌÏŒÌŠKŒKŒŒ
+Kˆ™XÌÏŒÌŠŒŒŒ
+K™XÌÏŒÌŠŒKŒŒ
+K™XÌÏŒÌŠKŒKŒŒ
+K™XÌÏŒÌŠKŒŒŒ
+Kˆ™XÌÏŒÌŠKŒŒKŒ
+K™XÌÏŒÌŠKŒKŒKŒ
+K™XÌÏŒÌŠŒKŒKŒ
+K™XÌÏŒÌŠŒŒKŒ
+Kˆ™XÌÏŒÌŠŒŒKŒ
+K™XÌÏŒÌŠŒKŒKŒ
+K™XÌÏŒÌŠŒKŒŒ
+K™XÌÏŒÌŠŒŒŒ
+Kˆ™XÌÏŒÌŠKŒŒŒ
+K™XÌÏŒÌŠKŒKŒŒ
+K™XÌÏŒÌŠKŒKŒKŒ
+K™XÌÏŒÌŠKŒŒKŒ
+JNÂ˜ÛÛœÝÓÕQÑPÑWÔÒQHH\œ˜^OŒÌ‹ŠËKŒŽŽŽKŽJNÂ‚‹ËÈÛÝY˜XÙ\È\È[ˆŽÔÒS•^[Y™™\‹ˆÙX‘ÔHØ[››Ýš[™H›Ü›X]YY™™\‚‹ËÈšY]ËÛÈ]È\ÚXØ[
+›Ý\‹Xž]HYY
+Hž]\È\œš]™H\ÈXÚÙYLÌˆÝÜ˜YÙB‹ËÈÛÜ™ËˆÙ[XÝ[™ÚYÛ‹Y^[™HØ[YHž]H^[™]ÚÛÝ[]™H™]\›™Y‚™›ˆÛÝY˜XÙP]
+[™^ˆLÌŠHOˆLÌˆÂˆ]ž]R[™^HLÌŠ[™^
+NÂˆ]ÛÜ™HÛÝY˜XÙ\ÖØž]R[™^ˆWNÂˆ]˜]ÈH
+ÛÜ™ˆ
+
+ž]R[™^	ˆÝJH
+ˆJJH	ˆM]NÂˆ™]\›ˆÙ[XÝ
+LÌŠ˜]ÊKLÌŠ˜]ÊHHM‹˜]ÈHLŽJNÂŸB‚œÝXÝœÓÝ]]ÂˆZ[[ŠÜÚ][ÛŠHÜÚ][ÛŽˆ™XÍŒÌ‹ˆØØ][ÛŠ
+H™\^\Ý[˜ÙNˆŒÌ‹ˆØØ][ÛŠJH™\^ÛÛÜŽˆ™XÍŒÌ‹ŸNÂ‚™\^™›ˆœ×ÛXZ[ŠZ[[Š™\^Ú[™^
+H™\^[™^ˆLÌŠHOˆœÓÝ]]Âˆ]]XY™\^HLÌŠ™\^[™^	HJNÂˆ]˜XÙR[™^HLÌŠ™\^[™^ÈJH
+ˆÎÂˆ˜\ˆÙ[HÛÝY˜XÙP]
+˜XÙR[™^
+NÂˆ˜\ˆÙ[ˆHÛÝY˜XÙP]
+˜XÙR[™^
+ÈJNÂˆ]›YÜÈHÛÝY˜XÙP]
+˜XÙR[™^
+ÈŠNÂˆ]\™XÝ[ÛˆH›YÜÈ	ˆÎÂˆ][œÚYHH
+›YÜÈ	ˆMŠHOHMŽÂˆ]\ÙUÜÛÛÜˆH
+›YÜÈ	ˆÌŠHOHÌŽÂˆÙ[H
+Ù[JH
+
+›YÜÈ	ˆLŽ
+HˆÊNÂˆÙ[ˆH
+Ù[ˆJH
+
+›YÜÈ	ˆ
+HˆŠNÂˆ]ØØ[™\^HÙ[XÝ
+]XY™\^ÈH]XY™\^[œÚYJNÂˆ]˜XÙU™\^HÓÕQÕ‘T•PÑTÖÙ\™XÝ[Ûˆ
+ˆ
+ÈØØ[™\^NÂˆ]Ù[Ú^™HH™XÌÏŒÌŠÛÝY[™›ËÙ[Ú^™VÛÝY[™›ËÙ[Ú^™VKÛÝY[™›ËÙ[Ú^™VŠNÂˆ]ÛÝYÙ™œÙ]H™XÌÏŒÌŠˆÛÝY[™›ËÛÝYÙ™œÙ]ÛÝY[™›ËÛÝYÙ™œÙ]KÛÝY[™›ËÛÝYÙ™œÙ]ŠNÂˆ]ÜÈH˜XÙU™\^
+ˆÙ[Ú^™H
+È™XÌÏŒÌŠŒÌŠÙ[
+KŒŒÌŠÙ[ŠJH
+ˆÙ[Ú^™H
+ÈÛÝYÙ™œÙ]Âˆ]ÚYHHÙ[XÝ
+ÓÕQÑPÑWÔÒQVÙ\™XÝ[Û—KÓÕQÑPÑWÔÒQVÌWK\ÙUÜÛÛÜŠNÂˆ]ÛÝYÛÛÜˆH™XÍŒÌŠˆÛÝY[™›ËÛÝYÛÛÜ”‹ÛÝY[™›ËÛÝYÛÛÜ‘ËÛÝY[™›ËÛÝYÛÛÜ‹ÛÝY[™›ËÛÝYÛÛÜJNÂˆ˜\ˆÝ]]ˆœÓÝ]]ÂˆÝ]]œÜÚ][ÛˆH›Ú™XÝ[Û‹”›Ú“X]
+ˆ[˜[ZXÕ˜[œÙ›Ü›\Ë“[Ù[šY]ÓX]
+ˆ™XÍŒÌŠÜËKŒ
+NÂˆÝ]]™\^\Ý[˜ÙHH[™Ý
+ÜÊNÂˆÝ]]™\^ÛÛÜˆH™XÍŒÌŠ™XÌÏŒÌŠÚYJKKŒ
+H
+ˆÛÝYÛÛÜŽÂˆ™]\›ˆÝ]]ÂŸXÂˆœÈHÝXÝœÒ[œ]ÂˆZ[[ŠÜÚ][ÛŠHÜÚ][ÛŽˆ™XÍŒÌ‹ˆØØ][ÛŠ
+H™\^\Ý[˜ÙNˆŒÌ‹ˆØØ][ÛŠJH™\^ÛÛÜŽˆ™XÍŒÌ‹ŸNÂ‚œ˜YÛY[™›ˆœ×ÛXZ[Š[œ]ˆœÒ[œ]
+HOˆØØ][ÛŠ
+H™XÍŒÌˆÂˆ]›ÙÕ˜[YHHÛ[\
+[œ]™\^\Ý[˜ÙHÈX^
+›ÙË‘›ÙÐÛÝYÑ[™ŒJKŒKŒ
+NÂˆ™]\›ˆ™XÍŒÌŠ[œ]™\^ÛÛÜ‹œ™Ø‹[œ]™\^ÛÛÜ‹˜H
+ˆ
+KŒH›ÙÕ˜[YJJNÂŸXÂˆBˆËÈ\ÜÙ]ËÛZ[™XÜ˜YÜÚY\œËÜÜÝÝ˜[œÜ\™[˜ÞK™œÚˆ[\›Ý™Y˜[œÜ\™[˜ÞBˆËÈ™[™\œÈHXZ[ˆØÙ[™H\Èš]™H™[][\YY˜[œÛXÙ[^Y\œÈ[ÂˆËÈÙ\\˜]HÛÛÜ‹Ù\\™Ù]ËÛÜÈ[HžH\\ˆ^[[™›[™ÂˆËÈ[H˜XÚË]ËYœ›ÛˆHÛÙ[™\šXÈ›Ë]™\^˜[˜XÚÈØ[\YÛ›HBˆËÈš\œÝÛÛÜˆ\™Ù][™XÛ\™Y]™\žH\šY]È\È[ˆÜ™[˜\žH›Ø]ˆËÈ^\™NÈÙX‘ÔH™Z™XÝY]š[™Ü›Ý\[™XZ[ˆ™[XZ[™Y›XÚË‚ˆÛÛœÝ\Õ˜[œÜ\™[˜ÞTÜÝHÊÎ—ŸÊ\ÜÝÝ˜[œÜ\™[˜ÞIÚK\Ý
+ˆÝš[™ÊÜXË™œ˜YÛY[ÚY\ˆˆŠKœ™\XÙJ×›Z[™XÜ˜Y‹ËˆŠBˆ
+NÂˆYˆ
+\Õ˜[œÜ\™[˜ÞTÜÝ
+HÂˆÛÛœÝØ[\\“˜[Y\ÈHË‹‹œØ[\\“X\šÙ^\Ê
+WNÂˆÛÛœÝš[™Ø[\\ˆH
+Ý[K\
+HOˆØ[\\“˜[Y\Ë™š[™
+
+˜[YJHOˆÂˆÛÛœÝ›Ü›X[^™YHÝš[™Ê˜[YJKœ™\XÙJÔØ[\\‰ÚKˆŠNÂˆ™]\›ˆ›Ü›X[^™YÓÝÙ\Ø\ÙJ
+BˆOOH	ÜÝ[_IÙ\È‘\ˆˆˆŸXÓÝÙ\Ø\ÙJ
+NÂˆJNÂˆÛÛœÝ^Y\œÈHÈ“XZ[ˆ‹•˜[œÛXÙ[‹’][Q[]H‹”\XÛ\È‹•ÙX]\ˆ‹ÛÝYÈ—Bˆ›X\
+
+Ý[JHOˆ
+ÂˆÝ[KˆÛÛÜŽˆš[™Ø[\\ŠÝ[K˜[ÙJKˆ\ˆš[™Ø[\\ŠÝ[KYJKˆJJNÂˆYˆ
+^Y\œË™]™\žJ
+^Y\ŠHOˆ^Y\‹˜ÛÛÜˆ	‰ˆ^Y\‹™\
+JHÂˆÛÛœÝXÛÈH^Y\œË™›]X\
+
+^Y\ŠHOˆÛ^Y\‹˜ÛÛÜ‹^Y\‹™\JBˆ›X\
+
+˜[YJHOˆÂˆÛÛœÝØÈHØ[\\“X\™Ù]
+˜[YJNÂˆÛÛœÝ^\™U\HH\Ñ\Ø[\\“˜[YJ˜[YJBˆÈ^\™WÙ\Ì™ˆˆ^\™WÌ™ŒÌˆŽÂˆ™]\›ˆÜ›Ý\
+	ÛØË™ßJHš[™[™Ê	ÛØË˜ˆ
+È_JH˜\ˆ	ÜØ[š]^™S˜[YJ˜[YJ_Nˆ	Ý^\™U\_NØÂˆJKš›Ú[Š—ˆŠNÂˆÛÛœÝØYH
+˜[YJHOˆÂˆÛÛœÝˆHØ[š]^™S˜[YJ˜[YJNÂˆ™]\›ˆ^\™SØY
+	ÛŸKÛ[\
+™XÌLÌŠ[œ]œÜÚ][Û‹žJK™XÌLÌŠ
+K™XÌLÌŠ^\™Q[Y[œÚ[ÛœÊ	ÛŸK
+JHH™XÌLÌŠJJK
+XÂˆNÂˆÛÛœÝÛÛÜ’[š]X[^™\œÈH^Y\œË›X\
+
+^Y\‹[™^
+HO‚ˆÛÛÜœÖÉÚ[™^WHH	ÛØY
+^Y\‹˜ÛÛÜŠ_NØ
+Kš›Ú[Š—ˆŠNÂˆÛÛœÝ\[š]X[^™\œÈH^Y\œË›X\
+
+^Y\‹[™^
+HO‚ˆ\ÖÉÚ[™^WHH	ÛØY
+^Y\‹™\
+_NØ
+Kš›Ú[Š—ˆŠNÂˆœÈHÝXÝœÓÝ]]ÂˆZ[[ŠÜÚ][ÛŠHÜÚ][ÛŽˆ™XÍŒÌ‹ŸNÂ‚™\^™›ˆœ×ÛXZ[ŠZ[[Š™\^Ú[™^
+H™\^[™^ˆLÌŠHOˆœÓÝ]]Âˆ]]ˆH™XÌŒÌŠŒÌŠ
+™\^[™^]JH	ˆJKŒÌŠ™\^[™^	ˆJJNÂˆ˜\ˆÝ]]ˆœÓÝ]]ÂˆÝ]]œÜÚ][ÛˆH™XÍŒÌŠ]ˆ
+ˆ™XÌŒÌŠ‹Œ‹Œ
+H
+È™XÌŒÌŠLKŒLKŒ
+KŒKŒ
+NÂˆ™]\›ˆÝ]]ÂŸXÂˆœÈH	ÙXÛßB‚œÝXÝœÒ[œ]ÂˆZ[[ŠÜÚ][ÛŠHÜÚ][ÛŽˆ™XÍŒÌ‹ŸNÂ‚œ˜YÛY[™›ˆœ×ÛXZ[Š[œ]ˆœÒ[œ]
+HOˆØØ][ÛŠ
+H™XÍŒÌˆÂˆ˜\ˆÛÛÜœÎˆ\œ˜^O™XÍŒÌ‹ŽÂˆ˜\ˆ\Îˆ\œ˜^OŒÌ‹ŽÂ‰ØÛÛÜ’[š]X[^™\œßB‰Ù\[š]X[^™\œßBˆËÈ˜[œÜ\™[ÛX\œÈ]™H[H™\›Ëˆ]ÜÙH[šY\È™Z[™HXÝ]™BˆËÈÌWH\˜[™ÙHÛÈ^HØ[››Ý\ÜXÙHHÜ\]YHXZ[ˆ˜\ÙK‚ˆ›Üˆ
+˜\ˆHHNÈHŽÈHHH
+ÈJHÂˆYˆ
+ÛÛÜœÖÚWK˜HOHŒ
+HÂˆ\ÖÚWHH‹ŒÂˆBˆBˆ›Üˆ
+˜\ˆHHNÈHŽÈHHH
+ÈJHÂˆ˜\ˆˆHNÂˆÛÜÂˆYˆ
+ˆH\ÖÚ—HH\ÖÚˆHWJHÈœ™XZÎÈBˆ]\ÝØ\H\ÖÚˆHWNÂˆ\ÖÚˆHWHH\ÖÚ—NÂˆ\ÖÚ—HH\ÝØ\Âˆ]ÛÛÜ”ÝØ\HÛÛÜœÖÚˆHWNÂˆÛÛÜœÖÚˆHWHHÛÛÜœÖÚ—NÂˆÛÛÜœÖÚ—HHÛÛÜ”ÝØ\ÂˆˆHˆHNÂˆBˆBˆ˜\ˆXØÝ[][]YH™XÌÏŒÌŠŒ
+NÂˆ›Üˆ
+˜\ˆHHÈHŽÈHHH
+ÈJHÂˆXØÝ[][]YHXØÝ[][]Y
+ˆ
+KŒHÛÛÜœÖÚWK˜JH
+ÈÛÛÜœÖÚWKœ™ØŽÂˆBˆ™]\›ˆ™XÍŒÌŠXØÝ[][]YKŒ
+NÂŸXÂˆBˆBˆËÈ[ØÜ™Y[‹X›]Ú\Nˆ^XÚ]ØÜ™Y[œ]XY˜[Z[KÜˆ[žH\[[™HÚ]ˆËÈ›È™\^[œ]
+[š[X]WÜÜš]WØ›]Ú[\œÛ]KYÚX\
+NˆÞ[\Ú^™BˆËÈH[ØÜ™Y[ˆšX[™ÛHœ›ÛH™\^Ú[™^[™Ø[\HHš\œÝØ[\\‹‚ˆÛÛœÝ\Ð›]HZ\Ð[š[X]TÜš]H	‰ˆZ\Ñ[™Ü[	‰ˆZ\ÐÛÝYÈ	‰ˆZ\Õ˜[œÜ\™[˜ÞTÜÝˆ	‰ˆ
+˜[Z[HOOHœØÜ™Y[œ]XYˆ\ÜXË™\^›Ü›X]È\ÜXË™\^›Ü›X]Ë›[™Ý
+NÂˆYˆ
+\Ð›]
+HÂˆœÈH™\^™›ˆœ×ÛXZ[ŠZ[[Š™\^Ú[™^
+H™\^[™^ˆLÌŠHOˆœÓÝ]]Âˆ˜\ˆ]ˆH™XÌŒÌŠŒÌŠ
+™\^[™^]JH	ˆJKŒÌŠ™\^[™^	ˆJJNÂˆ˜\ˆÝ]]ˆœÓÝ]]ÂˆÝ]]œÜÚ][ÛˆH™XÍŒÌŠ]ˆ
+ˆ™XÌŒÌŠ‹Œ‹Œ
+H
+È™XÌŒÌŠLKŒLKŒ
+KŒKŒ
+NÂˆ™]\›ˆÝ]]ÂŸBœÝXÝœÓÝ]]ÂˆZ[[ŠÜÚ][ÛŠHÜÚ][ÛŽˆ™XÍŒÌ‹ŸNØÂˆÛÛœÝØ[\\‘Ü›Ý\HÜ›Ý\Ë™š[™[™^
+
+ÊHOˆËœØ[\\œË›[™Ýˆ
+NÂˆYˆ
+Ø[\\‘Ü›Ý\
+HÂˆËÈ›È^\™H[œ]
+ÛÝYÈ™XYH^[Y™™\ŽÈYÚX\ÛÛ\]\ÂˆËÈ›ØÙY\˜[JNˆ[Z]H˜[YÛÛœÝ[XÛÛÜˆœ˜YÛY[ÛÈH\[[™BˆËÈÛÛ\[\È8 %›Û™HÙˆ\ÙH˜]ÈÛˆH]HØÜ™Y[‹‚ˆœÈHÝXÝœÒ[œ]ÂˆZ[[ŠÜÚ][ÛŠHÜÚ][ÛŽˆ™XÍŒÌ‹ŸNÂ‚œ˜YÛY[™›ˆœ×ÛXZ[Š[œ]ˆœÒ[œ]
+HOˆØØ][ÛŠ
+H™XÍŒÌˆÂˆ™]\›ˆ™XÍŒÌŠKŒKŒKŒKŒ
+NÂŸXÂˆH[ÙHÂˆÛÛœÝÈHÜ›Ý\ÖÜØ[\\‘Ü›Ý\NÂˆÛÛœÝ›]˜[YHHØ[š]^™S˜[YJËœØ[\\œÖÌJNÂˆËÈ\ÙHH‘SPTQ
+Ü›Ý\š[™[™ÊHœ›ÛHØ[\\“X\8 %“ÕH˜]ÈÜ›Ý\ˆËÈ[™^ÈË[šY›Ü›\Ë›[™ÝˆÚ[ˆÜ›Ý\È\™H›ÛY[ÈHËLHY\™ÙYˆËÈÜ›Ý\
+\È]šXÙHØ\ÈX^š[™Ü›Ý\È]H›\ˆÜÝXÚZ[ˆ\ÂˆËÈ[Ü™JKH˜]Èš[™[™ÈÛÛY\ÈÚ]H[šY›Ü›IÜÈš[™[™È[ˆHY\™ÙYˆËÈ^[Ý]
+˜š[™[™È[™^
+
+HØ\ÈÜXÚYšYYžHH™]š[Ý\È[žHŠH[™BˆËÈÚÛH›\ˆ\[[™H8 %[™\ÈH]K\ØÜ™Y[ˆ™[™\ˆ8 %˜Z[Ë‚ˆÛÛœÝÛØÈHØ[\\“X\™Ù]
+ËœØ[\\œÖÌJHÈÎˆØ[\\‘Ü›Ý\ŽˆË[šY›Ü›\Ë›[™ÝNÂˆœÈHÝXÝœÒ[œ]ÂˆZ[[ŠÜÚ][ÛŠHÜÚ][ÛŽˆ™XÍŒÌ‹ŸNÂ‚Ü›Ý\
+	ÜÛØË™ßJHš[™[™Ê	ÜÛØË˜ŸJH˜\ˆ	Ø›]˜[Y_WÜÎˆØ[\\ŽÂÜ›Ý\
+	ÜÛØË™ßJHš[™[™Ê	ÜÛØË˜ˆ
+È_JH˜\ˆ	Ø›]˜[Y_Nˆ^\™WÌ™ŒÌŽÂ‚œ˜YÛY[™›ˆœ×ÛXZ[Š[œ]ˆœÒ[œ]
+HOˆØØ][ÛŠ
+H™XÍŒÌˆÂˆ]Ú^™HH^\™Q[Y[œÚ[ÛœÊ	Ø›]˜[Y_K
+NÂˆ]]ˆH
+[œ]œÜÚ][Û‹žH
+È™XÌŒÌŠKJJHÈ™XÌŒÌŠŒÌŠÚ^™Kž
+KŒÌŠÚ^™KžJJNÂˆ™]\›ˆ^\™TØ[\J	Ø›]˜[Y_K	Ø›]˜[Y_WÜË]ŠNÂŸXÂˆBˆH[ÙHYˆ
+Z\Ð[š[X]TÜš]H	‰ˆZ\Ñ[™Ü[	‰ˆZ\ÐÛÝYÈ	‰ˆZ\Õ˜[œÜ\™[˜ÞTÜÝ
+HÂˆËÈ
+\Ð[š[X]TÜš]H[™XYH\ÜÚYÛ™YœËÙœÈX›Ý™NÈ˜[[™È[ÈZ[œÂˆËÈ\™HÛÝ[ÛØ˜™\ˆ[HÚ][Ú[˜ÙH[š[X]WÜÜš]H\È›È™\^ˆËÈ›Ü›X][™Z[œÈ™]\›œÈ[Ûˆ[ˆ[\H›Ü›X]Oˆ\[[™K\ÚÚ\YŠBˆœÈHZ[œÊ˜[Z[KÜXËÜ›Ý\ËÜ›Ý\™[X\
+NÂˆœÈHZ[œÊ˜[Z[KÜXËÜ›Ý\ËÜ›Ý\™[X\Ø[\\“X\
+NÂˆBˆYˆ
+]œÈYœÊHÈÜÜØÛÜJ
+NÈ™]\›ˆ[ÈB‚ˆÛÛœÝÙÜÛÛÙHH	Ý[šY›Ü›QXÛW‰ÝœßW‰ÙœßW˜ÂˆYˆ
+Ý\œ˜Z[‹Ë\Ý
+ÜXË›X™[ˆŠHÝ\œ˜Z[‹Ë\Ý
+˜[Z[JBˆ×Š›ØÚß\XÛ_][_[]_™[™\\WØÛÝYß™[™\\WÙ[™ÜÜ[
+IË\Ý
+˜[Z[JJHÂˆ
+ÛØ˜[\Ë›XÕÙX‘ÜK—ÝÙÜÛHßJVÜÜXË›X™[˜[Z[WHHÙÜÛÛÙNÂˆBˆÛÛœÝ[Ù[HH]šXÙK˜Ü™X]TÚY\“[Ù[JÂˆX™[ˆZ[™XÜ˜Y‰Ù˜[Z[_XˆÛÙNˆÙÜÛÛÙBˆJNÂˆËÈÝ\™˜XÙHÚY\ˆÛÛ\[H\œ›ÜœÈ
+H™X[QÔHš]™\ˆX^H™Z™XÝÑÔÓ]ˆËÈXY\ÜÈÝÚYÚY\ˆXØÙ\ÊKˆÙÙÙYÛ˜ÙH\ˆ˜[Z[HÈ]›ÚYÜ[K‚ˆYˆ
+[Ù[K™Ù]ÛÛ\[][Û’[™›È	‰ˆXZ[\[[™K—ÛÙÙÙYÛÛ\[JHZ[\[[™K—ÛÙÙÙYÛÛ\[HH™]ÈÙ]
+
+NÂˆYˆ
+[Ù[K™Ù]ÛÛ\[][Û’[™›È	‰ˆXZ[\[[™K—ÛÙÙÙYÛÛ\[Kš\Ê˜[Z[JJHÂˆ[Ù[K™Ù]ÛÛ\[][Û’[™›Ê
+K[Š
+[™›ÊHOˆÂˆÛÛœÝ\œœÈH
+[™›ÏË›Y\ÜØYÙ\È×JK™š[\Š
+JHOˆK\HOOH™\œ›ÜˆŠNÂˆYˆ
+\œœË›[™Ý
+HÂˆZ[\[[™K—ÛÙÙÙYÛÛ\[K˜Y
+˜[Z[JNÂˆÛÛœÛÛK™\œ›ÜŠÕÑÔÓÛÛ\[H\œ›Ü—H	ÜÜXË›X™[H
+˜[Z[OIÙ˜[Z[_JN˜ˆ\œœË›X\
+
+JHOˆ	ÛK›Y\ÜØYÙ_H	ÛK›[™S[_N‰ÛK›[™TÜßX
+Kš›Ú[ŠˆŠKˆ—‹KKUÑÔÓKKWˆˆ
+ÈÙÜÛÛÙJNÂˆBˆJK˜Ø]Ú
+
+
+HOˆßJNÂˆB‚ˆËÈÛ™H^[Ý]\ˆ
+›Y\™ÙY
+ˆÜ›Ý\ˆÚ[ˆÜ›Ý\ÈÙ\™H›ÛYXXÚY\™ÙYˆËÈ^[Ý]YÙÜ™YØ]\ÈH[šY\ÈÙˆ[ÜšYÚ[˜[Ü›Ý\È]X\È]]ˆËÈZ\ˆ™[X\Yš[™[™ÜÈ
+X]Ú[™ÈHÑÔÓ
+ÈHÜÝš[™Ø[ÊK‚ˆÛÛœÝš[™Ü›Ý\^[Ý]ÈH×NÂˆ›Üˆ
+]™ÈHÈ™ÈÜ›Ý\ÛÝ[È™ÊÊÊHÂˆÛÛœÝ[šY\ÈH×NÂˆÜ›Ý\Ë™›Ü‘XXÚ
+
+Ü›Ý\ÚJHOˆÂˆÛÛœÝˆHÜ›Ý\™[X\ÙÚWNÂˆYˆ
+‹›™ÈOOH™ÊH™]\›ŽÂˆÜ›Ý\[šY›Ü›\Ë™›Ü‘XXÚ
+
+[šY›Ü›Q\ØËZJHOˆÂˆ[šY\Ëœ\Ú
+Âˆš[™[™Îˆ‹˜˜\ÙUH
+ÈZKˆš\ÚXš[]NˆÔTÚY\”ÝYÙK•‘T•VÔTÚY\”ÝYÙK‘”QÓQS•ˆY™™\ŽˆÝ\Nˆ[šY›Ü›Q\ØË\HOOH•VSÐ•Q‘‘TˆˆÈœ™XY[Û›K\ÝÜ˜YÙHˆˆ[šY›Ü›HŸBˆJNÂˆJNÂˆÜ›Ý\œØ[\\œË™›Ü‘XXÚ
+
+Ø[\\“˜[YKÚJHOˆÂˆÛÛœÝ˜\ÙHHØ[\\˜\ÙJÚJH
+ÈÚH
+ˆŽÂˆ[šY\Ëœ\Ú
+Øš[™[™Îˆ˜\ÙKš\ÚXš[]NˆÔTÚY\”ÝYÙK‘”QÓQS•Ø[\\ŽˆÝ\Nˆ™š[\š[™ÈŸ_JNÂˆ[šY\Ëœ\Ú
+Øš[™[™Îˆ˜\ÙH
+ÈKš\ÚXš[]NˆÔTÚY\”ÝYÙK‘”QÓQS•ˆ^\™NˆÂˆØ[\U\Nˆ\Ñ\Ø[\\“˜[YJØ[\\“˜[YJHÈ™\ˆˆ™›Ø]‹ˆšY]Ñ[Y[œÚ[ÛŽˆ˜[Z[HOOHœ[›Ü˜[XHˆÈ˜ÝX™HˆˆŒ™‚ˆ_JNÂˆJNÂˆJNÂˆš[™Ü›Ý\^[Ý]Ëœ\Ú
+]šXÙK˜Ü™X]Pš[™Ü›Ý\^[Ý]
+ÛX™[ˆ	ÜÜXË›X™[N™Ü›Ý\	Û™ßX[šY\ßJJNÂˆB‚ˆÛÛœÝ›Ü›X]HÜXË™\^›Ü›X]ÖÌNÂˆËÈPQÎˆ\œ˜Z[ˆ™[™\œÈØ]\˜]YÚ]H
+MKMKMJK›Ý›ÙÐÛÛÜ‹ÛÈBˆËÈÚ[šÕš\ÚXš[]HZ^\Èš[™H[™Û™H][\Y\ˆ[‚ˆËÈ]\ÔØ[\H
+ˆÛÛÜˆ
+ˆØ[\WÛYÚX\
+Ø[\\Œ‹UŒŠBˆËÈ\ÈŒM^ÛÈ\™ÙKˆH[›Ü›NÛÛÝ\ˆXÛÙY\È˜]ÈZ[Ù\È^XÝBˆËÈ]ÛÈ™XÛÜ™HXÛ\™YœÈX\Y]šX]H›Ü›X]Ë‚ˆYˆ
+Ý\œ˜Z[Ÿ[]WÜÛÛYË\Ý
+ÜXË›X™[ˆŠJHÂˆ
+ÛØ˜[\Ë›XÕÙX‘ÜK—Ý™\^^[Ý]ÈHßJVÜÜXË›X™[HBˆÜXË™\^›Ü›X]Ë›X\
+
+™ŠHOˆ
+ÂˆÝšYNˆ™‹œÝšYKˆ[[Y[Îˆ
+™‹™[[Y[È×JK›X\
+
+JHOˆ
+Âˆ˜[YNˆK›˜[YKˆXÛ\™YˆK™›Ü›X]ˆX\Yˆ
+‘T•VÑÔWÑ“Ô“PUÖÙK™›Ü›X]HßJK™ÜHÏÈ•S“PTQ‹ˆÙ™œÙ]ˆK›Ù™œÙ]ˆJJBˆJJNÂˆBˆ]™\^H[™Yš[™YÂˆYˆ
+˜[Z[HOOHœØÜ™Y[œ]XYˆ	‰ˆ˜[Z[HOOH˜[š[X]WÜÜš]Hˆ	‰ˆ›Ü›X]
+HÂˆ™\^HÂˆ[Ù[Kˆ[žTÚ[ˆœ×ÛXZ[ˆ‹ˆY™™\œÎˆÜXË™\^›Ü›X]Ë›X\
+
+™ŠHOˆ
+Âˆ\œ˜^TÝšYNˆ™‹œÝšYKˆÝ\[ÙNˆ™‹œÝ\˜]HˆHÈš[œÝ[˜ÙHˆˆ™\^‹ˆ]šX]\ÎˆÛÛ\[U™\^^[Ý]
+™ŠK™ÜP]œÂˆJJBˆNÂˆB‚ˆÛÛœÝ\™Ù]ÈH×NÂˆÛÛœÝÛÛÜ•\™Ù]ÈHÜXË˜ÛÛÜ•\™Ù]È	‰ˆÜXË˜ÛÛÜ•\™Ù]Ë›[™ÝˆÈÜXË˜ÛÛÜ•\™Ù]ÂˆˆÛ[NÂˆ›Üˆ
+ÛÛœÝ\™Ù]ÙˆÛÛÜ•\™Ù]ÊHÂˆYˆ
+]\™Ù]
+HÂˆ\™Ù]Ëœ\Ú
+[™Yš[™Y
+NÂˆÛÛ[YNÂˆBˆÛÛœÝ[žHHÙ›Ü›X]ˆZ[™XÜ˜Y›Ü›X]
+\™Ù]™›Ü›X]
+_NÂˆYˆ
+\™Ù]Üš]SX\ÚÈOOH[™Yš[™Y	‰ˆ\™Ù]Üš]SX\ÚÈOOHMJHÂˆ[žKÜš]SX\ÚÈH\™Ù]Üš]SX\ÚÎÂˆBˆYˆ
+\™Ù]˜›[™
+HÂˆ[žK˜›[™HÂˆÛÛÜŽˆÂˆÜ˜Ñ˜XÝÜŽˆ“S‘ÑPÕÔ–Ý\™Ù]˜›[™˜ÛÛÜ”Ü˜×KˆÝ˜XÝÜŽˆ“S‘ÑPÕÔ–Ý\™Ù]˜›[™˜ÛÛÜ‘ÝKˆÜ\˜][ÛŽˆ“S‘ÓÔÝ\™Ù]˜›[™˜ÛÛÜ“ÜBˆKˆ[NˆÂˆÜ˜Ñ˜XÝÜŽˆ“S‘ÑPÕÔ–Ý\™Ù]˜›[™˜[TÜ˜×KˆÝ˜XÝÜŽˆ“S‘ÑPÕÔ–Ý\™Ù]˜›[™˜[QÝKˆÜ\˜][ÛŽˆ“S‘ÓÔÝ\™Ù]˜›[™˜[SÜBˆBˆNÂˆBˆYˆ
+Ù˜]ÐÙ[œÝ\È	‰ˆWØ›[™ÙÙÙYš\ÊÜXË›X™[
+JHÂˆØ›[™ÙÙÙY˜Y
+ÜXË›X™[
+NÂˆËÈHÛÛÝ\ˆÜš]HX\ÚÈÙˆÜˆH›[™]™\ÛÛ™\ÈÈšÙY\BˆËÈ\Ý[˜][Ûˆ‹XZÙ\ÈH˜]È[š\ÚX›HÚ[H]™\žHÝ\ˆÝ]HÛÚÜÂˆËÈÛÜœ™XÝHHØ[YHÞ[\ÛH\È™]™\ˆ˜]Ú[™È][‚ˆÛÛœÛÛK›ÙÊ–Ù˜]ËXÙ[œÝ\×H\™Ù]ˆ
+ÈÜXË›X™[ˆ
+ÈˆÜš]SX\ÚÏHˆ
+È
+\™Ù]Üš]SX\ÚÈOOH[™Yš[™YÈMHˆ\™Ù]Üš]SX\ÚÊBˆ
+Èˆ›[™Hˆ
+È
+[žK˜›[™ˆÈ[žK˜›[™˜ÛÛÜ‹œÜ˜Ñ˜XÝÜˆ
+È‹Èˆ
+È[žK˜›[™˜ÛÛÜ‹™Ý˜XÝÜ‚ˆ
+ÈˆNˆˆ
+È[žK˜›[™˜[KœÜ˜Ñ˜XÝÜˆ
+È‹Èˆ
+È[žK˜›[™˜[K™Ý˜XÝÜ‚ˆˆ››Û™HŠBˆ
+Èˆ›]Hˆ
+È[žK™›Ü›X]
+NÂˆBˆ\™Ù]Ëœ\Ú
+[žJNÂˆB‚ˆÛÛœÝ\ØÜš\ÜˆHÂˆX™[ˆÜXË›X™[ˆ^[Ý]ˆ]šXÙK˜Ü™X]T\[[™S^[Ý]
+ÂˆX™[ˆ	ÜÜXË›X™[N›^[Ý]ˆš[™Ü›Ý\^[Ý]ÂˆJKˆ™\^ˆ™\^Û[Ù[K[žTÚ[ˆœ×ÛXZ[ˆŸKˆœ˜YÛY[ˆÂˆ[Ù[Kˆ[žTÚ[ˆ™œ×ÛXZ[ˆ‹ˆ\™Ù]Îˆ\™Ù]Ë›X\
+
+
+HOˆÙ›Ü›X]ˆœ™Ø˜N[›Ü›HŸJBˆKˆš[Z]]™NˆÂˆÜÛÙÞNˆÔÓÑÖVÜÜXËÜÛÙÞWHšX[™ÛK[\Ý‹ˆËÈÜš]H›]È\™HÛËY[Y[œÚ[Û˜[ÛÜY\ËÛÈÝ[[™È\È›È\ÙY[ˆËÈY™™XÝ\™K‚ˆËÈÛXÝÙX—Û›ØÝ[LH\ØX›\È˜XÚÙ˜XÙHÝ[[™È]™\ž]Ú\™Kˆ\œ˜Z[ˆ\ÈBˆËÈÛ›H˜[Z[H]Ý[È[™HÛ›HÛ™H]™[™\œÈ›Ý[™ËÚ]ˆËÈ]™\žH[œ]
+™\XÙ\Ë[™XÙ\Ë[šY›Ü›\Ë˜[œÙ›Ü›K^\™\ÊBˆËÈ™\šYšYYÛÜœ™XÝ[™›È˜[Y][Ûˆ\œ›ÜœÈKHÛÈ™]™\œÙYÚ[™[™È\ÂˆËÈH™[XZ[š[™ÈØ[™Y]K[™\ÈÙ\\˜]\È][ˆÛ™H[‹‚ˆÝ[[ÙNˆ
+Ù›Ü˜ÙS›ÐÝ[˜[Z[HOOH˜[š[X]WÜÜš]HŠBˆÈ››Û™H‚ˆˆ
+ÜXË˜Ý[È˜˜XÚÈˆˆ››Û™HŠKˆœ›Û˜XÙNˆ˜ØÝÈ‚ˆBˆNÂˆYˆ
+ÜXË™\Ý[˜Ú[	‰ˆ\›Ü›X]OH[
+HÂˆ\ØÜš\Ü‹™\Ý[˜Ú[HÂˆËÈ\š]™Yœ›ÛHH™[™\ˆ\ÜÉÜÈ\]XÚY[
+ÙYHœÙ]\[[™BˆËÈ˜\šX[[™[™ÊNÈH™XÛÛ\[HY˜][\ÜÝ[Y\ÈHXZ[ˆ\™Ù]‚ˆËÂˆËÈH\›Ü›X]OH[ÝX\™X]\œÎˆÜ™X]T\[[™H[ÛÈZ[ÈBˆËÈ“ËY\˜\šX[
+\›Ü›X]OOH[
+HÙˆ]™\žH˜[Z[K[˜ÛY[™ÂˆËÈÜÙHÚÜÙHÜXÈÑTÈXÛ\™H\Ý]KˆÚ]Ý]HÝX\™]ˆËÈ˜\šX[[Z]Y›Ü›X]ˆ[[™ÙX‘ÔH™Z™XÝYH\[[™HÚ]ˆËÈ‘˜Z[YÈ™XYH	Ù›Ü›X]	È›Ü\Hœ›ÛH	ÑÔQ\Ý[˜Ú[Ý]IÈ‹ˆËÈÜÚ[™ÈH›ËY\˜\šX[›ÜˆÛÛYÝ\œ˜Z[ˆ[™Ý]Ý]Ý\œ˜Z[‹‚ˆËÈHÜXËYXÛ\™Y\Ý]HÚ[\HØ[››Ý\HÈH\ÜÈ]\ÂˆËÈ›È\]XÚY[ÛÈH˜\šX[]\Ý™H\[\ÜÈ[œÝXY‚ˆ›Ü›X]ˆ\›Ü›X]ˆ\Üš]Q[˜X›YˆÜXË™\Ý[˜Ú[Üš]Q\ˆËÈÛXÝÙX—ÙXYÏY\[Ø^\ÈOˆ\œ˜Z[ˆYÛ›Ü™\ÈH\\ÝˆÜ]ÂˆËÈH\Ý]H™Z™XÝÈ]™\žH\œ˜Z[ˆœ˜YÛY[ˆœ›ÛHHÙ[ÛY]žBˆËÈÜˆ]È[šY›Ü›\È\™HÜ›Û™ÈŽˆYˆ›ØÚÜÈ\X\ˆ[™\ˆ\È›YË\ˆËÈ\ÈH˜][ÈYˆHœ˜[YH\È[˜Ú[™ÙY\\È^Û™\˜]Y‚ˆ\ÛÛ\\™Nˆ
+Ù›Ü˜ÙQ\[Ø^\È	‰ˆÝ\œ˜Z[‹Ë\Ý
+ÜXË›X™[
+JBˆÈ˜[Ø^\È‚ˆˆ
+ÓÓTT‘WÓÔÜÜXË™\Ý[˜Ú[™\\ÝH›\ÜËY\]X[ŠKˆ\šX\ÎˆX]œ›Ý[™
+ÜXË™\Ý[˜Ú[˜šX\ÐÛÛœÝ[
+Kˆ\šX\ÔÛÜTØØ[NˆÜXË™\Ý[˜Ú[˜šX\ÔØØ[HˆNÂˆYˆ
+Ù˜]ÐÙ[œÝ\È	‰ˆWÙ\Ý]SÙÙÙYš\ÊÜXË›X™[
+JHÂˆÙ\Ý]SÙÙÙY˜Y
+ÜXË›X™[
+NÂˆÛÛœÛÛK›ÙÊ–Ù˜]ËXÙ[œÝ\×H\Ý]Hˆ
+ÈÜXË›X™[ˆ
+ÈˆÛÛ\\™OHˆ
+È\ØÜš\Ü‹™\Ý[˜Ú[™\ÛÛ\\™Bˆ
+ÈˆÜš]OHˆ
+È\ØÜš\Ü‹™\Ý[˜Ú[™\Üš]Q[˜X›Yˆ
+ÈˆXÛ\™YHˆ
+ÈÜXË™\Ý[˜Ú[™\\Ý
+NÂˆBˆH[ÙHYˆ
+\™\]Y\ÝY
+HÂˆËÈHÜXÈXÛ\™Y›È\Ý]K]H\ÜÈÙH\™H™Z[™ÈZ[›Ü‚ˆËÈTÈH\]XÚY[
+[›Ü˜[XKÜÚÞHS‘H[ØÜ™Y[ˆ›]È\™H[ˆËÈ˜]Ûˆ[ÈH\X™X\š[™ÈXZ[ˆ\ÜÈ]ÛÛYHÚ[
+KˆÙX‘ÔH™\]Z\™\ÂˆËÈH\[[™IÜÈ]XÚY[Ý]HÈX]ÚH\ÜÈ™YØ\™\ÜÈÙˆ˜[Z[KˆËÈÛÈÞ[\Ú^™HH\Ý]H]™]™\ˆ\Ý\˜œÈHY™™\‹ˆÝX\™YžBˆËÈ\™\]Y\ÝYÛÈH“ËY\˜\šX[
+\›Ü›X]OOH[
+HÝ^\ÂˆËÈ\[\ÜÈ8 %Ý\Ú\ÙHH\[[™HZ[›ÜˆH›ËY\\ÜÈÛÝ[]Ù[‚ˆËÈ˜Z[˜[Y][Û‹ˆÜ™X]T\[[™H™KXZ[È›Ý˜\šX[È[ÈžQ\‚ˆYˆ
+Ù˜]ÐÙ[œÝ\È	‰ˆWÙ\Ý]SÙÙÙYš\ÊÜXË›X™[
+JHÂˆÙ\Ý]SÙÙÙY˜Y
+ÜXË›X™[
+NÂˆÛÛœÛÛK›ÙÊ–Ù˜]ËXÙ[œÝ\×H\Ý]Hˆ
+ÈÜXË›X™[ˆ
+ÈˆÛÛ\\™OX[Ø^\ÈÜš]OY˜[ÙHXÛ\™YTÖS•TÒV‘QŠNÂˆBˆ\ØÜš\Ü‹™\Ý[˜Ú[HÂˆ›Ü›X]ˆ\›Ü›X]ˆ\Üš]Q[˜X›Yˆ˜[ÙKˆ\ÛÛ\\™Nˆ˜[Ø^\È‹ˆËÈ\šX\ÈUTÕ™H›Üˆ[™K[\ÝÜÛÙÚY\È
+™[™\\WÛ[™\ÊNÈÚ[˜ÙBˆËÈ\È\ÈHÞ[\Ú^™Y™]™\‹]Üš]KØ[Ø^\Ë\\ÜÈÝ]K™\›ÈšX\È\È[ÛÂˆËÈHÛÜœ™XÝ›Ë[Ü›Üˆ]™\žHÝ\ˆÜÛÙÞK‚ˆ\šX\Îˆˆ\šX\ÔÛÜTØØ[NˆˆNÂˆBˆËÈÙX‘ÔH›Ü˜šYÈ›Û‹^™\›È\šX\ÈÛˆ[™HÜÛÙÚY\È
+™\šX\È]\Ý™BˆËÈÚ[ˆ\Ú[™Èš[Z]]™UÜÛÙÞNŽ“[™S\ÝŠKˆ[Ú˜[™ÉÜÈ[™\È™[™\ˆ\BˆËÈÙ]ÈHšX\ËÚXÚÛÝ[˜Z[\[[™HÜ™X][Ûˆ
+[™H™XÛÛ\[HØ]JNÂˆËÈÛ[\]›Üˆ[žH[™HÜÛÙÞH™YØ\™\ÜÈÙˆÚ]\ˆH\Ý]HØ[YBˆËÈœ›ÛHHÜXÈÜˆØ\ÈÞ[\Ú^™YX›Ý™K‚ˆYˆ
+\ØÜš\Ü‹™\Ý[˜Ú[	‰ˆ×›[™KË\Ý
+ÔÓÑÖVÜÜXËÜÛÙÞWHˆŠJHÂˆ\ØÜš\Ü‹™\Ý[˜Ú[™\šX\ÈHÂˆ\ØÜš\Ü‹™\Ý[˜Ú[™\šX\ÔÛÜTØØ[HHÂˆBˆYˆ
+Û[™\ËË\Ý
+ÜXË›X™[
+H	‰ˆÑ‘ÊHÂˆÛÛœÛÛK›ÙÊ–Û[™\ËY™×HX™[H‹ÜXË›X™[œÜXËÜÛÙÞOH‹”ÓÓ‹œÝš[™ÚYžJÜXËÜÛÙÞJKˆ›X\YH‹ÔÓÑÖVÜÜXËÜÛÙÞWKšY\Ý[˜Ú[H‹H\ÜXË™\Ý[˜Ú[ˆ™\šX\ÏH‹\ØÜš\Ü‹™\Ý[˜Ú[	‰ˆ\ØÜš\Ü‹™\Ý[˜Ú[™\šX\ÊNÂˆB‚ˆYˆ
+\[Ùˆ]šXÙKœ\Ú\œ›Ü”ØÛÜHOOH™[˜Ý[ÛˆŠH]šXÙKœ\Ú\œ›Ü”ØÛÜJ˜[Y][ÛˆŠNÂˆÛÛœÝ\[[™HH]šXÙK˜Ü™X]T™[™\”\[[™J\ØÜš\ÜŠNÂˆYˆ
+\[Ùˆ]šXÙKœÜ\œ›Ü”ØÛÜHOOH™[˜Ý[ÛˆŠHÂˆ]šXÙKœÜ\œ›Ü”ØÛÜJ
+K[Š
+\œŠHOˆÂˆYˆ
+\œˆ	‰ˆJZ[\[[™K—ÛÙÙÙYÜ™X]H
+Z[\[[™K—ÛÙÙÙYÜ™X]HH™]ÈÙ]
+
+JJKš\ÊÜXË›X™[
+JHÂˆZ[\[[™K—ÛÙÙÙYÜ™X]K˜Y
+ÜXË›X™[
+NÂˆÛÛœÛÛK™\œ›ÜŠÜ\[[™HÜ™X]H\œ›Ü—H	ÜÜXË›X™[H
+˜[Z[OIÙ˜[Z[_JNˆ	Ù\œ‹›Y\ÜØYÙ_Xˆ—™\^›Ü›X]ÏHˆ
+È”ÓÓ‹œÝš[™ÚYžJ
+ÜXË™\^›Ü›X]È×JK›X\
+
+™ŠHOˆ™‹™[[Y[ÏË›X\
+
+JHOˆK›˜[YH
+ÈŽˆˆ
+ÈK™›Ü›X]
+JJKˆ—‹KKUÑÔÓKKWˆˆ
+ÈÙÜÛÛÙJNÂˆBˆJK˜Ø]Ú
+
+
+HOˆßJNÂˆBˆÜÜØÛÜJ
+NÂˆ™]\›ˆÜ\[[™KÜXË˜[Z[K\›Ü›X]Ü›Ý\™[X\Ü›Ý\ÛÝ[ˆØ[\\˜\Ù\ÎˆÜ›Ý\Ë›X\
+
+ËÚJHOˆØ[\\˜\ÙJÚJJ_NÂˆNÂ‚ˆËÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKBˆËÈ›Û‹Z[™^YÜÛÙÞHÝÙ\š[™È
+UPQÈÈ’PS‘ÓWÑSŠNˆÞ[\Ú^™H[™^ˆËÈY™™\œÈÛˆ[X[™[ˆ˜]Ò[™^Y‚ˆËÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKB‚ˆÛÛœÝÝÙ\š[™Ò[™^Y™™\œÈH™]ÈX\
+
+NÂˆÛÛœÝÝÙ\™Y[™XÙ\ÈH
+ÜÛÙÞK™\^ÛÝ[
+HOˆÂˆÛÛœÝÙ^HH	ÝÜÛÙÞ_N‰Ý™\^ÛÝ[XÂˆ][žHHÝÙ\š[™Ò[™^Y™™\œË™Ù]
+Ù^JNÂˆYˆ
+[žJH™]\›ˆ[žNÂˆ][™XÙ\ÎÂˆYˆ
+ÜÛÙÞHOOH”UPQÈŠHÂˆÛÛœÝ]XYÈHX]™›ÛÜŠ™\^ÛÝ[È
+NÂˆ[™XÙ\ÈH™]ÈZ[Ì\œ˜^J]XYÈ
+ˆŠNÂˆ›Üˆ
+]HHÈH]XYÎÈJÊÊHÂˆÛÛœÝ˜\ÙHHH
+ˆÂˆÛÛœÝÝ]HH
+ˆŽÂˆ[™XÙ\ÖÛÝ]HH˜\ÙNÂˆ[™XÙ\ÖÛÝ]
+ÈWHH˜\ÙH
+ÈNÂˆ[™XÙ\ÖÛÝ]
+È—HH˜\ÙH
+ÈŽÂˆ[™XÙ\ÖÛÝ]
+È×HH˜\ÙNÂˆ[™XÙ\ÖÛÝ]
+ÈHH˜\ÙH
+ÈŽÂˆ[™XÙ\ÖÛÝ]
+ÈWHH˜\ÙH
+ÈÎÂˆBˆH[ÙHYˆ
+ÜÛÙÞHOOH•’PS‘ÓWÑSˆŠHÂˆÛÛœÝšX[™Û\ÈHX]›X^
+™\^ÛÝ[HŠNÂˆ[™XÙ\ÈH™]ÈZ[Ì\œ˜^JšX[™Û\È
+ˆÊNÂˆ›Üˆ
+]HHÈHšX[™Û\ÎÈJÊÊHÂˆ[™XÙ\ÖÚH
+ˆ×HHÂˆ[™XÙ\ÖÚH
+ˆÈ
+ÈWHHH
+ÈNÂˆ[™XÙ\ÖÚH
+ˆÈ
+È—HHH
+ÈŽÂˆBˆH[ÙHÂˆ™]\›ˆ[ÂˆBˆÛÛœÝY™™\ˆH]šXÙK˜Ü™X]PY™™\ŠÂˆX™[ˆÝÙ\™Y	ÝÜÛÙÞ_H	Ý™\^ÛÝ[XˆÚ^™NˆX]›X^
+[™XÙ\Ë˜ž]S[™Ý
+Kˆ\ØYÙNˆÔPY™™\•\ØYÙK’S‘VÔPY™™\•\ØYÙKÓÔWÑÕˆJNÂˆ]šXÙKœ]Y]YKÜš]PY™™\ŠY™™\‹[™XÙ\ÊNÂˆ[žHHØY™™\‹ÛÝ[ˆ[™XÙ\Ë›[™ÝNÂˆÝÙ\š[™Ò[™^Y™™\œËœÙ]
+Ù^K[žJNÂˆ™]\›ˆ[žNÂˆNÂ‚ˆËÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKBˆËÈÜÝ\ÚYH™\Ù[ÛÛ\ÜÚ]Nˆ[Ú˜[™ÉÜÈ‹Œˆ™\Ù[\ˆ™[™\œÈHØÙ[™HÂˆËÈ[ˆÙ™œØÜ™Y[ˆXZ[ˆ\™Ù]]™]™\ˆ›]È]ÈHÝØ\XÚZ[ˆØ[˜\È
+]ÂˆËÈ›]œ›ÛU^\™KØÛÜU^\™H]\È›Ý^\˜Ú\ÙY\™JKÛÈHØ[˜\ÂˆËÈÛÝ[Ý^H[\KˆÙH˜XÚÈH\ÝØÙ[™HÛÛÜˆ\™Ù][™Ú[ˆH™[™\‚ˆËÈ\ÜÈ\ÈÜ[™YYØZ[œÝHØ[˜\Ë˜]È]^\™H[È]Ú]BˆËÈYXØ]Y[ØÜ™Y[‹]šX[™ÛH›]\[[™K‚ˆ]ÛÛ\ÜÚ]TÛÝ\˜ÙHH[Âˆ]ØÛÛ\ÜÚ]SÙÐ]HÂˆ]Û\Ý™\Ù[]HÂˆ]Ü™\Ù[[\]HÂˆ]Ü™\Ù[^]]HÂˆ]Ü™\Ù[ÛÝ[HÂˆ]Üœ™ÓˆHÈËÈ›Ý[™YœÙ]\[[™HXYÈ˜XÙHÛÝ[\ˆ
+[Ù[HØÛÜJBˆËÈPQÎˆ^\™\ÈXÝX[HØ[\Y
+›Ý[™[ÈHš[™Ü›Ý\
+H\Èœ˜[YK[™ˆËÈH\Ý]]ËÙ›Ü˜ÙY^\™K\™XY˜XÚÈÛ˜\ÚÝ
+ÙYHXÕÙX‘ÜK—Ý^XYÊK‚ˆ]ÜØ[\Y\Ñœ˜[YHH™]ÈÙ]
+
+NÂˆ]Û\Ýœ˜[YTØ[\YH™]ÈÙ]
+
+NÈËÈPQÎˆØ[\YÙ]ÙˆH[ÜÝ™XÙ[œ˜[YBˆÛÛœÝÜØ[\Y[šY\ÈH™]ÈÙ]
+
+NÈËÈPQÎˆ]™\žH^\™H[žH]™\ˆ›Ý[™›ÜˆØ[\[™Âˆ]Ý^XYÔÛ˜\ÚÝH[Âˆ]Ý^XYÑÛ™HH˜[ÙNÂˆ]Ý^XYÓ]QÛ™HH˜[ÙNÈËÈPQÎˆ]HY™][YK]\ØY[\š\™YÛ˜ÙBˆ]Ø[š[Q™ÑÛ™HH˜[ÙNÈËÈPQÎˆÛ™K\ÚÝ[š[X]WÜÜš]HP“È[\ˆ]Ý^˜]Ñ™ÓˆHÈËÈPQÎˆÛÝ[Ùˆ^\™YÕRH˜]È[\È[Z]Y
+Ø\
+BˆËÈPQÎˆš[™ÈY™™\ˆÙˆHPÕPSXÛÙY™\^Ú[™^ž]\È›ÜˆHš\œÝ™]ÂˆËÈ^\™YÕRH˜]ÜËˆHÛ\ˆÛX^X™U^˜]ÑXYÈ™XYÈ“ÈÙ™œÙ]
+›ÝBˆËÈ˜]ÚY˜]ÉÜÈ˜\ÙU™\^
+H[™™]™\ˆÝÜ™YH[™^XY™™\ˆ[™KÛÈ]ˆËÈÛÝ[›ÝÚÝÈÚH]\Ë\Ø[\YÕRH]XYÈØØ]\ˆÚ[HHÝ[™[Û™HÙÛÂˆËÈ
+Ø[YH˜[Z[JH™[™\œÈÛÜœ™XÝKˆ\ÈØ\\™\Ë\ˆ˜]ËHXÛÙYˆËÈÜÚ][Û‹ÕUŒÐÛÛÜˆ]˜\ÙU™\^
+Ú[™^H[™^˜[Y\ËH˜]È\˜[\ËˆËÈ[™H[˜[ZXÕ˜[œÙ›Ü›\È›ØÚÈ
+[˜Ûˆ^\™SX]
+K[ˆ[\ÈÛ˜ÙK‚ˆÛÛœÝÙÝZQ˜]Ôš[™ÈH×NÂˆËÈ][H[Ù[È\™H™[™\™Y[ÈHYXØ]YÙ™œØÜ™Y[ˆ]\ÈÚ]BˆËÈ›ØÚËÚ][KÙ[]H\[[™\ËÛÈHX\›HÕRK[Û›Hš[™ÈX›Ý™H™]™\ˆÙY\ÂˆËÈH˜]ÜÈ]Ü[]HZ\ÜÚ[™È[™[ÜžHXÛÛœËˆÙY\HÙ\\˜]H›Ý[™YˆËÈ˜XÙHÚ]H^XÝÛÝ˜[œÙ›Ü›H[™ØÚ\ÜÛÜˆ\ÙY›ÜˆXXÚ]\È˜]Ë‚ˆÛÛœÝÚ][P]\Ñ˜]Ôš[™ÈH×NÂˆËÈPQÎˆ]KYœ˜[YH^˜]ÜÈ\™H›Ü›X[H™XXÚYY\ˆHX\›HÕRHš[™ÂˆËÈ\Èš[YÚ]H[Ú˜[™ÈÜ\ÚÛÙÛËˆÙY\[H[ˆHÙ\\˜]H›Ý[™YˆËÈš[™ÈÛÈ›ÛXYÙÚ[™ÈØ[ˆ›Ý™HÚ]\ˆÛ\]XYÈ[™HÛ\^\™BˆËÈXÝX[H™XXÚHÜÝ‚ˆÛÛœÝÙ›Û˜]Ôš[™ÈH×NÂˆÛÛœÝÙ›Û\ÜÔÝ]ÈH™]ÈX\
+
+NÂˆ]ÙÝZTš[™Ñ[\YH˜[ÙNÂˆËÈPQÎˆ[›Ü˜[XHÝX™KYš[
+È˜]È›Ø™H
+ÛÛœÛÛY]YÚ[™ÛK[[™H[\]œ˜[YHŠK‚ˆÛÛœÝÜ[›Ô›Ø™HHÈÜ™X]Yˆ×K\ØYÎˆ×K\P™YÚ[Žˆ×K\SÚÎˆ×K\TÚÚ\ˆ×K\Q˜Z[ˆ×KÙ]ˆNÂˆ]Ü[›Ñ[\YH˜[ÙNÂˆËÈPQÎˆÛØ˜[\ØY\ÝÜžHžHX™[ØÛÝ[ž]\×K[™HÜ™X][Ûˆ™YÚ\ÝžBˆËÈ
+]™\žH^\™H[œÝ[˜ÙJKÛÈÙHØ[ˆÜÝHX™[]ÐTÈ\ØYY]ÚÜÙBˆËÈØ[\Y[œÝ[˜ÙHØ\Û‰Ý
+Ý[KÙ\XØ]H[™JK‚ˆÛÛœÝÝ\ØYžSX™[H™]ÈX\
+
+NÂˆÛÛœÝÜ™XÙ[Ü™X]YH×NÂˆËÈ™\˜›ÜÙH\‹Yœ˜[YKÜ\[[™HXYÛ›ÜÝXÜÎÈÙ™ˆžHY˜][
+Ù]ÛXÝÙX—ÙXYÊK‚ˆÛÛœÝÑ‘ÈH
+\[ÙˆØØ][ÛˆOOH[™Yš[™YŠH	‰ˆ™]ÈT“ÙX\˜Ú\˜[\ÊØØ][Û‹œÙX\˜Ú
+Kš\Ê›XÝÙX—ÙXYÈŠNÂˆ]ÛÛ\ÜÚ]T\[[™HH[Âˆ]ÛÛ\ÜÚ]T\[[™RHÂˆ]ÛÛ\ÜÚ]TØ[\\ˆH[ÂˆËÈ™YÚ[ÛˆÛX\œÈØ[››Ý\ÙH]XÚY[ØYÜXÛX\ŽˆÙX‘ÔH\Y\È]ÂˆËÈH[\™HÝXœ™\ÛÝ\˜ÙK™YØ\™\ÜÈÙˆ™[™\ˆ\™XHÜˆØÚ\ÜÛÜ‹ˆZ[™XÜ˜Y	ÜÂˆËÈÕRH][HØXÚHÛX\œÈÛ™H]\È[H™Y›Ü™H˜]Ú[™ÈXXÚ][KÛÈ\›š[™ÂˆËÈÜÙH[È[ÛX\œÈ\˜\ÙY]™\žH™]š[Ý\ÛH™[™\™Y[™[ÜžHXÛÛ‹‚ˆËÈØXÚH[žH˜]ËX˜\ÙYÛX\ˆ\[[™\ÈžH]XÚY[›Ü›X]È
+È˜[Y\Ë‚ˆÛÛœÝ™YÚ[ÛÛX\”\[[™\ÈH™]ÈX\
+
+NÂˆËÈ[[^H™\ÛÝ\˜Ù\È\ÙYÈš[š[™YÜ›Ý\ÛÝÈÚÜÙH™X[™\ÛÝ\˜ÙH\Û‰ÝˆËÈ›Ý[™Y]ÛÈHÜ›Ý\\ÈSÐVTÈÛÛ\]H[™Ù]š[™Ü›Ý\™]™\ˆÙ]ÂˆËÈÚÚ\Y
+ÚÚ\[™È]X]™\ÈHÜ›Ý\[˜›Ý[™8¡¤ˆ“›Èš[™Ü›Ý\]Ü›Ý\ˆËÈ[™^ˆˆ˜[Y][Ûˆ8¡¤ˆ[Ú˜[™ÉÜÈ˜]˜H›ÝÜÈ8¡¤ˆHœ˜[YH[\Y\ÊK‚ˆ][[^U[šY›Ü›HH[[[^TÝÜ˜YÙHH[[[^TØ[\\ˆH[Âˆ][[^U^šY]ÈH[[[^Q\šY]ÈH[ÂˆËÈ™[˜ÙKX˜\ÙYY™\œ™YÔK\™\ÛÝ\˜ÙH\ÝXÝ[Û‹ˆ[Ú˜[™È[]\ÈH[šY›Ü›KÂˆËÈ™\^Y™™\ˆ
+K™ËˆÜš]P[š[X][Û’[™›ÊHÚ[HHÛÛ[X[™Y™™\ˆ]ˆËÈ™Y™\™[˜Ù\È]\ÈÝ[[ˆ›YÚÈ˜]]™HÓ™]Z[œÈHY™™\ˆ[[HÔBˆËÈ\ÈÛ™K]ÙX‘ÔH™Z™XÝÈHÝX›Z]
+\ÙY[ˆÝX›Z]Ú[H\Ý›ÞYYŠH[™ˆËÈHœ˜[YHX›ÜËÚ[[™ÈH[\ˆÛÈÛˆ\Ý›ÞHÙHÛ›H›ÜH]™BˆËÈ™YÚ\ÝžH[žH[™\šÈHÔHØš™XÝ[ˆH[™[™È\ÝÈY\ˆXXÚÝX›Z]ˆËÈÙHÛ˜\ÚÝ]\Ý[™Û][[]Y]YK›Û”ÝX›Z]YÛÜšÑÛ™J
+H™\ÛÛ™\ÂˆËÈ
+H]™\žHÝX›Z]\ÜÝYY\È]Ú[\ÈÛÛ\]YÛˆHÔJKÚXÚ\ÂˆËÈH^XÝ[ÛY[›È[‹Y›YÚÛÛ[X[™Y™™\ˆØ[ˆ™Y™\™[˜ÙH]ˆHœ˜[YKXÛÝ[ˆËÈÜ˜XÙH\ÈÛÈœ˜YÚ[H™XØ]\ÙHHY™™\ˆ\Ý›ÞYYQ•TˆHÝX›Z]\ÈÝ[[‚ˆËÈ›YÚ›Üˆ]ÝX›Z]‚ˆÛÛœÝÙY™\œ™Y\Ý›ÞHHÛØ˜[\Ë›XÕÙX•^\™SY™][YK˜Ü™X]QY™\œ™Y\Ý›ÞT]Y]YJÂˆÙ]]Y]YNˆ
+
+HOˆ]šXÙOËœ]Y]YHÏÈ[ˆ˜[˜XÚÐ˜]Ú\ÎˆˆJNÂˆÛÛœÝY™\‘\Ý›ÞPY™™\ˆHÙY™\œ™Y\Ý›ÞK™Y™\‘\Ý›ÞPY™™\ŽÂˆÛÛœÝY™\‘\Ý›ÞU^\™HHÙY™\œ™Y\Ý›ÞK™Y™\‘\Ý›ÞU^\™NÂˆÛÛœÝ›\ÚÜ˜]™^X\™HÙY™\œ™Y\Ý›ÞK™›\ÚÂˆÛÛœÝÝ^\™SY™][YHHÛØ˜[\Ë›XÕÙX•^\™SY™][YK˜Ü™X]U^\™SY™][YJÂˆY™\‘\Ý›ÞU^\™Kˆ™XÙ[Ø[Îˆ
+
+HOˆÜ™XÙ[Ø[ËˆœÐ˜]Úˆ
+
+HOˆÛØ˜[\Ë›XÕÙX‘ÜOË—ÜœÓ\Ý˜]ÚÏÈ[ˆJNÂˆ]XYÐÚXÚÙ\ˆH[ÂˆËÈ\‹]\™Ù]˜]ÈXØÛÝ[[™ÈÈY[YžHH™X[ØÙ[™H\™Ù]žH]K‚ˆ]^Ù\HHÂˆÛÛœÝ^[™[ÜžHH×NÂˆ]œ˜[YQ˜]ÜÈH™]ÈX\
+
+NÈËÈYOˆ˜]ÈØ[È\Èœ˜[YBˆ]\Ýœ˜[YQ˜]ÜÈH™]ÈX\
+
+NÂˆ]˜]ÔÙ\HHÈËÈ[Û›ÝÛšXÈ\‹\\ÜÈ˜]Ë[Ü™\ˆÝ[\ˆ]œ˜[YQ˜]ÔÙ\HH™]ÈX\
+
+NÈËÈYOˆ\Ý˜]ÔÙ\H]™]È[È]\Èœ˜[YBˆ]\Ýœ˜[YQ˜]ÔÙ\HH™]ÈX\
+
+NÂˆËÈXœÛÛ]H\ÝY˜]Ûˆ\™Ù]\Èœ˜[YH
+[˜ÛˆHØ[˜\ËÝYLJHÛÈÙHØ[‚ˆËÈ[“[Ú˜[™È™]ÈHš[˜[[XYÙHÈHØ[˜\Èˆ
+Ü\Ú8¡äˆÛ‰ÝÛÛ\ÜÚ]JBˆËÈœ›ÛH“[Ú˜[™ÉÜÈš[˜[[XYÙH\ÈÙ™œØÜ™Y[ˆˆ
+]H8¡äˆÛÛ\ÜÚ]H]
+K‚ˆ]œ˜[YS\ÝYHÂˆ]œ˜[YS\Ý\ÐØ[˜\ÈH˜[ÙNÂˆ]\Ýœ˜[YR\ÐØ[˜\ÈH˜[ÙNÂˆÛÛœÝ[œÝ\™QXYÐÚXÚÙ\ˆH
+
+HOˆÂˆYˆ
+XYÐÚXÚÙ\ŠH™]\›ˆXYÐÚXÚÙ\ŽÂˆÛÛœÝÈHMŽÂˆÛÛœÝ]HH™]ÈZ[\œ˜^JÈ
+ˆÈ
+ˆ
+NÂˆ›Üˆ
+]HHÈHÎÈJÊÊH›Üˆ
+]HÈÎÈ
+ÊÊHÂˆÛÛœÝHH
+H
+ˆÈ
+È
+H
+ˆÛˆH
+
+ÈJH	ˆNÂˆ]VÚWHHÛˆÈMHˆÈ]VÚJÌWHHÛˆÈMLˆÈ]VÚJÌ—HHÛˆÈˆŒÈ]VÚJÌ×HHMNÂˆBˆÛÛœÝH]šXÙK˜Ü™X]U^\™JÜÚ^™NˆÔË×K›Ü›X]ˆœ™Ø˜N[›Ü›H‹ˆ\ØYÙNˆÔU^\™U\ØYÙK•VT‘WÐ’S‘S‘ÈÔU^\™U\ØYÙKÓÔWÑÕJNÂˆ]šXÙKœ]Y]YKÜš]U^\™JÝ^\™NˆK]KØž]\Ô\”›ÝÎˆÈ
+ˆKÝÚYˆËZYÚˆßJNÂˆXYÐÚXÚÙ\ˆHÂˆ™]\›ˆÂˆNÂˆÛÛœÝ[œÝ\™PÛÛ\ÜÚ]HH
+
+HOˆÂˆYˆ
+XÛÛ\ÜÚ]TØ[\\ŠHÂˆÛÛ\ÜÚ]TØ[\\ˆH]šXÙK˜Ü™X]TØ[\\ŠÛXYÑš[\Žˆ›[™X\ˆ‹Z[‘š[\Žˆ›[™X\ˆŸJNÂˆBˆYˆ
+ÛÛ\ÜÚ]T\[[™H	‰ˆÛÛ\ÜÚ]T\[[™ROOH
+H™]\›ˆÛÛ\ÜÚ]T\[[™NÂˆÛÛœÝ[ÙH]šXÙK˜Ü™X]TÚY\“[Ù[JÛX™[ˆ›XÝÙX‹XÛÛ\ÜÚ]H‹ÛÙNˆœÝXÝœÓÝ]ÈZ[[ŠÜÚ][ÛŠHÜÚ][ÛŽˆ™XÍŒÌ‹ØØ][ÛŠ
+H]Žˆ™XÌŒÌˆNÂ™\^›ˆœ×ÛXZ[ŠZ[[Š™\^Ú[™^
+HNˆLÌŠHOˆœÓÝ]Âˆ˜\ˆH\œ˜^O™XÌŒÌ‹ÏŠ™XÌŒÌŠLKŒLKŒ
+K™XÌŒÌŠËŒLKŒ
+K™XÌŒÌŠLKŒËŒ
+JNÂˆ˜\ˆHH\œ˜^O™XÌŒÌ‹ÏŠ™XÌŒÌŠŒKŒ
+K™XÌŒÌŠ‹ŒKŒ
+K™XÌŒÌŠŒLKŒ
+JNÂˆ˜\ˆÎˆœÓÝ]ÈËœÜÚ][ÛˆH™XÍŒÌŠÚWKŒKŒ
+NÈË]ˆHVÚWNÈ™]\›ˆÎÂŸBÜ›Ý\
+
+Hš[™[™Ê
+H˜\ˆ×ÜÎˆØ[\\ŽÂÜ›Ý\
+
+Hš[™[™ÊJH˜\ˆÎˆ^\™WÌ™ŒÌŽÂœ˜YÛY[›ˆœ×ÛXZ[Š[ŽˆœÓÝ]
+HOˆØØ][ÛŠ
+H™XÍŒÌˆÈ™]\›ˆ^\™TØ[\JË×ÜË[‹]ŠNÈB˜JNÂˆÛÛœÝ^[Ý]H]šXÙK˜Ü™X]T\[[™S^[Ý]
+Øš[™Ü›Ý\^[Ý]ÎˆÙ]šXÙK˜Ü™X]Pš[™Ü›Ý\^[Ý]
+Âˆ[šY\ÎˆÂˆØš[™[™Îˆš\ÚXš[]NˆÔTÚY\”ÝYÙK‘”QÓQS•Ø[\\ŽˆÝ\Nˆ™š[\š[™ÈŸ_KˆØš[™[™ÎˆKš\ÚXš[]NˆÔTÚY\”ÝYÙK‘”QÓQS•^\™NˆÜØ[\U\Nˆ™›Ø]‹šY]Ñ[Y[œÚ[ÛŽˆŒ™Ÿ_BˆBˆJW_JNÂˆÛÛ\ÜÚ]T\[[™HH]šXÙK˜Ü™X]T™[™\”\[[™JÂˆX™[ˆ›XÝÙX‹XÛÛ\ÜÚ]H‹^[Ý]™\^ˆÛ[Ù[Nˆ[Ù[žTÚ[ˆœ×ÛXZ[ˆŸKˆœ˜YÛY[ˆÛ[Ù[Nˆ[Ù[žTÚ[ˆ™œ×ÛXZ[ˆ‹\™Ù]ÎˆÞÙ›Ü›X]ˆœ™Ø˜N[›Ü›HŸW_Kˆš[Z]]™NˆÝÜÛÙÞNˆšX[™ÛK[\ÝŸBˆJNÂˆÛÛ\ÜÚ]T\[[™RHÂˆ™]\›ˆÛÛ\ÜÚ]T\[[™NÂˆNÂ‚ˆËÈ™[™\ˆ\ÜÈÝ]BˆËÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKB‚ˆÛÛœÝ\ÜÔÝ]HH
+\ÜÒ[™JHOˆÙ]
+\ÜÒ[™Kœ™[™\ˆ\ÜÈŠNÂˆËÈPQÎˆÛ™K\ÚÝ[\ÙˆHš\œÝ^\™YÕRH˜]È
+™\^ž]\È
+ÈX]šXÙ\È
+È\™Ù]
+K‚ˆËÈØ[Yœ›ÛH›Ýœ˜]È[™œ˜]Ò[™^Y™XØ]\ÙH[Ú˜[™ÉÜÈY™™\Z[\ˆ[Z]ÂˆËÈ[™^YÙ[ÛY]žH›Üˆ]XYÈ
+ÙÛË]ÛœËÚYÙ]È[ÛÈ›ÝYÚœ˜]Ò[™^Y
+K‚ˆÛÛœÝÛX^X™U^˜]ÑXYÈH
+Ý]K˜]ÒÚ[™
+HOˆÂˆYˆ
+Ý^˜]Ñ™ÓˆH\Ý]Kœ\[[™H\Ý]Kœ\[[™KœÜXÊH™]\›ŽÂˆÛÛœÝœÒYHÝ]Kœ\[[™KœÜXË™\^ÚY\ˆˆŽÂˆÛÛœÝ˜[HHÚY\‘˜[Z[JœÒY
+NÂˆYˆ
+K×ŠÜÚ][Û—Ý^ÝZWÝ^\™Y^ÜÚ][Û—Ý^ØÛÛÜŸÝZWÝ^
+IË\Ý
+˜[JJH™]\›ŽÂˆÝ^˜]Ñ™ÓŠÊÎÂˆÛÛœÝ™ˆHÝ]Kœ\[[™KœÜXË™\^›Ü›X]È	‰ˆÝ]Kœ\[[™KœÜXË™\^›Ü›X]ÖÌNÂˆÛÛœÝ˜ˆHÝ]K™\^Y™™\œÖÌNÂˆ]˜ž]\ÈH››È˜ŒŽÂˆYˆ
+˜ˆ	‰ˆ˜‹—Ú[™JHÂˆÛÛœÝ™HHØš™XÝË™Ù]
+˜‹—Ú[™JNÂˆYˆ
+™H	‰ˆ™K—ÜÚYÝÊHÂˆÛÛœÝ˜\ÙHH˜‹›Ù™œÙ]ÂˆÛÛœÝˆHX]›Z[Š™K—ÜÚYÝË›[™ÝH˜\ÙJNÂˆÛÛœÝŒÌˆH™]È›Ø]Ì\œ˜^J™K—ÜÚYÝË˜Y™™\‹˜\ÙKX]™›ÛÜŠˆÈ
+JNÂˆ˜ž]\ÈH”ÓÓ‹œÝš[™ÚYžJÛÙ™Žˆ˜‹›Ù™œÙ]ÞŽˆ˜‹œÚ^™KŽˆ\œ˜^K™œ›ÛJŒÌŠ_JNÂˆH[ÙHÈ˜ž]\ÈH˜ŒÈˆ
+È˜‹—Ú[™H
+Èˆ›ÜÚYÝÈŽÈBˆBˆ]Xž]\ÈH››ÈXˆŽÂˆYˆ
+Ý]Kš[™^Y™™\ˆ	‰ˆÝ]Kš[™^Y™™\‹—Ú[™JHÂˆÛÛœÝ™HHØš™XÝË™Ù]
+Ý]Kš[™^Y™™\‹—Ú[™JNÂˆYˆ
+™H	‰ˆ™K—ÜÚYÝÊHÂˆÛÛœÝHHÝ]Kš[™^Y™™\‹™›Ü›X]OOHZ[MˆˆÈ™]ÈZ[M\œ˜^J™K—ÜÚYÝË˜Y™™\‹X]›Z[ŠL‹™K—ÜÚYÝË›[™ÝˆJJHˆ™]ÈZ[Ì\œ˜^J™K—ÜÚYÝË˜Y™™\‹X]›Z[ŠL‹™K—ÜÚYÝË›[™ÝˆŠJNÂˆXž]\ÈH”ÓÓ‹œÝš[™ÚYžJÙ›]ˆÝ]Kš[™^Y™™\‹™›Ü›X]Yˆ\œ˜^K™œ›ÛJJ_JNÂˆBˆBˆÛÛœÝÜ˜X“X]H
+[˜[YJHOˆÂˆÛÛœÝHHÝ]Kœ™\ÛÝ\˜Ù\Ë™Ù]
+[˜[YJNÂˆYˆ
+JH	‰ˆKšÚ[™OOH[šY›Ü›HŠJH™]\›ˆ››ÝX›Ý[™ŽÂˆÛÛœÝ™HHØš™XÝË™Ù]
+K˜Y™™\’[™JNÂˆYˆ
+J™H	‰ˆ™K—ÜÚYÝÊJH™]\›ˆ››ÜÚYÝÈŽÂˆ™]\›ˆ\œ˜^K™œ›ÛJ™]È›Ø]Ì\œ˜^J™K—ÜÚYÝË˜Y™™\‹K›Ù™œÙ]MŠJNÂˆNÂˆÛÛœÝØ[\YH×NÂˆ›Üˆ
+ÛÛœÝÛ›K—HÙˆÝ]Kœ™\ÛÝ\˜Ù\ÊHYˆ
+ˆ	‰ˆ‹šÚ[™OOH^\™Hˆ	‰ˆ‹—Ý^[žJHØ[\Yœ\Ú
+›H
+ÈHˆ
+È
+‹—Ý^[žK—ÛX™[ÈŠJNÂˆÛÛœÝ^[Ý]H™ˆÈ™‹™[[Y[Ë›X\
+
+JHOˆK›˜[YH
+Èˆ
+ÈK›Ù™œÙ]
+ÈŽˆˆ
+ÈK™›Ü›X]
+Hˆ››Ë]™ˆŽÂˆÛÛœÛÛK›ÙÊ–ÕVQUËQPQÈÈˆ
+ÈÝ^˜]Ñ™Óˆ
+È—Hˆ
+È˜]ÒÚ[™
+Èˆ˜[OHˆ
+È˜[H
+ÈˆÝHˆ
+ÈÝ]K—Ý\™Ù]X™[
+Èˆˆ
+ÈÝ]K—Ý\™Ù]Ò
+ÈˆHˆ
+ÈÝ]KšZYÚˆ
+ÈˆØ[\YHˆ
+È”ÓÓ‹œÝš[™ÚYžJØ[\Y
+Bˆ
+Èˆ›ÚHˆ
+È”ÓÓ‹œÝš[™ÚYžJÜ˜X“X]
+”›Ú™XÝ[ÛˆŠJBˆ
+ÈˆUHˆ
+È”ÓÓ‹œÝš[™ÚYžJÜ˜X“X]
+‘[˜[ZXÕ˜[œÙ›Ü›\ÈŠJBˆ
+Èˆ^[Ý]Hˆ
+È”ÓÓ‹œÝš[™ÚYžJ^[Ý]
+Bˆ
+Èˆ˜ŒHˆ
+È˜ž]\È
+ÈˆXHˆ
+ÈXž]\ÊNÂˆNÂˆÛÛœÝÙXÛÙQÝZQ˜]ÈH
+Ý]KÚ[™
+HOˆÂˆžHÂˆYˆ
+\Ý]Kœ\[[™H\Ý]Kœ\[[™KœÜXÊH™]\›ŽÂˆÛÛœÝ˜[HHÚY\‘˜[Z[JÝ]Kœ\[[™KœÜXË™\^ÚY\ˆˆŠNÂˆÛÛœÝ\Ñ›Û˜]ÈH˜[HOOH^ˆÊÎ—ŸË××J]^
+Î‰Ë××JKË\Ý
+Ý]Kœ\[[™KœÜXË›X™[ˆŠNÂˆÛÛœÝ\Ò][P]\Ñ˜]ÈH×•RH][\È]\ÊÎ—ß	
+KË\Ý
+Ý]K—Ý\™Ù]X™[ˆŠNÂˆÛÛœÝ˜]Ôš[™ÈH\Ò][P]\Ñ˜]ÈÈÚ][P]\Ñ˜]Ôš[™Èˆ
+\Ñ›Û˜]ÈÈÙ›Û˜]Ôš[™ÈˆÙÝZQ˜]Ôš[™ÊNÂˆÛÛœÝš[™Ó[Z]H\Ò][P]\Ñ˜]ÈÈMŒˆ
+\Ñ›Û˜]ÈÈˆLŠNÂˆYˆ
+˜]Ôš[™Ë›[™ÝHš[™Ó[Z]
+H™]\›ŽÂˆYˆ
+Z\Ò][P]\Ñ˜]È	‰ˆKÜÜÚ][Û—Ý^ØÛÛÜŸÜÚ][Û—Ý^^	™ÝZIÝZWÝ^Ë\Ý
+˜[JJH™]\›ŽÂˆÛÛœÝ™ˆHÝ]Kœ\[[™KœÜXË™\^›Ü›X]È	‰ˆÝ]Kœ\[[™KœÜXË™\^›Ü›X]ÖÌNÂˆÛÛœÝ˜ˆHÝ]K™\^Y™™\œÖÌNÂˆYˆ
+]˜ˆ]˜‹—Ú[™JH™]\›ŽÂˆÛÛœÝ™HHØš™XÝË™Ù]
+˜‹—Ú[™JNÂˆYˆ
+X™HX™K—ÜÚYÝÊH™]\›ŽÂˆÛÛœÝÝšYHH™ˆÈ™‹œÝšYHˆÌŽÂˆÛÛœÝ[Ù™ˆH
+‹
+HOˆ™ˆÈ
+
+™‹™[[Y[Ë™š[™
+
+JHOˆK›˜[YHOOHŠHßJK›Ù™œÙ]ÏÈ
+HˆÂˆÛÛœÝÜÓÙ™ˆH[Ù™Š”ÜÚ][Ûˆ‹
+K]“Ù™ˆH[Ù™Š•UŒ‹LŠKÛÛÙ™ˆH[Ù™ŠÛÛÜˆ‹Œ
+NÂˆÛÛœÝˆH™]È]UšY]Ê™K—ÜÚYÝË˜Y™™\‹™K—ÜÚYÝË˜ž]SÙ™œÙ]
+NÂˆÛÛœÝ™XY™\H
+ŠHOˆÂˆÛÛœÝ˜\ÙHH˜‹›Ù™œÙ]
+Èˆ
+ˆÝšYNÂˆYˆ
+˜\ÙH˜\ÙH
+ÈÛÛÙ™ˆ
+Èˆ™K—ÜÚYÝË›[™Ý
+H™]\›ˆ[Âˆ™]\›ˆÂˆÜÎˆÙ‹™Ù]›Ø]ÌŠ˜\ÙH
+ÈÜÓÙ™‹YJK‹™Ù]›Ø]ÌŠ˜\ÙH
+ÈÜÓÙ™ˆ
+ÈYJK‹™Ù]›Ø]ÌŠ˜\ÙH
+ÈÜÓÙ™ˆ
+ÈYJWKˆ]ŽˆÙ‹™Ù]›Ø]ÌŠ˜\ÙH
+È]“Ù™‹YJK‹™Ù]›Ø]ÌŠ˜\ÙH
+È]“Ù™ˆ
+ÈYJWKˆÛÛˆÙ‹™Ù]Z[
+˜\ÙH
+ÈÛÛÙ™ŠK‹™Ù]Z[
+˜\ÙH
+ÈÛÛÙ™ˆ
+ÈJK‹™Ù]Z[
+˜\ÙH
+ÈÛÛÙ™ˆ
+ÈŠK‹™Ù]Z[
+˜\ÙH
+ÈÛÛÙ™ˆ
+ÈÊWBˆNÂˆNÂˆ]YÈH[ÂˆÛÛœÝXˆHÝ]Kš[™^Y™™\ŽÂˆYˆ
+Xˆ	‰ˆX‹—Ú[™JHÂˆÛÛœÝX™HHØš™XÝË™Ù]
+X‹—Ú[™JNÂˆYˆ
+X™H	‰ˆX™K—ÜÚYÝÊHÂˆÛÛœÝYˆH™]È]UšY]ÊX™K—ÜÚYÝË˜Y™™\‹X™K—ÜÚYÝË˜ž]SÙ™œÙ]
+NÂˆÛÛœÝÈHX‹™›Ü›X]OOHZ[MˆˆÈˆˆÂˆYÈH×NÂˆ›Üˆ
+]ÈHÈÈX]›Z[Šš[™^ÛÝ[ŠNÈÊÊÊHÂˆÛÛœÝ›ÈH
+™š\œÝ[™^
+ÈÊH
+ˆÎÂˆYËœ\Ú
+ÈOOHˆÈY‹™Ù]Z[MŠ›ËYJHˆY‹™Ù]Z[ÌŠ›ËYJJNÂˆBˆBˆBˆÛÛœÝ™\ÈH×NÂˆÛÛœÝˆHYÈÈYË›[™ÝˆX]›Z[Š™\^ÛÝ[ŠNÂˆ›Üˆ
+]ÈHÈÈŽÈÊÊÊHÂˆÛÛœÝˆH
+˜˜\ÙU™\^
+H
+È
+YÈÈYÖÚ×Hˆ
+™š\œÝ™\^
+H
+ÈÊNÂˆ™\Ëœ\Ú
+™XY™\
+ŠJNÂˆBˆÛÛœÝÜ˜XˆH
+JHOˆÂˆÛÛœÝˆHÝ]Kœ™\ÛÝ\˜Ù\Ë™Ù]
+JNÂˆYˆ
+Jˆ	‰ˆ‹šÚ[™OOH[šY›Ü›HŠJH™]\›ˆ[ÂˆÛÛœÝˆHØš™XÝË™Ù]
+‹˜Y™™\’[™JNÂˆYˆ
+Jˆ	‰ˆ‹—ÜÚYÝÊJH™]\›ˆ[ÂˆÛÛœÝž]SÙ™œÙ]H
+‹—ÜÚYÝË˜ž]SÙ™œÙ]
+H
+È‹›Ù™œÙ]ÂˆÛÛœÝ]˜Z[X›HHX]›X^
+‹—ÜÚYÝË˜ž]S[™ÝH‹›Ù™œÙ]
+NÂˆ™]\›ˆ\œ˜^K™œ›ÛJ™]È›Ø]Ì\œ˜^J‹—ÜÚYÝË˜Y™™\‹ž]SÙ™œÙ]X]›Z[ŠÌ‹]˜Z[X›HˆŠJJNÂˆNÂˆÛÛœÝØ[\YH×NÈ›Üˆ
+ÛÛœÝÛ›K—HÙˆÝ]Kœ™\ÛÝ\˜Ù\ÊHYˆ
+ˆ	‰ˆ‹šÚ[™OOH^\™Hˆ	‰ˆ‹—Ý^[žJHØ[\Yœ\Ú
+
+‹—Ý^[žK—ÛX™[ÈŠKœÜ]
+‹ÈŠKœÜ
+
+JNÂˆ˜]Ôš[™Ëœ\Ú
+ÈÚ[™\NˆÝ]Kœ\[[™KœÜXË›X™[˜[KÝˆÝ]K—Ý\™Ù]X™[ÜÎˆÝ]Kœ\[[™KœÜXËÜÛÙÞKØ[\YØÚ\ÜÛÜŽˆÝ]K—ÜØÚ\ÜÛÜˆ[˜“Ù™Žˆ˜‹›Ù™œÙ]˜”Ú^™Nˆ˜‹œÚ^™KÝšYK˜\ÙU™\^ˆ˜˜\ÙU™\^š\œÝ[™^ˆ™š\œÝ[™^[™^ÛÝ[ˆš[™^ÛÝ[š\œÝ™\^ˆ™š\œÝ™\^YË™\ËˆÜ˜XŠ‘[˜[ZXÕ˜[œÙ›Ü›\ÈŠKˆÜ˜XŠ”›Ú™XÝ[ÛˆŠHJNÂˆHØ]Ú
+ÙJHÈÊˆ™]™\ˆ]HXÛÙH\œ›ÜˆÚÚ\H™X[˜]È
+‹ÈBˆNÂˆÛÛœÝÛ›ÝQ›Û˜]ÈH
+Ý]KÚ[™\˜[\ÈH[
+HOˆÂˆYˆ
+\Ý]Kœ\[[™H\Ý]Kœ\[[™KœÜXÊH™]\›ŽÂˆÛÛœÝX™[HÝ]Kœ\[[™KœÜXË›X™[ˆŽÂˆÛÛœÝ˜[HHÚY\‘˜[Z[JÝ]Kœ\[[™KœÜXË™\^ÚY\ˆˆŠNÂˆYˆ
+˜[HOOH^ˆ	‰ˆKÊÎ—ŸË××J]^
+Î‰Ë××JKË\Ý
+X™[
+JH™]\›ŽÂˆÛÛœÝØ[\YH×NÂˆ›Üˆ
+ÛÛœÝÛ˜[YK™\ÛÝ\˜ÙWHÙˆÝ]Kœ™\ÛÝ\˜Ù\ÊHÂˆYˆ
+™\ÛÝ\˜ÙH	‰ˆ™\ÛÝ\˜ÙKšÚ[™OOH^\™Hˆ	‰ˆ™\ÛÝ\˜ÙK—Ý^[žJHÂˆØ[\Yœ\Ú
+˜[YH
+ÈHˆ
+È
+™\ÛÝ\˜ÙK—Ý^[žK—ÛX™[ÈŠJNÂˆBˆBˆÛÛœÝÙ^HHÚ[™
+ÈŸˆ
+ÈX™[
+ÈŸˆ
+ÈØ[\Yš›Ú[Š‹ŠNÂˆÛÛœÝÛHÙ›Û\ÜÔÝ]Ë™Ù]
+Ù^JNÂˆÙ›Û\ÜÔÝ]ËœÙ]
+Ù^KÂˆÚ[™ˆ\NˆX™[ˆ˜[KˆÝˆÝ]K—Ý\™Ù]X™[ˆØ[\Yˆ\˜[\Ëˆ™\^ÛÝÎˆÝ]K™\^Y™™\œË›X\
+
+ÛÝ[™^
+HOˆÛÝÈÂˆ[™^ˆ[™NˆÛÝ—Ú[™KˆÙ™œÙ]ˆÛÝ›Ù™œÙ]ˆÚ^™NˆÛÝœÚ^™KˆÚYÝÎˆ›ÛÛX[ŠØš™XÝË™Ù]
+ÛÝ—Ú[™JOË—ÜÚYÝÊBˆHˆ[
+K™š[\Š›ÛÛX[ŠKˆ[™^ˆÝ]Kš[™^Y™™\ˆÈÂˆ[™NˆÝ]Kš[™^Y™™\‹—Ú[™Kˆ›Ü›X]ˆÝ]Kš[™^Y™™\‹™›Ü›X]ˆÚYÝÎˆ›ÛÛX[ŠØš™XÝË™Ù]
+Ý]Kš[™^Y™™\‹—Ú[™JOË—ÜÚYÝÊBˆHˆ[ˆÛÝ[ˆ
+ÛË˜ÛÝ[
+H
+ÈBˆJNÂˆNÂ‚ˆÛÛœÝ[œÝ\™Q[[ZY\ÈH
+
+HOˆÂˆYˆ
+[[^U[šY›Ü›JH™]\›ŽÂˆËÈ]\Ý™HH]™\žH[šY›Ü›H›ØÚÈH^[Ý]X^H™Y™\™[˜ÙH
+[Ú˜[™ÉÜÈÛØ˜[ÂˆËÈ\È\™ÙJNÈHÛË\ÛX[[[^HXZÙ\ÈÜ™X]Pš[™Ü›Ý\›ÝËÚXÚX›ÜÂˆËÈ[œÝ\™Pš[™Ü›Ý\È™Y›Ü™HÙ]š[™Ü›Ý\[™X]™\ÈHÜ›Ý\[˜›Ý[™‚ˆÛÛœÝX”Ú^™HHX]›Z[Š]šXÙK›[Z]ÏË›X^[šY›Ü›PY™™\š[™[™ÔÚ^™HMLÍ‹MLÍŠNÂˆ[[^U[šY›Ü›HH]šXÙK˜Ü™X]PY™™\ŠÛX™[ˆ›XÝÙX‹Y[[^K][šY›Ü›H‹Ú^™NˆX”Ú^™Kˆ\ØYÙNˆÔPY™™\•\ØYÙK•S’Q“Ô“HÔPY™™\•\ØYÙKÓÔWÑÕJNÂˆ[[^TÝÜ˜YÙHH]šXÙK˜Ü™X]PY™™\ŠÛX™[ˆ›XÝÙX‹Y[[^K\ÝÜ˜YÙH‹Ú^™NˆM‹ˆ\ØYÙNˆÔPY™™\•\ØYÙK”ÕÔQÑHÔPY™™\•\ØYÙKÓÔWÑÕJNÂˆ[[^TØ[\\ˆH]šXÙK˜Ü™X]TØ[\\ŠÛXYÑš[\Žˆ›[™X\ˆ‹Z[‘š[\Žˆ›[™X\ˆŸJNÂˆÛÛœÝH]šXÙK˜Ü™X]U^\™JÛX™[ˆ›XÝÙX‹Y[[^K]^‹Ú^™NˆÌKKWKˆ›Ü›X]ˆœ™Ø˜N[›Ü›H‹\ØYÙNˆÔU^\™U\ØYÙK•VT‘WÐ’S‘S‘ÈÔU^\™U\ØYÙKÓÔWÑÕJNÂˆ[[^U^šY]ÈH˜Ü™X]UšY]Ê
+NÂˆÛÛœÝ\H]šXÙK˜Ü™X]U^\™JÛX™[ˆ›XÝÙX‹Y[[^KY\‹Ú^™NˆÌKKWKˆ›Ü›X]ˆ™\Ì™›Ø]‹ˆ\ØYÙNˆÔU^\™U\ØYÙK•VT‘WÐ’S‘S‘ÈÔU^\™U\ØYÙK”‘S‘T—ÐUPÒQS•JNÂˆ[[^Q\šY]ÈH\˜Ü™X]UšY]Ê
+NÂˆNÂˆÛÛœÝ[[^Q›ÜˆH
+[žJHOˆÂˆYˆ
+[žK˜Y™™\ŠH™]\›ˆÜ™\ÛÝ\˜ÙNˆØY™™\Žˆ[[^U[šY›Ü›__NÂˆYˆ
+[žKœØ[\\ŠH™]\›ˆÜ™\ÛÝ\˜ÙNˆ[[^TØ[\\ŸNÂˆËÈØ[\Y^\™HÔˆÝÜ˜YÙH^\™H
+ÝÜ˜YÙU^\™JH8¡¤ˆH^\™HšY]Âˆ™]\›ˆÜ™\ÛÝ\˜ÙNˆ[[^U^šY]ßNÂˆNÂ‚ˆËÈš[™Ü›Ý\È\™HØXÚY›ÜˆHY™][YHÙˆH]šXÙK›ÝH™[™\ˆ\ÜË‚ˆËÈHÚYÛ˜]\™H™[ÝÈ˜[Y\È]™\žH™\ÛÝ\˜ÙHHÜ›Ý\š[™ÈžH
+š[™J‹[™ˆËÈ[™\ÈÛÛYHœ›ÛHH[Û›ÝÛšXÈÛÝ[\ˆ]™]™\ˆ™]\Ù\ÈH[X™\‹ÛÈ[‚ˆËÈ[žHØ[ˆÛ›H]™\ˆ\ØÜšX™HH™\ÛÝ\˜Ù\È]Ø\ÈZ[œ›ÛKˆH\‹\\ÜÂˆËÈX\ÛÚÙY\]Z]˜[[]Ø\È›Ýˆ\ÈÜ\ÜÝY\ÈŽ™[™\ˆ\ÜÙ\È\‚ˆËÈœ˜[YHÛˆH™X[Ù\™\‹ÛÈ]™\žH\ÜÈÝ\YÚ][ˆ[\HØXÚH[™ˆËÈ™KXÜ™X]Y]™\žHÜ›Ý\]›Ý[™8 %YX\Ý\™Y]KŒ	HÙˆœ˜[YH[YHÛ‚ˆËÈÜ]K™ÙËË	HÙˆ][œÚYHÜ™X]Pš[™Ü›Ý\]Ù[‹‚ˆËÂˆËÈÙ^YYžH\[[™H\ÈÙ[\ÈžHÚYÛ˜]\™NˆÛÈ\[[™\ÈØ[ˆØ[HØ[YBˆËÈ™\ÛÝ\˜Ù\È[™\ˆ[˜ÛÛ\]X›H^[Ý]Ë[™Ù]š[™Ü›Ý\^[Ý]
+™ÊH\ÈBˆËÈ›Ü\HÙˆH\[[™Kˆ
+H\‹\\ÜÈ›Ý[™Ü›Ý\ØX\›K[Ý]Ý^\È\ÂˆËÈ]\È8 %Ù]\[[™H[™XYHÛX\œÈ]ŠBˆÛÛœÝØš[™Ü›Ý\ØXÚHH™]ÈX\
+
+NÂˆÛÛœÝØš[™Ü›Ý\Ý]ÈHÚ]ˆZ\ÜÎˆÛX\œÎˆNÂˆÛÛœÝÜ\[[™RYÈH™]ÈÙXZÓX\
+
+NÂˆ]Ü\[[™RYÙ\HHÂˆÛÛœÝ\[[™RYH
+\[[™JHOˆÂˆ]YHÜ\[[™RYË™Ù]
+\[[™JNÂˆYˆ
+YOOH[™Yš[™Y
+HÂˆYH
+Ê×Ü\[[™RYÙ\NÂˆÜ\[[™RYËœÙ]
+\[[™KY
+NÂˆBˆ™]\›ˆYÂˆNÂˆËÈ\Ý›ÞYY™\ÛÝ\˜Ù\ÈÙY\Z\ˆ
+™]™\‹\™Z\ÜÝYY
+H[™\ËÛÈHÝ[H[žBˆËÈ\È[œ™XXÚX›H˜]\ˆ[ˆÜ›Û™ÎÈHÛ›HÛÜÝ\È™][[Û‹ˆØ\]8 %ˆËÈ]Ù[X›Ý™HH]™HÛÜšÚ[™ÈÙ]ÚXÚ\È\™Ù\ˆ[ˆ]ÛÚÜÎˆHP“ÂˆËÈš[™ÈÞXÛ\ÈMˆÛÝÙ™œÙ]È[™XXÚÙ™œÙ]\È]ÈÝÛˆÚYÛ˜]\™KÛÈBˆËÈ[™[Ùˆ\[[™\È™XXÚÙ]™\˜[Ý\Ø[™[šY\Ëˆ]NLˆHØXÚBˆËÈÛX\™Y[Y\È[ˆHÈÚ[™ÝÈ[™™KXÜ™X]YÚ]]Y\Ý]šXÝY‚ˆÛÛœÝ’S‘ÑÔ“ÕTÐÐPÒWÓSRUHÌÍŽÂˆËÈš\ÙXÝÛÛ›ÛX]Ú[™ÈXÝÙX—ÛY\ÚÜXÙHÈXÝÙX—Ý[˜Ø\Yˆ\ÜØ™\ÝÜ™\ÂˆËÈHÛ\‹\™[™\‹\\ÜÈØXÚHY™][YH›Üˆ[ˆKÐˆYØZ[œÝ\ÈÛ™K‚ˆÛÛœÝØš[™Ü›Ý\ØXÚTØÛÜHBˆ™]ÈT“ÙX\˜Ú\˜[\ÊØØ][Û‹œÙX\˜Ú
+K™Ù]
+›XÝÙX—Øš[™Ü›Ý\ØØXÚHŠHOOHœ\ÜÈ‚ˆÈœ\ÜÈˆˆ™]šXÙHŽÂ‚ˆËÈÚ]™[XZ[œÈÙˆ\È[˜Ý[Û‰ÜÈÛÜÝ\ÈZ[[™ÈH\‹Y˜]ÈÚYÛ˜]\™BˆËÈÝš[™ËIHÙˆœ˜[YH[YH]LH˜]ÜËÙœ˜[YKˆ[ˆX\›K[Ý]Ù^YYÛˆ™YˆËÈ[žHš[™[™ÈXÝX[HÚ[™ÙHÚ[˜ÙHH\Ý˜]ÈˆØ\ÈšYY[™YX\Ý\™Y›ÂˆËÈY™™\™[˜ÙH
+ÉHOˆŽNIJNˆZ[™XÜ˜YÙ]ÈH[šY›Ü›HÙ™œÙ]œ›ÛH]ÈP“ÂˆËÈš[™ÈÛˆ\ÜÙ[X[H]™\žH˜]ËÛÈHX\›K[Ý]™]™\ˆš\™\ËˆHÛÜÝ\ÂˆËÈZ[™XÜ˜Y	ÜÈ™Xš[™[™È˜]K›Ý›ÛÚÚÙY\[™È\™K‚ˆÛÛœÝ[œÝ\™Pš[™Ü›Ý\ÈH
+Ý]JHOˆÂˆ[œÝ\™Q[[ZY\Ê
+NÂˆÛÛœÝÜXÈHÝ]Kœ\[[™KœÜXÎÂˆÛÛœÝÜ›Ý\ÈHÜXË˜š[™Ü›Ý\È×NÂˆÛÛœÝÜ›Ý\™[X\HÝ]Kœ\[[™K™Ü›Ý\™[X\Ü›Ý\Ë›X\
+
+ËJHOˆ
+Û™ÎˆK˜\ÙUNˆ˜\ÙTÎˆJJNÂˆÛÛœÝÜ›Ý\ÛÝ[HÝ]Kœ\[[™K™Ü›Ý\ÛÝ[Ü›Ý\Ë›[™ÝÂˆËÈ\‹[ÜšYÚ[˜[YÜ›Ý\Ø[\\ˆš[™[™È˜\ÙH
+Ø[\\œÈZYY\ˆHÜ›Ý\	ÜÂˆËÈ[šY›Ü›\ÎÈÙYHZ[\[[™JKˆ˜[˜XÚÈ™XÛÛ\]\ÈHØ[YHÙ™œÙ]YˆBˆËÈ\[[™H™Y]\ÈHšY[‚ˆÛÛœÝØ[\\˜\Ù\ÈHÝ]Kœ\[[™KœØ[\\˜\Ù\ÈÜ›Ý\Ë›X\
+
+ËÚJHOˆÂˆ]HHÈÜ›Ý\Ë™›Ü‘XXÚ
+
+ÙËÙÚJHOˆÈYˆ
+Ü›Ý\™[X\ÙÙÚWK›™ÈOOHÜ›Ý\™[X\ÙÚWK›™ÊHH
+ÏHÙË[šY›Ü›\Ë›[™ÝÈJNÂˆ™]\›ˆX]›X^
+Ü›Ý\™[X\ÙÚWK˜˜\ÙTËJNÂˆJNÂˆÛÛœÝ^[Ý]HÝ]Kœ\[[™Kœ\[[™NÂˆËÈš]™Hš[™[™Èœ›ÛHHÔPÈ
+È™[X\
+H]]Üš]]]™HÙ]Ùˆš[™[™ÜÈ8 %ˆËÈHØ[YH]H]Z[H\[[™H^[Ý][™HÑÔÓ
+KˆÙHÈ“Õ™[BˆËÈÛˆÙ]š[™Ü›Ý\^[Ý]
+ŠK™[šY\ËÚXÚ\È[\KÝ[˜]˜Z[X›HÛˆÛÛYBˆËÈÚ›ÛZ][HZ[È[™™]š[Ý\ÛHØ]\ÙY]™\žHÜ›Ý\È™HÚÚ\Y8¡¤ˆ“›Èš[™ˆËÈÜ›Ý\]Ü›Ý\[™^ˆ˜[Y][Ûˆ8¡¤ˆ[Ú˜[™ÉÜÈ˜]˜H›ÝÜÈ8¡¤ˆ[\Y\Ë‚ˆËÈ›ÜˆXXÚY\™ÙYÜ›Ý\ÙH[Z]U‘T–Hš[™[™ÈH^[Ý]^XÝÎÈHÛÝˆËÈÚÜÙH™X[™\ÛÝ\˜ÙH\Û‰Ý›Ý[™Y]Ù]ÈH\K[X]ÚY[[^HÛÈHÜ›Ý\ˆËÈ\È[Ø^\ÈÛÛ\]H[™SÐVTÈ›Ý[™‚ˆËÈ^\™Hš[™È[Ú˜[™È\ÜÝYY\È˜]È]Y“ÕX]Ú[žHÜXÈØ[\\‚ˆËÈ˜[YH8 %\ÙY\ÈHÜÚ][Û˜[˜[˜XÚÈ
+š[™Ü™\ˆ8¡¤ˆØ[\\‹\ÛÝÜ™\ŠHÛÂˆËÈ^\™Y˜]ÜÈØ[\HH™X[]\È]™[ˆÚ[ˆHš[™˜[YHY™™\œÈœ›ÛBˆËÈHÜXÉÜÈØ[\\ˆ˜[YH
+ÚXÚÛÝ[Ý\Ú\ÙHZY[H›XÚÈ[[^JK‚ˆÛÛœÝX]ÚY^H™]ÈÙ]
+
+NÂˆ›Üˆ
+ÛÛœÝÈÙˆÜ›Ý\ÊH›Üˆ
+ÛÛœÝÈÙˆËœØ[\\œÊHÂˆÛÛœÝˆHÝ]Kœ™\ÛÝ\˜Ù\Ë™Ù]
+ÊNÂˆYˆ
+ˆ	‰ˆ‹šÚ[™OOH^\™HŠHX]ÚY^˜Y
+ŠNÂˆBˆÛÛœÝ[›X]ÚY^HÝ]K™˜]Õ^š[™Ë™š[\Š
+
+HOˆ[X]ÚY^š\Ê
+JNÂˆ][›X]ÚYÝ\œÛÜˆHÂˆ›Üˆ
+]™ÈHÈ™ÈÜ›Ý\ÛÝ[È™ÊÊÊHÂˆÛÛœÝ[šY\ÈH×NÂˆÛÛœÝÚYÛ˜]\™T\ÈH×NÂˆ]\Ð[žHH˜[ÙNÂˆÜ›Ý\Ë™›Ü‘XXÚ
+
+Ü›Ý\ÚJHOˆÂˆÛÛœÝˆHÜ›Ý\™[X\ÙÚWNÂˆYˆ
+‹›™ÈOOH™ÊH™]\›ŽÂˆÜ›Ý\[šY›Ü›\Ë™›Ü‘XXÚ
+
+[šY›Ü›Q\ØËZJHOˆÂˆ\Ð[žHHYNÂˆÛÛœÝš[™[™ÈH‹˜˜\ÙUH
+ÈZNÂˆÛÛœÝ›Ý[™HÝ]Kœ™\ÛÝ\˜Ù\Ë™Ù]
+[šY›Ü›Q\ØË›˜[YJNÂˆYˆ
+›Ý[™	‰ˆ›Ý[™šÚ[™OOH[šY›Ü›HŠHÂˆËÈÙX‘ÔH[™›Ü˜Ù\ÈHÝM[H]H[šY›Ü›HÝXÝ	ÜÈ›Ý[™ˆËÈ˜[™ÙH™HH]ÈÚY\‹YXÛ\™YÚ^™H
+YYÈH][\HÙ‚ˆËÈHÝXÝ	ÜÈ˜\ÙH[YÛ›Y[ˆMˆÚ]HX]
+Kˆ[Ú˜[™ÉÜÂˆËÈÝMÚ^™PØ[Ý[]Üˆ™]\›œÈS‘[ØØ]\È]HS‹\›Ý[™YˆËÈÚ^™H
+Üš]P[š[X][Û’[™›ÈÛXÙHHMœÈHMHÚY\‚ˆËÈ™YYÎÈÛØ˜[ÈY™™\ˆHMˆœÈ
+KˆÛÎ‚ˆËÈ
+ˆHÛXÙHÛÈÛX[›ÜˆHÚY\ˆOˆ˜›Ý[™Ú]Ú^™HMˆËÈ‹‹ˆÛÈÛX[‹‹ˆ™\]Z\™\ÈMˆ
+]\È›]È›ÜY
+NÂˆËÈ
+ˆ›Ý[™[™ÈH˜[™ÙHÈMˆÝ™\œ[œÈH[‹\›Ý[™Y•Q‘‘T‚ˆËÈ
+ÛØ˜[ÈM‹OˆMŠHOˆÜ™X]Pš[™Ü›Ý\˜Z[ÈOˆHÚÛBˆËÈÝX›Z]Ø\ØØY\È\È’[˜[Yš[™Ü›Ý\‹‹ˆ[˜[YYHÈBˆËÈ™]š[Ý\È\œ›Üˆˆ[™HØÜ™Y[ˆÛÙ\È›XÚË‚ˆËÈHÛ™H›Ý[™\žH]\ÈSÐVTÈØY™H\ÈH\‹\ÛÝXÚÚ[™ÂˆËÈÝšYNˆ[Ú˜[™È^\ÈP“ÈÛÝÈÝ]]ˆËÈ›Ý[™ÝØ\™
+Ú^™KZ[•[šY›Ü›SÙ™œÙ][YÛ›Y[LMŠKÛÈ]™\žHÛÝˆËÈ
+[™›ÜˆH\ÝH[ˆÈHY™™\ˆ[™
+H\ÈLMˆˆÙ‚ˆËÈ›ÛÛKÚXÚ[Ø^\ÈÛÝ™\œÈHÑÔÓX[YÛ™YÝXÝ
+LM
+H[™ˆËÈ™]™\ˆ™XYÈ\Ý™X[]H
+ÝMY[X™\ˆÙ™œÙ]È\™HBˆËÈ[‹\›Ý[™YÚ^™JKˆ›Ý[™H›Ý[™˜[™ÙH\ÈM‹Ø\Y]BˆËÈY™™\ˆÛÈÙHØ[ˆ™]™\ˆ^ÙYY]‚ˆÛÛœÝX›Ý[™HX]›Z[Š
+›Ý[™œÚ^™H
+ÈMJH	ˆŒMK›Ý[™˜Y™™\”Ú^™HH›Ý[™›Ù™œÙ]
+NÂˆ[šY\Ëœ\Ú
+Øš[™[™Ë™\ÛÝ\˜ÙNˆØY™™\Žˆ›Ý[™˜Y™™\‹Ù™œÙ]ˆ›Ý[™›Ù™œÙ]Ú^™NˆX›Ý[™_JNÂˆÚYÛ˜]\™T\Ëœ\Ú
+	Øš[™[™ßNN‰Ø›Ý[™˜Y™™\’[™_N‰Ø›Ý[™›Ù™œÙ]N‰ÝX›Ý[™X
+NÂˆH[ÙHÂˆÛÛœÝ[[^HH[šY›Ü›Q\ØË\HOOH•VSÐ•Q‘‘TˆˆÈ[[^TÝÜ˜YÙHˆ[[^U[šY›Ü›NÂˆ[šY\Ëœ\Ú
+Øš[™[™Ë™\ÛÝ\˜ÙNˆØY™™\Žˆ[[^__JNÂˆÚYÛ˜]\™T\Ëœ\Ú
+	Øš[™[™ßN‰Ý[šY›Ü›Q\ØË\HOOH•VSÐ•Q‘‘TˆˆÈœÑˆˆQŸX
+NÂˆBˆJNÂˆÜ›Ý\œØ[\\œË™›Ü‘XXÚ
+
+Ø[\\“˜[YKÚJHOˆÂˆ\Ð[žHHYNÂˆÛÛœÝ˜\ÙHHØ[\\˜\Ù\ÖÙÚWH
+ÈÚH
+ˆŽÂˆ]›Ý[™HÝ]Kœ™\ÛÝ\˜Ù\Ë™Ù]
+Ø[\\“˜[YJNÂˆYˆ
+J›Ý[™	‰ˆ›Ý[™šÚ[™OOH^\™HŠH	‰ˆ[›X]ÚYÝ\œÛÜˆ[›X]ÚY^›[™Ý
+HÂˆËÈ˜[YHZ\ÜÈ8¡¤ˆ˜[˜XÚÈÈH™^š[™[Ü™\ˆ^\™H]›ÈÜXÂˆËÈØ[\\ˆÛZ[YYžH˜[YK‚ˆ›Ý[™H[›X]ÚY^Ý[›X]ÚYÝ\œÛÜŠÊ×NÂˆYˆ
+XZ[\[[™K—ÛÙÙÙY^˜[˜XÚÊHÂˆZ[\[[™K—ÛÙÙÙY^˜[˜XÚÈH™]ÈÙ]
+
+NÂˆBˆÛÛœÝšÈH	ÜÜXË›X™[_	ÜØ[\\“˜[Y_XÂˆYˆ
+XZ[\[[™K—ÛÙÙÙY^˜[˜XÚËš\ÊšÊJHÂˆZ[\[[™K—ÛÙÙÙY^˜[˜XÚË˜Y
+šÊNÂˆÛÛœÛÛKØ\›ŠÝ^Y˜[˜XÚ×H	ÜÜXË›X™[NˆØ[\\ˆ‰ÜØ[\\“˜[Y_Hˆ›Ý[ˆ™\ÛÝ\˜Ù\ÈžH˜[YNÈ\ÙYÜÚ][Û˜[š[™
+˜]Õ^š[™ÊKˆš[™˜[Y\È\È˜]ÈX^HY™™\ˆœ›ÛHÜXÈØ[\\ˆ˜[Y\Ë˜
+NÂˆBˆBˆYˆ
+›Ý[™	‰ˆ›Ý[™šÚ[™OOH^\™HŠHÂˆ[šY\Ëœ\Ú
+Øš[™[™Îˆ˜\ÙK™\ÛÝ\˜ÙNˆ›Ý[™œØ[\\ŸJNÂˆ[šY\Ëœ\Ú
+Øš[™[™Îˆ˜\ÙH
+ÈK™\ÛÝ\˜ÙNˆ›Ý[™šY]ßJNÂˆÚYÛ˜]\™T\Ëœ\Ú
+	Ø˜\Ù_NœÎ‰Ø›Ý[™œØ[\\’[™_X	Ø˜\ÙH
+È_N‰Ø›Ý[™šY]Ò[™_X
+NÂˆYˆ
+›Ý[™—Ý^[žJHÈÜØ[\Y\Ñœ˜[YK˜Y
+›Ý[™—Ý^[žJNÈÜØ[\Y[šY\Ë˜Y
+›Ý[™—Ý^[žJNÈHËÈPQÂˆH[ÙHÂˆ[šY\Ëœ\Ú
+Øš[™[™Îˆ˜\ÙK™\ÛÝ\˜ÙNˆ[[^TØ[\\ŸJNÂˆ[šY\Ëœ\Ú
+Øš[™[™Îˆ˜\ÙH
+ÈKˆ™\ÛÝ\˜ÙNˆ\Ñ\Ø[\\“˜[YJØ[\\“˜[YJHÈ[[^Q\šY]Èˆ[[^U^šY]ßJNÂˆÚYÛ˜]\™T\Ëœ\Ú
+	Ø˜\Ù_NœÑ	Ø˜\ÙH
+È_N
+NÂˆBˆJNÂˆJNÂˆYˆ
+Z\Ð[žJHÛÛ[YNÈËÈÙ[Z[™[H[\HÜ›Ý\
+K™ËˆHÛØ˜[Ë[Û›H™[X\\™Ù]Ú]›Ý[™ÊH8¡¤ˆ›È^[Ý][žH8¡¤ˆ›Ý[™ÈÈš[™ˆÛÛœÝÚYÛ˜]\™HH	Ü\[[™RY
+^[Ý]
+__	Û™ß_	ÜÚYÛ˜]\™T\Ëš›Ú[Š‹Š_XÂˆYˆ
+Ý]K˜›Ý[™Ü›Ý\ÖÛ™×HOOHÚYÛ˜]\™JHÛÛ[YNÂˆÛÛœÝØXÚHHØš[™Ü›Ý\ØXÚTØÛÜHOOHœ\ÜÈ‚ˆÈ
+Ý]K˜š[™Ü›Ý\ØXÚHH™]ÈX\
+
+JHˆØš[™Ü›Ý\ØXÚNÂˆ]š[™Ü›Ý\HØXÚK™Ù]
+ÚYÛ˜]\™JNÂˆYˆ
+Xš[™Ü›Ý\
+HÂˆØš[™Ü›Ý\Ý]Ë›Z\ÜÊÊÎÂˆš[™Ü›Ý\H]šXÙK˜Ü™X]Pš[™Ü›Ý\
+ÂˆX™[ˆ	ÜÜXË›X™[N˜š[™	Û™ßXˆ^[Ý]ˆ^[Ý]™Ù]š[™Ü›Ý\^[Ý]
+™ÊKˆ[šY\ÂˆJNÂˆYˆ
+ØXÚKœÚ^™HH’S‘ÑÔ“ÕTÐÐPÒWÓSRU
+HÂˆØXÚK˜ÛX\Š
+NÂˆØš[™Ü›Ý\Ý]Ë˜ÛX\œÊÊÎÂˆBˆØXÚKœÙ]
+ÚYÛ˜]\™Kš[™Ü›Ý\
+NÂˆH[ÙHÂˆØš[™Ü›Ý\Ý]Ëš]
+ÊÎÂˆBˆÝ]Kœ\ÜËœÙ]š[™Ü›Ý\
+™Ëš[™Ü›Ý\
+NÂˆÝ]K˜›Ý[™Ü›Ý\ÖÛ™×HHÚYÛ˜]\™NÂˆBˆNÂ‚ˆËÈ\™Ù\ÝY™™\ˆ]Ù]ÈHXYÛ›ÜÝXÈÔHZ\œ›ÜŽÈÙYHÜ™X]PY™™\‹‚ˆÛÛœÝÒQÕ×ÓSRUH
+ˆL
+ˆLÂ‚ˆËÈPQÎˆ\œ˜Z[ˆ˜]ÜËˆÙXÝ[ÛœÈ\™H˜]ÛˆÝ]ÙˆHÚ\™YLŽZP‚ˆËÈ•X™\Y™™\ˆˆ[ØØ][ÛœËÛÈH˜]ÈÚÜÙHÛÝL™\^Y™™\ˆ\È]ˆËÈ\™ÙH\ÈÚ[šÈÙ[ÛY]žKˆ\œ˜Z[ˆÝ\œ™[HÛÛ\[\È™[™\˜X›HY\Ú\ÂˆËÈ
+š\Ô™[™\˜X›Hˆ
+H[™\ÜÝY\È[™^Y˜]ÜÈÚ]›ÈÙX‘ÔH˜[Y][Û‚ˆËÈ\œ›Ü‹Y]›Ý[™È\X\œÈ8 %ÛÈH]Y\Ý[Ûˆ\ÈÚ]\ˆH˜]ÂˆËÈ\˜[Y]\œÈ[™Y™™\ˆš[™[™ÜÈY™\ÜÚ[™È]Ú\™YY™™\ˆ\™HØ[™K‚ˆËÈ]Y\žXX›HšXHÛØ˜[\Ë›XÕÙX‘ÜK—Ý\œ˜Z[‘˜]ÜË‚ˆËÈHÙ[œÝ\ÈÙ^YYžH\[[™HX™[ˆÝÈX[žH˜]ÜÈXXÚ\[[™H\ÜÝYYÝÂˆËÈX[žHÙ\™H›ÜY™XØ]\ÙH›È\[[™HØ\È›Ý[™[™H\™Ù\ÝÛÝLˆËÈ™\^Y™™\ˆ]™]Èœ›ÛKˆÚ[šÈÙ[ÛY]žH]™\È[ˆHLŽZP‚ˆËÈ•X™\Y™™\ˆˆ[ØØ][ÛœËÛÈH\œ˜Z[ˆ\[[™HÚÝ[ÚÝÈHX^˜ˆ[ˆ]ˆËÈ˜[™ÙNÈH\œ˜Z[ˆX™[]™]™\ˆ\X\œÈ][YX[œÈ]È˜]ÜÈ\™H™Z[™ÂˆËÈ›ÜY\Ý™X[KÚXÚ\ÈÚ[[[ˆ›ÝH˜]˜H[™”È^Y\œË‚ˆËÈž]\È™XXÚ[™ÈXXÚY™™\‹žHX™[ˆ\œ˜Z[ˆÙ[ÛY]žH[™È[ˆBˆËÈ•X™\Y™™\ˆ
+ˆˆ[ØØ][ÛœÎÈYˆÜÙHÚÝÈ™\›Èž]\È[‹HÙXÝ[ÛœÈ\™BˆËÈY\ÚY[™˜]Ûˆ]HÔHY™™\ˆ\ÈÝ[[\KÚXÚ\ÈÚ[[
+›ÂˆËÈ˜[Y][Ûˆ\œ›Ü‹ÛÜœ™XÝ[ÛÚÚ[™È˜]È\˜[Y]\œË›Ý[™ÈÛˆØÜ™Y[ŠK‚ˆËÈ[šY›Ü›KXY™™\ˆÛÛ[›Ø™\È
+ÛXÝÙX—ÙÜWÜ›Ø™OLJK‚ˆËÂˆËÈÛX[[šY›Ü›HY™™\œÈ\™HÜ™X]YS’Q“Ô“_ÓÔWÑÕÚ]›ÈÓÔWÔÔËÛÈBˆËÈÛÜPY™™\•ÐY™™\ˆ™XY˜XÚÈÙˆ[H\È[˜[Y[™Ú[[HZY[È™\›ÜÈ8 %ˆËÈÚXÚ™XYÈ^XÝHZÙHH[šY›Ü›H\È™\›È‹ˆ™XÛÜ™[™ÈÚ]\ÈÜš][‚ˆËÈ\ÈHÛ›HØ^HÈÙYHH˜[YHHÚY\ˆÙY\Ë[™H]\È[™ˆËÈ]]ÔÝÜ˜YÙR[™^Y™™\ˆ[™\ÝYØ][ÛœÈ›Ý™YYY]‚ˆËÂˆËÈ]]\Ý›Ý™HÛˆžHY˜][ˆ]™\žHP“ÈÛÝ\ÈHMˆ‹ÛÈHØ]ÚY‚ˆËÈœ˜[˜Úš\™YÛˆ\ÜÙ[X[H]™\žH[šY›Ü›H\ØY[™ÛÜÝHÛXÙH\ÈÛÂˆËÈ\YX\œ˜^HX]\šX[^˜][ÛœÈ\ÈH›Ý[™[™ÈX\8 %ÛˆHÝ]ÙˆBˆËÈœ˜[YH][™XYH\ØYÈLÐ‹‚ˆÛÛœÝÙÜT›Ø™HH™]ÈT“ÙX\˜Ú\˜[\ÊØØ][Û‹œÙX\˜Ú
+Kš\Ê›XÝÙX—ÙÜWÜ›Ø™HŠNÂˆÛÛœÝ›ÝU[šY›Ü›T›Ø™HH
+[žK[™K\Ý[˜][Û“Ù™œÙ]ž]\Ëž]S[™Ý
+HOˆÂˆYˆ
+Y[žJH™]\›ŽÂˆYˆ
+Ð]]ÈÝÜ˜YÙKÚK\Ý
+[žK—ÛX™[ˆŠJHÂˆÛÛœÝ™XÛÜ™H
+ÛØ˜[\Ë›XÕÙX‘ÜK—Ø]]Ò[™^Üš]\ÈHÂˆÜš]PY™™\Žˆž]\ÎˆÛÜY\Îˆ[™\ÎˆßBˆJNÂˆ™XÛÜ™Üš]PY™™\ŠÊÎÂˆ™XÛÜ™˜ž]\È
+ÏHž]S[™ÝÂˆËÈÙ^YYžH[™K›ÝX™[ˆ]]ÔÝÜ˜YÙR[™^Y™™\ˆÜ›ÝÜÈžHÜ™X][™ÈBˆËÈ‘UÈY™™\‹ÛÈHX™[Ø\ÈÜš][ˆˆØ[ˆ™HYHÚ[HH[œÝ[˜ÙBˆËÈH˜]Èš[™ÈØ\È™]™\ˆÝXÚY‚ˆÛÛœÝÙ^HHÝš[™Ê[™JNÂˆ™XÛÜ™š[™\ÖÚÙ^WHH
+™XÛÜ™š[™\ÖÚÙ^WH
+H
+ÈNÂˆBˆYˆ
+[žKœÚ^™HHMŠHÂˆÛÛœÝÛÜHHž]\ËœÛXÙJX]›Z[Šž]\Ë›[™Ý
+JNÂˆÛÛœÝ™XÛÜ™HÂˆÙ™œÙ]ˆ\Ý[˜][Û“Ù™œÙ]ˆ›Ø]Îˆ\œ˜^K™œ›ÛJ™]È›Ø]Ì\œ˜^JÛÜK˜Y™™\‹ÛÜK˜ž]S[™ÝˆŠJBˆ›X\
+
+
+HOˆX]œ›Ý[™
+
+ˆL
+HÈL
+Kˆ[Îˆ\œ˜^K™œ›ÛJ™]È[Ì\œ˜^JÛÜK˜Y™™\‹ÛÜK˜ž]S[™ÝˆŠJBˆNÂˆÛÛœÝÙ^HH
+[žK—ÛX™[ÈŠH
+ÈˆÈˆ
+È[™NÂˆ
+ÛØ˜[\Ë›XÕÙX‘ÜK—ÜÛX[Y™™\•Üš]\ÈHßJVÚÙ^WHH™XÛÜ™ÂˆËÈÙY\Hš\œÝ™]ÈÜš]\È\ÈÙ[\ÈH\Ýˆ“™]™\ˆÜš][‚ˆËÈÛÜœ™XÝHˆ[™Üš][ˆÛÜœ™XÝH[ˆÛØ˜™\™Yˆ™YYÜÜÚ]BˆËÈš^\Ë[™Û›HH\ÝÜš]HØ\È™Z[™È™]Z[™Y‚ˆÛÛœÝ\ÝÜžHH
+ÛØ˜[\Ë›XÕÙX‘ÜK—ÜÛX[Y™™\•Üš]R\ÝÜžHHßJNÂˆÛÛœÝ\ÝH
+\ÝÜžVÚÙ^WHH×JNÂˆYˆ
+\Ý›[™ÝŠH\Ýœ\Ú
+™XÛÜ™
+NÂˆ™XÛÜ™œÙ\HH
+\ÝÜžVÚÙ^H
+ÈˆØÛÝ[—HH
+\ÝÜžVÚÙ^H
+ÈˆØÛÝ[—H
+H
+ÈJNÂˆBˆNÂ‚ˆÛÛœÝÛ›ÝPž]\ÈH
+[žKÚ[™ž]\ÊHOˆÂˆYˆ
+Y[žHJž]\Èˆ
+JH™]\›ŽÂˆÛÛœÝ[ÈH
+ÛØ˜[\Ë›XÕÙX‘ÜK—ØY™™\’[ÈHßJNÂˆÛÛœÝ›ÝÈH
+[ÖÙ[žK—ÛX™[ÏÈ[›X™[Yˆ—HHÝÜš]NˆÛÜNˆÚ^™Nˆ[žKœÚ^™_JNÂˆ›ÝÖÚÚ[™H
+ÏHž]\ÎÂˆNÂ‚ˆËÈ›Ý[™Y]šY[˜ÙH›ÜˆH™X[˜[š[HÛÝY]ˆHÛÝY™\^ÚY\‚ˆËÈ\È›È™\^Y™™\ŽˆXXÚ[™^Y˜]È^[™È™YHÛÝY˜XÙ\Èž]\ÂˆËÈ\ˆ]XY[™ÛÛXš[™\ÈÛÝY[™›ÈÚ]H™YÝ[\ˆ›Ú™XÝ[ÛˆÈ˜[œÙ›Ü›BˆËÈP“ÜËˆH˜]ÈÛÝ[[Û™H\™Y›Ü™HØ[››Ý\Ý[™ÝZ\Ú™X[ÛÝYÙ[ÛY]žBˆËÈœ›ÛH[ˆ[\HÜˆZ\ËX›Ý[™ÝÜ˜YÙHY™™\‹ˆØ\\™HÛ™HÛX[Ù\šX[\ØX›BˆËÈØ[\HÚ[HÛÛ[Z[™ÈÈÛÝ[]™\žH][\YÙ^XÝ]Y˜]Ë‚ˆÛÛœÝÝ[šY›Ü›Q›Ø]Ø[\HH
+Ý]K˜[YKÛÝ[
+HOˆÂˆÛÛœÝ›Ý[™HÝ]Kœ™\ÛÝ\˜Ù\Ë™Ù]
+˜[YJNÂˆYˆ
+›Ý[™ËšÚ[™OOH[šY›Ü›HŠH™]\›ˆ[ÂˆÛÛœÝ[žHHØš™XÝË™Ù]
+›Ý[™˜Y™™\’[™JNÂˆÛÛœÝÚYÝÈH[žOË—ÜÚYÝÎÂˆYˆ
+\ÚYÝÊH™]\›ˆ[ÂˆÛÛœÝž]S[™ÝHX]›Z[Š›Ý[™œÚ^™KÛÝ[
+ˆˆX]›X^
+ÚYÝË˜ž]S[™ÝH›Ý[™›Ù™œÙ]
+JNÂˆYˆ
+ž]S[™Ý
+H™]\›ˆ[ÂˆÛÛœÝšY]ÈH™]È]UšY]ÊÚYÝË˜Y™™\‹ˆ
+ÚYÝË˜ž]SÙ™œÙ]
+H
+È›Ý[™›Ù™œÙ]ž]S[™Ý
+NÂˆ™]\›ˆ\œ˜^K™œ›ÛJÛ[™ÝˆX]™›ÛÜŠž]S[™ÝÈ
+_Kˆ
+Ë[™^
+HOˆšY]Ë™Ù]›Ø]ÌŠ[™^
+ˆYJJNÂˆNÂ‚ˆÛÛœÝØÛÝY˜XÙ\ÔØ[\HH
+Ý]K[™^ÛÝ[
+HOˆÂˆÛÛœÝ›Ý[™HÝ]Kœ™\ÛÝ\˜Ù\Ë™Ù]
+ÛÝY˜XÙ\ÈŠNÂˆYˆ
+›Ý[™ËšÚ[™OOH[šY›Ü›HŠH™]\›ˆ[ÂˆÛÛœÝ[žHHØš™XÝË™Ù]
+›Ý[™˜Y™™\’[™JNÂˆÛÛœÝÚYÝÈH[žOË—ÜÚYÝÎÂˆYˆ
+\ÚYÝÊHÂˆ™]\›ˆÂˆX™[ˆ[žOË—ÛX™[ÏÈ[ˆY™™\”Ú^™Nˆ[žOËœÚ^™HÏÈ[ˆ›Ý[™Ù™œÙ]ˆ›Ý[™›Ù™œÙ]ˆ›Ý[™Ú^™Nˆ›Ý[™œÚ^™KˆÚYÝÙYˆ˜[ÙBˆNÂˆBˆÛÛœÝ›Ý[™ž]\ÈHX]›Z[Š›Ý[™œÚ^™KˆX]›X^
+ÚYÝË˜ž]S[™ÝH›Ý[™›Ù™œÙ]
+JNÂˆËÈÚ^[™XÙ\ÈY™\ÜÈ›Ý\ˆ™\XÙ\È›ÜˆXXÚ]XYÈŽÔÒS•ÛÛœÝ[Y\È^XÝBˆËÈ™YHÚYÛ™Yž]\Ëˆ™\ÜÜÙHÙÚXØ[^[Ë›ÝHÜÝ	ÜÈYYˆËÈLÌˆÝÜ˜YÙHÛÜ™ËÛÈHØ[\H›Ý™\ÈHÚY\‹]š\ÚX›H]K‚ˆÛÛœÝ™\]Z\™Y˜[Y\ÈHX]˜ÙZ[
+X]›X^
+[™^ÛÝ[
+HÈŠH
+ˆÎÂˆÛÛœÝØØ[›™Y˜[Y\ÈHX]›Z[Š™\]Z\™Y˜[Y\Ë›Ý[™ž]\ÊNÂˆÛÛœÝšY]ÈH™]ÈZ[\œ˜^JÚYÝË˜Y™™\‹ˆ
+ÚYÝË˜ž]SÙ™œÙ]
+H
+È›Ý[™›Ù™œÙ]ØØ[›™Y˜[Y\ÊNÂˆÛÛœÝš\œÝ˜[Y\ÈH×NÂˆ]›Ûž™\›Õ˜[Y\ÈHÂˆ›Üˆ
+][™^HÈ[™^ØØ[›™Y˜[Y\ÎÈ[™^
+ÊÊHÂˆÛÛœÝž]HHšY]ÖÚ[™^NÂˆÛÛœÝ˜[YHHž]HLŽÈž]Hˆž]HHMŽÂˆYˆ
+˜[YHOOH
+H›Ûž™\›Õ˜[Y\ÊÊÎÂˆYˆ
+[™^
+Hš\œÝ˜[Y\Ëœ\Ú
+˜[YJNÂˆBˆ™]\›ˆÂˆX™[ˆ[žOË—ÛX™[ÏÈ[ˆY™™\”Ú^™Nˆ[žOËœÚ^™HÏÈ[ˆ›Ý[™Ù™œÙ]ˆ›Ý[™›Ù™œÙ]ˆ›Ý[™Ú^™Nˆ›Ý[™œÚ^™KˆÚYÝÙYˆYKˆ›Ü›X]ˆ”ŽÔÒS•‹ˆ™\]Z\™Y˜[Y\ËˆØØ[›™Y˜[Y\Ëˆ›Ûž™\›Õ˜[Y\Ëˆš\œÝ˜[Y\ÂˆNÂˆNÂ‚ˆÛÛœÝÚ\ÐÛÝY\[[™SX™[H
+X™[
+HO‚ˆÊÎœ\[[™WÊÎ™›]ÊOØÛÝYß™[™\\WØÛÝYÊKÚK\Ý
+X™[
+NÂ‚ˆÛÛœÝÛ›ÝPÛÝY˜]ÈH
+Ý]K\˜[\Ë^XÝ]Y
+HOˆÂˆÛÛœÝX™[HÝ]Kœ\[[™OËœÜXÏË›X™[ÏÈˆŽÂˆYˆ
+WÚ\ÐÛÝY\[[™SX™[
+X™[
+JH™]\›ŽÂˆÛÛœÝ™\ÜH
+ÛØ˜[\Ë›XÕÙX‘ÜK—ØÛÝY˜]ÜÈHÂˆ][\Y˜]ÜÎˆˆ^XÝ]Y˜]ÜÎˆˆÝ\™\ÜÙY˜]ÜÎˆˆÝ[[™XÙ\ÎˆˆX^[™^ÛÝ[ˆˆš\œÝXÚÎˆ[ˆ\ÝXÚÎˆ[ˆØ[\Nˆ[ˆJNÂˆ™\Ü˜][\Y˜]ÜÊÊÎÂˆYˆ
+^XÝ]Y
+HÂˆ™\Ü™^XÝ]Y˜]ÜÊÊÎÂˆ™\ÜÝ[[™XÙ\È
+ÏH\˜[\Ëš[™^ÛÝ[Âˆ™\Ü›X^[™^ÛÝ[HX]›X^
+™\Ü›X^[™^ÛÝ[\˜[\Ëš[™^ÛÝ[
+NÂˆH[ÙHÂˆ™\ÜœÝ\™\ÜÙY˜]ÜÊÊÎÂˆBˆÛÛœÝXÚÈHÛØ˜[\Ë›XÕÙX”[\ËXÚÜÈÏÈÂˆYˆ
+™\Ü™š\œÝXÚÈOOH[
+H™\Ü™š\œÝXÚÈHXÚÎÂˆ™\Ü›\ÝXÚÈHXÚÎÂˆYˆ
+^XÝ]Y	‰ˆ\™\ÜœØ[\JHÂˆ™\ÜœØ[\HHÂˆ\[[™NˆX™[ˆ\™Ù]ˆÝ]K—Ý\™Ù]X™[ˆ\™Ù]ÒˆÝ]K—Ý\™Ù]Òˆ\›Ü›X]ˆÝ]K™\›Ü›X]ˆÜÛÙÞNˆÝ]Kœ\[[™OËœÜXÏËÜÛÙÞHÏÈ[ˆÝ[ˆÝ]Kœ\[[™OËœÜXÏË˜Ý[ÏÈ[ˆ[™^ÛÝ[ˆ\˜[\Ëš[™^ÛÝ[ˆ[œÝ[˜ÙPÛÝ[ˆ\˜[\Ëš[œÝ[˜ÙPÛÝ[ˆÛÝY˜XÙ\ÎˆØÛÝY˜XÙ\ÔØ[\JÝ]K\˜[\Ëš[™^ÛÝ[
+KˆÛÝY[™›ÎˆÝ[šY›Ü›Q›Ø]Ø[\JÝ]KÛÝY[™›È‹LJKˆ[˜[ZXÕ˜[œÙ›Ü›\ÎˆÝ[šY›Ü›Q›Ø]Ø[\JÝ]K‘[˜[ZXÕ˜[œÙ›Ü›\È‹MŠKˆ›Ú™XÝ[ÛŽˆÝ[šY›Ü›Q›Ø]Ø[\JÝ]K”›Ú™XÝ[Ûˆ‹MŠKˆ›ÙÎˆÝ[šY›Ü›Q›Ø]Ø[\JÝ]K‘›ÙÈ‹L
+BˆNÂˆBˆNÂ‚ˆÛÛœÝÛ›ÝQ˜]ÈH
+Ý]KÚ[™\˜[\ÊHOˆÂˆÛÛœÝÙ[œÝ\ÈH
+ÛØ˜[\Ë›XÕÙX‘ÜK—Ù˜]ÐÙ[œÝ\ÈHßJNÂˆÛÛœÝX™[HÝ]Kœ\[[™OËœÜXÏË›X™[ÏÈ›Ë\\[[™OˆŽÂˆÛÛœÝ›ÝÈH
+Ù[œÝ\ÖÛX™[HHÙ˜]ÜÎˆX^˜ŽˆÚ[™ÎˆßKØ[\Nˆ[ˆš\œÝXÚÎˆ[\ÝXÚÎˆ[JNÂˆ›ÝË™˜]ÜÊÊÎÂˆËÈœ˜[YH[X™\œÈœ˜XÚÙ]HXÝ]š]KˆH\[[™HÚÜÙH˜]ÜÈÝÜX\›BˆËÈÚ[HH˜]˜HÚYHÝ[™\ÜÈš\ÚX›K™[™\˜X›HÙXÝ[ÛœÈYX[œÈBˆËÈÙ[ÛY]žH\È™Z[™È›ÜY™]ÙY[ˆ]™[™[™\™\ˆ[™H™[™\ˆ\ÜË‚ˆÛÛœÝXÚÈHÛØ˜[\Ë›XÕÙX”[\ËXÚÜÈÏÈÂˆYˆ
+›ÝË™š\œÝXÚÈOOH[
+H›ÝË™š\œÝXÚÈHXÚÎÂˆ›ÝË›\ÝXÚÈHXÚÎÂˆ›ÝËšÚ[™ÖÚÚ[™HH
+›ÝËšÚ[™ÖÚÚ[™H
+H
+ÈNÂˆÛÛœÝÛÝHÝ]K™\^Y™™\œÖÌNÂˆÛÛœÝ˜ˆHÛÝÈØš™XÝË™Ù]
+ÛÝ—Ú[™JHˆ[ÂˆYˆ
+˜ˆ	‰ˆ˜‹œÚ^™Hˆ›ÝË›X^˜ŠHÂˆ›ÝË›X^˜ˆH˜‹œÚ^™NÂˆ›ÝË˜“X™[H˜‹—ÛX™[ÂˆBˆËÈÚXÚ^\™\È\È\[[™HØ[\\Ë[™Ú]\ˆ^H]™\ˆ™XÙZ]™YˆËÈ^[]Kˆ\œ˜Z[ˆ]˜]ÜÈÝ\Ø[™ÈÙˆ˜[YšX[™Û\È]ÚÝÜÂˆËÈ›Ý[™È\È\]X[HÛÛœÚ\Ý[Ú][ˆ]\È]\ØYY›[šË‚ˆYˆ
+\›ÝË^\™\È	‰ˆÝ]Kœ™\ÛÝ\˜Ù\È	‰ˆÝ]Kœ™\ÛÝ\˜Ù\ËœÚ^™JHÂˆ›ÝË^\™\ÈH×NÂˆ›Üˆ
+ÛÛœÝÛ˜[YK™X×HÙˆÝ]Kœ™\ÛÝ\˜Ù\ÊHÂˆYˆ
+™XÏËšÚ[™OOH^\™HŠHÛÛ[YNÂˆÛÛœÝHH™XË—Ý^[žNÂˆ›ÝË^\™\Ëœ\Ú
+Âˆ›Ý[™ˆ˜[YKˆ[™Nˆ™XËšY]Ò[™Kˆ^[™NˆOË—ÚYÏÈ[ˆX™[ˆOË—ÛX™[ÏÈ[ˆÚˆHÈ	ÝKÚY^	ÝKšZYÚXˆ[ˆ\ØYÎˆOË—Ý\ØYÈÏÈˆJNÂˆBˆBˆYˆ
+\›ÝËœØ[\H	‰ˆ˜ˆ	‰ˆ˜‹œÚ^™HˆÒQÕ×ÓSRU
+HÂˆÛÛœÝXˆHÝ]Kš[™^Y™™\ˆÈØš™XÝË™Ù]
+Ý]Kš[™^Y™™\‹—Ú[™JHˆ[Âˆ›ÝËœØ[\HHÂˆ‹‹œ\˜[\Ëˆ˜“Ù™œÙ]ˆÛÝ›Ù™œÙ]˜”Ú^™NˆÛÝœÚ^™K˜•Ý[ˆ˜‹œÚ^™KˆX“X™[ˆXË—ÛX™[ÏÈ[X•Ý[ˆXËœÚ^™HÏÈ[ˆX‘›Ü›X]ˆÝ]Kš[™^Y™™\Ë™›Ü›X]ÏÈ[ˆNÂˆBˆNÂ‚ˆÛÛœÝ\U™\^[™[™^H
+Ý]JHOˆÂˆÛÛœÝÜXÈHÝ]Kœ\[[™KœÜXÎÂˆYˆ
+ÜXË™\^›Ü›X]ÊHÂˆÜXË™\^›Ü›X]Ë™›Ü‘XXÚ
+
+™‹ÛÝ
+HOˆÂˆÛÛœÝ›Ý[™HÝ]K™\^Y™™\œÖÜÛÝNÂˆYˆ
+›Ý[™
+HÂˆÝ]Kœ\ÜËœÙ]™\^Y™™\ŠÛÝ›Ý[™˜Y™™\‹›Ý[™›Ù™œÙ]›Ý[™œÚ^™JNÂˆBˆJNÂˆBˆYˆ
+Ý]Kš[™^Y™™\ŠHÂˆÝ]Kœ\ÜËœÙ][™^Y™™\ŠÝ]Kš[™^Y™™\‹˜Y™™\‹Ý]Kš[™^Y™™\‹™›Ü›X]
+NÂˆBˆNÂ‚ˆÛÛœÝ™YYÓÝÙ\š[™ÈH
+Ý]JHOˆÂˆÛÛœÝÜÛÙÞHHÝ]Kœ\[[™KœÜXËÜÛÙÞNÂˆ™]\›ˆÜÛÙÞHOOH”UPQÈˆÜÛÙÞHOOH•’PS‘ÓWÑSˆŽÂˆNÂ‚ˆËÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKBˆËÈÛ‹\ØÜ™Y[ˆœ˜[YHÜ˜\
+ÛXÝÙX—Ùœ˜[YYÜ˜\LJBˆËÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKBˆËÈHš\ÝX[œ˜[YK][YHÝš\›Üˆ]™H^]\Ý[™ÎˆÛ™HÛÛ[[ˆ\ˆÛY[ˆËÈœ˜[YH
+ZYÚHœ˜[YH\ËM‹È\È[™H˜]ÛŠKÛ™H›ÝÈÙˆÜ]X\™\È›Ü‚ˆËÈÙ\™\ˆ[\Y˜[˜Ù\È
+Ü™Y[ˆHXÚÈ[™Y\šÈH[\˜[ˆÚ]Ý]BˆËÈXÚÊK[™H[Y\šXÈ™XYÝ]ˆÝ[È™XY\ÈÜZÙ\ÎÈHˆˆÙ\™\ˆ™XYÂˆËÈ\ÈHÜ\œÙHÜ™Y[ˆ›ÝËˆÜZ[ˆÛÈ›Ü›X[[œÈØ\œžH™\›ÈÛÜÝ‚ˆÛÛœÝÙœ˜[YQÜ˜\H
+
+
+HOˆÂˆÛÛœÝ[˜X›YH™]ÈT“ÙX\˜Ú\˜[\ÊØØ][Û‹œÙX\˜Ú
+Kš\Ê›XÝÙX—Ùœ˜[YYÜ˜\ŠNÂˆYˆ
+Y[˜X›Y
+H™]\›ˆÂˆ\Ú
+
+HßK\ÚÙ\™\Š
+HßK™\Ù]
+
+HßKˆ™\Ü
+
+HÈ™]\›ˆÈ\œ›ÜŽˆ™œ˜[YHÜ˜\Ù™ŽÈØYÚ]ÛXÝÙX—Ùœ˜[YYÜ˜\LHˆNÈKˆ[˜X›Yˆ˜[ÙBˆNÂˆÛÛœÝˆHÂˆËÈXZ[ˆ˜\œÈ\ÙHœ˜[YK\Ý\ØY[˜ÙNˆ]\ÈÚ]H^Y\ˆ^\šY[˜Ù\ËˆËÈ[™]^ÜÙ\È]\Ù\ÈÚXÚØØÝ\ˆ™]ÙY[ˆ˜]˜HØ[˜XÚÜÈ
+ÐËœ›ÝÜÙ\‚ˆËÈØÚY[[™ËÔH˜XÚË\™\ÜÝ\™JKˆÚ]”Þ[˜È\È\ÈQ‹]Ë\QŽÈ[˜Ø\YˆËÈ[ÙH\Ù\ÈZY[[™È\ÚÈÝ\ËˆÞX[ˆXÚÜÈ™]Z[ˆØ[˜XÚÈ^XÝ][Û‚ˆËÈ\˜][ÛˆÛÈH[˜\ˆØ[ˆÝ[™H]šX]Y]HÛ[˜ÙK‚ˆÛÛœÝœ˜[Y\ÈH™]È›Ø]Ì\œ˜^JŠNÈËÈ™[™\™YYœ˜[YHÝ\ØY[˜ÙH\ÂˆÛÛœÝØ[˜XÚÑœ˜[Y\ÈH™]È›Ø]Ì\œ˜^JŠNÈËÈ˜]˜HØ[˜XÚÈ\˜][Ûˆ\ÂˆÛÛœÝÙ\™\‘[\ÈH™]ÈZ[\œ˜^JŠNÈËÈXÚÜÈY˜[˜ÙY[ˆ\Èœ˜[YHÚ[™ÝÂˆËÈÙ\™\‹\ÚYH[\[Z[™Èœ›ÛHHÛÜšÙ\ˆ
+[\\Ý]ÈY\ÜØYÙ\ÊNˆ\‚ˆËÈ[\XØ[\˜][Ûˆ[™HØ\™]ÙY[ˆ[\Ý\ËˆšYÈ\˜][ÛœÈBˆËÈÛÝÈÙ\™\ˆXÚÜÎÈšYÈØ\ÈÚ]ÛX[\˜][ÛœÈHHÝ\™YÛÜšÙ\‚ˆËÈ]™[ÛÜˆ›Ý™XY\ÈH\Ù\‹]š\ÚX›HØ[Y\^H[^K‚ˆÛÛœÝÓˆHÂˆÛÛœÝÙ\™\‘\ˆH™]È›Ø]Ì\œ˜^JÓŠNÂˆÛÛœÝÙ\™\‘Ø\H™]È›Ø]Ì\œ˜^JÓŠNÂˆ]Ù\™\’XYHÂˆ]\ÝÙ\™\‘\ˆHÂˆ]ÛÜœÝÙ\™\‘Ø\HÂˆ]XYHÂˆ][™[™ÕXÚÜÈHÂˆ]\ÝXÚÐÛÝ[HLNÂˆ]Ø[˜\Ñ[H[Âˆ]X™[[H[Âˆ]\Ý˜]ÈHÂˆ]\Ýœ˜[YS\ÈHÂˆ]\Ý˜Y‘Ø\\ÈHÂˆ]š\ÚX›SÝ™\ŒÌÈHÂˆ]š\ÚX›SÝ™\ŒLHÂˆÛÛœÝPVÓTÈHLÈËÈ™\XØ[ØØ[HØ\ˆËÈHš\ÚX›HÝš\\È[X™\˜][HÚÜ]PH™YYÈHÛ™È[›ÝYÚ˜]ÂˆËÈ\ÝÜžHÈØ]Ú[\›Z][Ý]\œÈÚ]Ý][˜X›[™ÈÛXÝÙX—Ü\™LK‚ˆËÈ]›Ùš[\ˆÜ˜\È]™\žHÜÝY]Ù[™X]\šX[HÝÙ\œÈ”ËÚ\™X\ÂˆËÈ\ÙHÛÈÜZ[ˆ\YX\œ˜^HÜš]\ÈÈ›ÝÚ[™ÙHHZ[™XÜ˜YÚÜÝÙX[K‚ˆËÈ™]Z[ˆHÛÛ\]HÌ\ÙXÛÛ™XØÙ\[˜ÙHÚ[™ÝÈ]™[ˆ]Z[™XÜ˜Y	ÜÂˆËÈŒÝ[›[Z]YÙ][™È
+Ëœ˜[Y\ÊKÚ]›ÛÛH›ÜˆØÚY[[™Èš]\‹‚ˆÛÛœÝˆHLŒÂˆÛÛœÝœ˜[YR\ÝÜžHH™]È›Ø]Ì\œ˜^JŠNÂˆÛÛœÝ˜Y‘Ø\\ÝÜžHH™]È›Ø]Ì\œ˜^JŠNÂˆ]\ÝÜžRXYHÂˆ]\ÝÜžPÛÝ[HÂˆËÈÚ[ˆXXÚ]Ú\[™Y›Ý\ÝÝÈX[žH\™HÙ\™KˆHÝ]\ˆÚ]BˆËÈ™YÝ[\ˆ\š[Ù\ÈH\š[ÙXÈ
+\ÚÊ‹[™]È\š[Ù˜[Y\ÈHÝ[š]8 %ˆËÈH‹ŒÈÜXÚ[™ÈYÝ˜ZYÚÈHÝÜ˜YÙHÞ[˜ËˆÛÝ[È[Û™HØ[››ÝˆËÈ\Ý[™ÝZ\Ú]œ›ÛHØØ]\™Yš]\‹‚ˆÛÛœÝUÒÓTÈHÌÎÂˆÛÛœÝ]Ú[Y\ÈH×NÂ‚ˆÊŠ‚ˆ
+ˆÜXÚ[™È™]ÙY[ˆÛÛœÙXÝ]]™H]Ú\ËˆHYÚYYX[ˆÚ]HÛX[Ü™XYˆ
+ˆYX[œÈÛÛY][™È\š[ÙXÈ\È[›š[™ÈÛˆHœ˜[YH™XYÈ\š[ÙXÚ]X\Âˆ
+ˆHœ˜XÝ[ÛˆÙˆØ\ÈÚ][ˆIHÙˆHYYX[‹ÛÈHØ[\ˆØ[ˆ[›Û™Bˆ
+ˆ\ÚÈ]™\žHˆÈˆœ›ÛHšš]\ˆ]]™\˜YÙ\ÈˆÈ‹‚ˆ
+‹ÂˆÛÛœÝ]ÚÜXÚ[™ÈH
+
+HOˆÂˆÛÛœÝØ\ÈH×NÂˆ›Üˆ
+]HHNÈH]Ú[Y\Ë›[™ÝÈJÊÊHØ\Ëœ\Ú
+]Ú[Y\ÖÚWKH]Ú[Y\ÖÚHHWK
+NÂˆYˆ
+YØ\Ë›[™Ý
+HÂˆ™]\›ˆØÛÝ[ˆ]Ú[Y\Ë›[™ÝØ\Îˆ×KYYX[‘Ø\\Îˆ\š[ÙXÚ]Nˆˆ]™[Îˆ]Ú[Y\ËœÛXÙJ
+_NÂˆBˆÛÛœÝÛÜYHË‹‹™Ø\×KœÛÜ
+
+KŠHOˆHHŠNÂˆÛÛœÝYYX[ˆHÛÜYÜÛÜY›[™ÝˆWNÂˆÛÛœÝ™X\ˆHØ\Ë™š[\Š
+ÊHOˆX]˜XœÊÈHYYX[ŠHHYYX[ˆ
+ˆŒJK›[™ÝÂˆ™]\›ˆÂˆÛÝ[ˆ]Ú[Y\Ë›[™ÝˆYYX[‘Ø\\ÎˆYYX[‹ˆ\š[ÙXÚ]NˆX]œ›Ý[™
+™X\ˆÈØ\Ë›[™Ý
+ˆL
+HÈLˆØ\ÎˆØ\ËœÛXÙJ
+Kˆ]™[Îˆ]Ú[Y\ËœÛXÙJ
+BˆNÂˆNÂ‚ˆÛÛœÝ\ÝÜžU˜[Y\ÈH
+ÛÝ\˜ÙKÜÚ]]™SÛ›HH˜[ÙJHOˆÂˆÛÛœÝÝ]H×NÂˆÛÛœÝÝ\H
+\ÝÜžRXYH\ÝÜžPÛÝ[
+ÈŠH	HŽÂˆ›Üˆ
+]HHÈH\ÝÜžPÛÝ[ÈJÊÊHÂˆÛÛœÝ˜[YHHÛÝ\˜ÙVÊÝ\
+ÈJH	H—NÂˆYˆ
+\ÜÚ]]™SÛ›H˜[YHˆ
+HÝ]œ\Ú
+˜[YJNÂˆBˆ™]\›ˆÝ]ÂˆNÂ‚ˆÛÛœÝÝ[[X\žHH
+˜[Y\ÊHOˆÂˆYˆ
+]˜[Y\Ë›[™Ý
+H™]\›ˆÈYX[ŽˆLˆMNˆNNˆX^ˆNÂˆÛÛœÝÛÜYHË‹‹˜[Y\×KœÛÜ
+
+KŠHOˆHHŠNÂˆÛÛœÝ]H
+
+HOˆÛÜYÓX]›Z[ŠÛÜY›[™ÝHKX]™›ÛÜŠÛÜY›[™Ý
+ˆ
+JWNÂˆÛÛœÝ›Ý[™H
+˜[YJHOˆX]œ›Ý[™
+˜[YH
+ˆL
+HÈLÂˆ™]\›ˆÂˆYX[Žˆ›Ý[™
+˜[Y\Ëœ™YXÙJ
+KŠHOˆH
+È‹
+HÈ˜[Y\Ë›[™Ý
+KˆLˆ›Ý[™
+]
+L
+JKˆMNˆ›Ý[™
+]
+ŽMJJKˆNNˆ›Ý[™
+]
+ŽNJJKˆX^ˆ›Ý[™
+ÛÜYÜÛÜY›[™ÝHWJBˆNÂˆNÂ‚ˆÛÛœÝ[œÝ\™QÛHH
+
+HOˆÂˆYˆ
+Ø[˜\Ñ[
+H™]\›ŽÂˆØ[˜\Ñ[HØÝ[Y[˜Ü™X]Q[[Y[
+˜Ø[˜\ÈŠNÂˆØ[˜\Ñ[ÚYHˆ
+ˆŽÂˆØ[˜\Ñ[šZYÚHLÌŽÂˆØ[˜\Ñ[œÝ[K˜ÜÜÕ^HœÜÚ][ÛŽ™š^YÛYŽÝÜŽÞ‹Z[™^ŽNNNNÈ‚ˆ
+È˜˜XÚÙÜ›Ý[™œ™Ø˜JMJNØ›Ü™\ŽŒ\ÛÛYÍMMNÜÚ[\‹Y]™[Î››Û™NÈŽÂˆØÝ[Y[˜›ÙK˜\[™Ú[
+Ø[˜\Ñ[
+NÂˆX™[[HØÝ[Y[˜Ü™X]Q[[Y[
+™]ˆŠNÂˆX™[[œÝ[K˜ÜÜÕ^HœÜÚ][ÛŽ™š^YÛYŽÝÜŒMÞ‹Z[™^ŽNNNNÈ‚ˆ
+È˜ÛÛÜŽˆÎYŽNÙ›ÛŒL\[Û›ÜÜXÙNÜÚ[\‹Y]™[Î››Û™NÝÚ]K\ÜXÙNœ™NÈŽÂˆØÝ[Y[˜›ÙK˜\[™Ú[
+X™[[
+NÂˆNÂ‚ˆÛÛœÝ˜]ÈH
+›ÝÓ\ÊHOˆÂˆYˆ
+›ÝÓ\ÈH\Ý˜]ÈL
+H™]\›ŽÈËÈLˆ™Y˜]ÈÙY\ÈÛÜÝ™YÛYÚX›Bˆ\Ý˜]ÈH›ÝÓ\ÎÂˆ[œÝ\™QÛJ
+NÂˆÛÛœÝÝHØ[˜\Ñ[™Ù]ÛÛ^
+Œ™ŠNÂˆÛÛœÝÈHØ[˜\Ñ[ÚYHØ[˜\Ñ[šZYÚÂˆÛÛœÝÜ˜\HÙ\™\–HHM\–HHL‹Ø\HHLŒÂˆÝ˜ÛX\”™XÝ
+Ë
+NÂˆËÈM‹È\È™Y™\™[˜ÙH[™H
+Œ”ÊK‚ˆÛÛœÝSÙˆH
+\ÊHOˆÜ˜\HX]›Z[Š\ËPVÓTÊHÈPVÓTÈ
+ˆÜ˜\ÂˆÝœÝ›ÚÙTÝ[HHˆÌØMˆŽÂˆÝ˜™YÚ[”]
+
+NÂˆÛÛœÝ™YˆHSÙŠM‹ÊNÂˆÝ›[Ý™UÊ™YŠNÈÝ›[™UÊË™YŠNÈÝœÝ›ÚÙJ
+NÂˆËÈœ˜[YH˜\œË‚ˆ›Üˆ
+]HHÈHŽÈJÊÊHÂˆÛÛœÝYH
+XY
+ÈJH	HŽÂˆÛÛœÝ\ÈHœ˜[Y\ÖÚYNÂˆYˆ
+\ÈH
+HÛÛ[YNÂˆÛÛœÝHH
+ˆŽÂˆÝ™š[Ý[HH\ÈˆLÈˆÙMˆˆ\ÈˆÌÈÈˆÙXLÈˆˆˆÍXÎŽÂˆÝ™š[™XÝ
+SÙŠ\ÊK‹Ü˜\HSÙŠ\ÊJNÂˆÛÛœÝØ[˜XÚÓ\ÈHØ[˜XÚÑœ˜[Y\ÖÚYNÂˆYˆ
+Ø[˜XÚÓ\Èˆ
+HÂˆÝ™š[Ý[HHˆÍXÙˆŽÂˆÝ™š[™XÝ
+SÙŠØ[˜XÚÓ\ÊK‹JNÂˆBˆËÈÙ\™\ˆXÚÈY˜[˜ÙH[ˆ\Èœ˜[YHÚ[™ÝÎˆÜ™Y[ˆÜ]X\™H™[ÝË‚ˆÝ™š[Ý[HHÙ\™\‘[\ÖÚYHˆÈˆÌÙˆˆˆˆÌŒŒˆŽÂˆÝ™š[™XÝ
+Ù\™\–K‹
+NÂˆBˆËÈÙ\™\ˆ[\\˜][ÛœÈ
+˜\œÈš\Ú[™Èœ›ÛH\–JH[™Ø\È™]ÙY[ˆ[\ˆËÈÝ\È
+˜\œÈš\Ú[™Èœ›ÛHØ\JNˆH]šX][Ûˆ›Üˆ[^YYØ[Y\^K‚ˆ›Üˆ
+]HHÈHÓŽÈJÊÊHÂˆÛÛœÝYH
+Ù\™\’XY
+ÈJH	HÓŽÂˆÛÛœÝHH
+ˆŽÂˆÛÛœÝHÙ\™\‘\–ÚYNÂˆYˆ
+ˆ
+HÂˆÝ™š[Ý[HHˆLÈˆÙMˆˆˆÌÈÈˆÙXLÈˆˆˆÍŽYŽÂˆÛÛœÝHX]›X^
+KL
+ˆX]›Z[ŠPVÓTÊHÈPVÓTÊNÂˆÝ™š[™XÝ
+\–H
+ÈLH‹
+NÂˆBˆÛÛœÝÈHÙ\™\‘Ø\ÚYNÂˆYˆ
+Èˆ
+HÂˆÝ™š[Ý[HHÈˆLÈˆÙMˆˆÈˆŒÈˆÙXLÈˆˆˆÌŽÂˆÛÛœÝHX]›X^
+K
+ˆX]›Z[ŠËPVÓTÊHÈPVÓTÊNÂˆÝ™š[™XÝ
+Ø\H
+ÈH‹
+NÂˆBˆBˆNÂ‚ˆÛÛœÝ™Yœ™\ÚX™[H
+
+HOˆÂˆÛÛœÝÙ\™\ˆHÛØ˜[\Ë›XÕÙX”Ù\™\ŽÂˆÛÛœÝ[™›ÈHÙ\™\Ëš[™›ÏËŠ
+HÏÈßNÂˆÛÛœÝœÓ›ÝÈH\Ý˜Y‘Ø\\ÈˆˆÈX]›Z[ŠNNKX]œ›Ý[™
+LÈ\Ý˜Y‘Ø\\ÊJHˆÂˆX™[[^ÛÛ[Bˆœ˜[YH	ÙÛØ˜[\Ë›XÕÙX”[\ËœXÚ[™ÏËŠ
+KœØÚY[\ˆÏÈÈŸXˆ
+È	ÓX]œ›Ý[™
+\Ý˜Y‘Ø\\È
+ˆL
+HÈL[\È
+‰ÙœÓ›ÝßYœÊXˆ
+ÈØ[˜XÚÈ	ÓX]œ›Ý[™
+\Ýœ˜[YS\È
+ˆL
+HÈL[\Øˆ
+È™XÙ[ŒÌÏIÝš\ÚX›SÝ™\ŒÌßHŒLIÝš\ÚX›SÝ™\ŒLXˆ
+ÈÙ\™\•XÚÏIÚ[™›ËXÚÐÛÝ[ÏÈÈŸH[”OIÚ[™›Ëš[˜›Ý[™]Y]YYÏÈÈŸXˆ
+ÈÙ\™\”[\	Û\ÝÙ\™\‘\Ÿ[\ÈØ\	ÝÛÜœÝÙ\™\‘Ø\[\Øˆ
+ÈÝ]OIÚ[™›ËœÝ]HÏÈÈŸXÂˆNÂ‚ˆ™]\›ˆÂˆ[˜X›YˆYKˆ\Ú
+œ˜[YS\Ë˜Y‘Ø\\ÈH
+HÂˆËÈØ\\™Y™Y›Ü™H\Ýœ˜[YS\È\È™X\ÜÚYÛ™Y™[ÝÎˆHØ\™Z[™ÂˆËÈ™XÛÜ™Y[™YÚ]TÈØ[˜XÚËÛÈHØ[˜XÚÈ]˜[ˆ™Y›Ü™H]ˆËÈ\ÈHÛ™H]ÛÝ[]™HÝ™\œ[ˆ[È]‚ˆÛÛœÝ™]š[Ý\ÐØ[˜XÚÓ\ÈH\Ýœ˜[YS\ÎÂˆÛÛœÝØY[˜ÙS\ÈH˜Y‘Ø\\ÈˆÈ˜Y‘Ø\\Èˆœ˜[YS\ÎÂˆYˆ
+œ˜[Y\ÖÚXYHˆÌÊHš\ÚX›SÝ™\ŒÌËKNÂˆYˆ
+œ˜[Y\ÖÚXYHˆL
+Hš\ÚX›SÝ™\ŒLKNÂˆœ˜[Y\ÖÚXYHHØY[˜ÙS\ÎÂˆØ[˜XÚÑœ˜[Y\ÖÚXYHHœ˜[YS\ÎÂˆYˆ
+ØY[˜ÙS\ÈˆÌÊHš\ÚX›SÝ™\ŒÌÊÊÎÂˆYˆ
+ØY[˜ÙS\ÈˆL
+Hš\ÚX›SÝ™\ŒL
+ÊÎÂˆ\Ýœ˜[YS\ÈHœ˜[YS\ÎÂˆYˆ
+˜Y‘Ø\\Èˆ
+H\Ý˜Y‘Ø\\ÈH˜Y‘Ø\\ÎÂˆœ˜[YR\ÝÜžVÚ\ÝÜžRXYHHœ˜[YS\ÎÂˆ˜Y‘Ø\\ÝÜžVÚ\ÝÜžRXYHH˜Y‘Ø\\ÎÂˆYˆ
+˜Y‘Ø\\ÈˆUÒÓTÈ	‰ˆ]Ú[Y\Ë›[™ÝMŠHÂˆËÈ™XÛÜ™HØ[˜XÚÈÛÜÝ[Û™ÜÚYHHØ\ˆHÛÈÙÙ]\ˆØ^BˆËÈÚ\™HH]Ú]™\ÈÚ]Ý][žH›Ùš[[™ÎˆHØ\]X]Ú\È]ÂˆËÈØ[˜XÚÈ\È˜]˜HÛÜšÈ[œÚYHHœ˜[YKÚ[HHØuÛ¾ô¶‰žËkºwµçB†V–v‡C¢‡Ò“°¢Ò6F6‚†R’²&WGW&â&öÖ—6Rç&W6öÇfR‡¶W'&÷#¢'6VÆc¢"²†RbbRæÖW76vR—Ò“²Ð¢Ò’‚“°¢6öç7BÒ&öÖ—6RæÆÂ…·6VÆd6†V6²ÂââæVçG&–W2æÖ‚†R’ÓâvÆö&ÅF†—2æÖ5vV$wRå÷&VF&6µFW‚†R’•Ò’çF†Vâ‚…·6VÆbÂââç&'5Ò’Óâ°¢6öç7B÷WBÒ&÷w2æÖ‚‡"Â’’Óâö&¦V7Bæ76–vâ‡·ÒÂ"Â&'5¶•Ò’“°¢÷FW„F–u6æ6†÷BÒ·&VF&6µ6VÆc¢6VÆbÂ&÷w3¢÷WBÂWÆöD'”Æ&VÃ¢ö&¦V7Bæg&öÔVçG&–W2…÷WÆöD'”Æ&VÂ’Â&V6VçD7&VFVC¢÷&V6VçD7&VFVBç6Æ–6R‚Ó#B—Ó°¢6öç6öÆRæÆör‚%µDU‚ÔD”uÒ&VF&6µ6VÆb„ÕU5B&RæöåG&ç7ãVÇ6R&VF&6²—2'&ö¶Vâ“¢"Â¥4ôâç7G&–æv–g’‡6VÆb’“°¢6öç6öÆRæÆör‚%µDU‚ÔD”uÒWÆöD'”Æ&VÂ·WÆöG2Æ'—FW5Ò†FÆ2wV’çærWÆöG3Ó†W&R(y"FÆ2G'VÇ’æWfW"WÆöFVB“¢"Â¥4ôâç7G&–æv–g’„ö&¦V7Bæg&öÔVçG&–W2…÷WÆöD'”Æ&VÂ’’“°¢6öç6öÆRæÆör‚%µDU‚ÔD”uÒ&V6VçD7&VFVB†Æ&VÇÇv‡ÇWÆöG2’(	BÆöö²f÷"wV’çærv—F‚WÆöG3ãF†B—2äõBF†R6×ÆVB–ç7Fæ6R(y"7FÆR†æFÆR“¢"Â¥4ôâç7G&–æv–g’…÷&V6VçD7&VFVBç6Æ–6R‚Ó#B’æÖ‚‡"’Óâ‡¶Æ&VÃ¢‡"æÆ&VÂÇÂ#ò"’ç6Æ–6RƒÂ#b’Âvƒ¢"çv‚ÂWÆöG3¢"åöRò‡"åöRå÷WÆöG2ÇÂ’¢Ò’’’“°¢G'’²6öç6öÆRçF&ÆR†÷WB“²Ò6F6‚·Ð¢6öç6öÆRæÆör‚%µDU‚ÔD”uÒ6×ÆVB&÷w2‡WÆöG3Ö–ç7BWÆöG3²Æ&VÅWÆöG3×F÷FÂf÷"F†BÆ&VÃ²æöä&Æ6²öæöåG&ç7g&öÒv†öÆR×FW‚&VF&6²“¢"Â¥4ôâç7G&–æv–g’†÷WB’“°¢&WGW&â÷WC°¢Ò“°¢&WGW&â°¢ÒÀ¢÷FW„F–u6æ6†÷C¢‚’Óâ÷FW„F–u6æ6†÷BÀ¢öföçE&ö&S¢‚’Óâ‡¶G&w3¢öföçDG&u&–ærÂ7FG3¢²ââåöföçE757FG2çfÇVW2‚•×Ò’À¢öFÆ5&ö&S¢‚’Óâ‡°¢F&vWG3¢ö&¦V7Bæg&öÔVçG&–W2…öæ–ÕF&vWD6÷VçG2’À¢wV“¢öwV”FÆ5&–ærÀ¢76VÖ&Ç”öfeF&vWC¢ö6Ô&BÀ¢67&VVå7&—FTG&w3¢÷66GFW$G&w0¢Ò’À¢÷FW‡GW&U&ö&S¢†æVVFÆR’Óâ°¢6öç7BVW'’Ò7G&–ær†æVVFÆRÇÂ""’çFôÆ÷vW$66R‚“°¢6öç7BVçG&–W2Ò÷&V6VçD7&VFV@¢æf–ÇFW"‚‡&V6÷&B’Óâ7G&–ær‡&V6÷&BæÆ&VÂÇÂ""’çFôÆ÷vW$66R‚’æ–æ6ÇVFW2‡VW'’’¢æÖ‚‡&V6÷&B’Óâ&V6÷&BåöR¢æf–ÇFW"„&ööÆVâ“°¢&WGW&â&öÖ—6RæÆÂ†VçG&–W2æÖ†7–æ2†VçG'’’Óâ‡°¢Æ&VÃ¢VçG'’åöÆ&VÂÀ¢†æFÆS¢VçG'’åö†–BÀ¢6—¦S¢G¶VçG'’çv–GF‡×‚G¶VçG'’æ†V–v‡G×‚G¶VçG'’æFWF‚ÇÂÖÀ¢f÷&ÖC¢VçG'’æf÷&ÖBÀ¢WÆöG3¢VçG'’å÷WÆöG2ÇÂÀ¢WÆöD'—FW3¢VçG'’å÷WÆöD'—FW2ÇÂÀ¢WÆöE&Vv–öç3¢VçG'’å÷WÆöE&Vv–öç2ÇÂµÒÀ¢&VF&6³¢v—BvÆö&ÅF†—2æÖ5vV$wRå÷&VF&6µFW‚†VçG'’¢Ò’’“°¢ÒÀ¢÷FW‡GW&U6×ÆW3¢†æVVFÆRÂ6ö÷&G2’ÓâæWr&öÖ—6R‚‡&W6öÇfR’Óâ°¢G'’°¢6öç7BVW'’Ò7G&–ær†æVVFÆRÇÂ""’çFôÆ÷vW$66R‚“°¢6öç7B&V6÷&BÒ²ââå÷&V6VçD7&VFVEÒç&WfW'6R‚¢æf–æB‚†—FVÒ’Óâ7G&–ær†—FVÒæÆ&VÂÇÂ""’çFôÆ÷vW$66R‚’æ–æ6ÇVFW2‡VW'’’“°¢6öç7BVçG'’Ò&V6÷&CòåöS°¢–b‚VçG'’’°¢&W6öÇfR‡¶W'&÷#¢'FW‡GW&Ræ÷Bf÷VæB'Ò“°¢&WGW&ã°¢Ð¢6öç7BrÒVçG'’çv–GF‚Â‚ÒVçG'’æ†V–v‡BÂ'"ÒÖF‚æ6V–Â‡r¢Bò#Sb’¢#Sc°¢6öç7B'VffW"ÒFWf–6Ræ7&VFT'VffW"‡°¢6—¦S¢'"¢‚À¢W6vS¢uT'VffW%W6vRä4õ•ôE5BÂuT'VffW%W6vRäÔõ$T@¢Ò“°¢6öç7BVæ6öFW"ÒFWf–6Ræ7&VFT6öÖÖæDVæ6öFW"‚“°¢Væ6öFW"æ6÷•FW‡GW&UFô'VffW"€¢·FW‡GW&S¢VçG'’çFW‡GW&WÒÀ¢¶'VffW"Â'—FW5W%&÷s¢'"Â&÷w5W$–ÖvS¢‡ÒÀ¢·v–GFƒ¢rÂ†V–v‡C¢‚ÂFWF„÷$'&”Æ–W'3¢Ð¢“°¢FWf–6RçVWVRç7V&Ö—B…¶Væ6öFW"æf–æ—6‚‚•Ò“°¢'VffW"æÖ7–æ2„uTÖÖöFRå$TB’çF†Vâ‚‚’Óâ°¢6öç7B'—FW2ÒæWrV–çC„'&’†'VffW"ævWDÖVE&ævR‚’ç6Æ–6Rƒ’“°¢'VffW"çVæÖ‚“°¢'VffW"æFW7G&÷’‚“°¢6öç7B&W7VÇBÒ„'&’æ—4'&’†6ö÷&G2’ò6ö÷&G2¢µÒ’æÖ‚…·RÂeÒ’Óâ°¢6öç7B7‚ÒÖF‚æÖ‚ƒÂÖF‚æÖ–â‡rÒÂÖF‚æfÆö÷"‡R¢r’’“°¢6öç7B7’ÒÖF‚æÖ‚ƒÂÖF‚æÖ–â†‚ÒÂÖF‚æfÆö÷"‡b¢‚’’“°¢6öç7BæV–v†&÷&†ööBÒµÓ°¢f÷"†ÆWBG’ÒÓ²G’ÃÒ²G’²²’f÷"†ÆWBG‚ÒÓ²G‚ÃÒ²G‚²²’°¢6öç7B‚ÒÖF‚æÖ‚ƒÂÖF‚æÖ–â‡rÒÂ7‚²G‚’“°¢6öç7B’ÒÖF‚æÖ‚ƒÂÖF‚æÖ–â†‚ÒÂ7’²G’’“°¢6öç7Böfg6WBÒ’¢'"²‚¢C°¢æV–v†&÷&†ööBçW6‚…·‚Â’Âââæ'—FW2ç6Æ–6R†öfg6WBÂöfg6WB²B•Ò“°¢Ð¢&WGW&â·Wc¢·RÂeÒÂ—†VÃ¢¶7‚Â7•ÒÂæV–v†&÷&†ööGÓ°¢Ò“°¢ÆWBÖ–å‚ÒrÂÖ–å’Ò‚ÂÖ…‚ÒÓÂÖ…’ÒÓÂæöç¦W&òÒ°¢6öç7Bf—'7BÒµÓ°¢f÷"†ÆWB’Ò²’Âƒ²’²²’f÷"†ÆWB‚Ò²‚Âs²‚²²’°¢6öç7Böfg6WBÒ’¢'"²‚¢C°¢–b†'—FW5¶öfg6WEÒÇÂ'—FW5¶öfg6WB²ÒÇÂ'—FW5¶öfg6WB²%ÒÇÂ'—FW5¶öfg6WB²5Ò’°¢æöç¦W&ò²³°¢Ö–å‚ÒÖF‚æÖ–â†Ö–å‚Â‚“²Ö–å’ÒÖF‚æÖ–â†Ö–å’Â’“°¢Ö…‚ÒÖF‚æÖ‚†Ö…‚Â‚“²Ö…’ÒÖF‚æÖ‚†Ö…’Â’“°¢–b†f—'7BæÆVæwF‚ÂC’f—'7BçW6‚…·‚Â’Âââæ'—FW2ç6Æ–6R†öfg6WBÂöfg6WB²B•Ò“°¢Ð¢Ð¢&W6öÇfR‡°¢Æ&VÃ¢VçG'’åöÆ&VÂÀ¢6—¦S¢·rÂ…ÒÀ¢WÆöG3¢VçG'’å÷WÆöE&Vv–öç2ÇÂµÒÀ¢æöç¦W&òÀ¢&÷VæG3¢æöç¦W&òò¶Ö–å‚ÂÖ–å’ÂÖ…‚ÂÖ…•Ò¢çVÆÂÀ¢f—'7BÀ¢6×ÆW3¢&W7VÇ@¢Ò“°¢Ò’æ6F6‚‚†W'&÷"’Óâ&W6öÇfR‡¶W'&÷#¢&Ö¢"²W'&÷"æÖW76vWÒ’“°¢Ò6F6‚†W'&÷"’°¢&W6öÇfR‡¶W'&÷#¢7G&–ær†W'&÷#òæÖW76vRÇÂW'&÷"—Ò“°¢Ð¢Ò’À¢òòD”s¢ÆFRÆ–fWF–ÖRGV×â–ç7Fæ6W5W$Æ&VÂÆ—7G2UdU%’7&VFVBFW‡GW&P¢òò–ç7Fæ6Rf÷"Æ&VÇ2F†B6öçF–âFÆ2öwV’öföçBöÖVçR÷F—FÆR‡v—F‚V6€¢òò–ç7Fæ6Rw2WÆöB6÷VçB’Â6òvR6â6VR6×ÆVBÖ'WBÖV×G’–ç7Fæ6RæW‡@¢òòFòâWÆöFVBöæR‡7FÆR†æFÆR’õ"6öæf—&ÒF†RFÆ2Æ&VÂæWfW"v÷Bç¢òòWÆöBBÆÂ‡WÆöB×F‚v’âWÆöD'”Æ&VÂ—2F†RvÆö&ÂF÷FÂà¢÷FW„F–tÆFS¢‚’Óâ°¢6öç7B'”Æ&VÂÒ·Ó°¢f÷"†6öç7B"öb÷&V6VçD7&VFVB’°¢6öç7B²Ò"æÆ&VÂÇÂ#ò#°¢†'”Æ&VÅ¶µÒÒ'”Æ&VÅ¶µÒÇÂµÒ’çW6‚‡"åöRò‡"åöRå÷WÆöG2ÇÂ’¢Ó“°¢Ð¢6öç7B–çFW&W7F–ærÒ·Ó°¢f÷"†6öç7B²öbö&¦V7Bæ¶W—2†'”Æ&VÂ’’°¢–b‚öFÆ7ÆwV—ÆföçGÆÖVçWÇF—FÆWÇv–FvWGÆÖ—76–ærö’çFW7B†²’’–çFW&W7F–æu¶µÒÒ¶–ç7Fæ6W3¢'”Æ&VÅ¶µÒÂF÷FÅWÆöG3¢…÷WÆöD'”Æ&VÂævWB†²’ÇÂ³Ò•³×Ó°¢Ð¢6öç7B÷WBÒ·F–6³¢vÆö&ÅF†—2æÖ5vV%V×òçF–6·2ÇÂÂ–çFW&W7F–æt–ç7Fæ6W3¢–çFW&W7F–ærÂWÆöD'”Æ&VÅF÷FÇ3¢ö&¦V7Bæg&öÔVçG&–W2…²ââå÷WÆöD'”Æ&VÂæVçG&–W2‚•Òæf–ÇFW"‚…¶µÒ’ÓâöFÆ7ÆwV—ÆföçGÆÖVçWÇF—FÆWÇv–FvWBö’çFW7B†²’’—Ó°¢÷FW„F–u6æ6†÷BÒ÷WC°¢òòD”s¢W"Ö†æFÆR–FVçF—G’6†V6²â6×ÆVEµÒÒFW‡GW&W27GVÆÇ’&÷VæBf÷ ¢òò6×Æ–ær‡v—F‚F†V—"WÆöB6÷VçB“²WÆöFVDæ÷E6×ÆVEµÒÒFW‡GW&W2F†@¢òòv÷Bw&—FUFW‡GW&ScB'WBvW&RäUdU"6×ÆVBâ–b6×ÆVBFÆ2÷v–FvW@¢òò6†÷w2WÆöG3Óv†–ÆRâWÆöFVDæ÷E6×ÆVBVçG'’6†&W2—G2Æ&VÂÓâF†P¢òò&–æBw&÷W6×ÆW2D”ddU$TåB–ç7Fæ6RF†âF†RWÆöB‡7FÆR†æFÆR’à¢6öç7B6×ÆVBÒ²ââå÷6×ÆVDVçG&–W5Òæf–ÇFW"‚†R’ÓâöFÆ7ÆwV—Çv–FvWGÇF—FÆWÆföçBòçFW7B†RåöÆ&VÂÇÂ""’’ç6Æ–6RƒÂC¢æÖ‚†R’Óâ‡¶Æ&VÃ¢†RåöÆ&VÂÇÂ#ò"’ç6Æ–6RƒÂ#B’Â†–C¢Råö†–BÂWÆöG3¢Rå÷WÆöG2ÇÂÂvƒ¢G¶Rçv–GF‡×‚G¶Ræ†V–v‡GÖÒ’“°¢6öç7B6×ÆVE6WBÒæWr6WB…²ââå÷6×ÆVDVçG&–W5Ò“°¢6öç7BWÆöFVDæ÷E6×ÆVBÒ÷&V6VçD7&VFVBæf–ÇFW"‚‡"’Óâ"åöRbb‡"åöRå÷WÆöG2ÇÂ’âbb6×ÆVE6WBæ†2‡"åöR’bböFÆ7ÆwV—Çv–FvWGÇF—FÆWÆföçBòçFW7B‡"æÆ&VÂÇÂ""’¢ç6Æ–6RƒÂC’æÖ‚‡"’Óâ‡¶Æ&VÃ¢‡"æÆ&VÂÇÂ#ò"’ç6Æ–6RƒÂ#B’Â†–C¢"åöRåö†–BÂWÆöG3¢"åöRå÷WÆöG2ÇÂÒ’“°¢6öç6öÆRæÆör‚%µDU‚Ô”DTåD•E•Ò6×ÆVB††–C§WÆöG2’(	BWÆöG3Óöâ6×ÆVBFÆ2÷v–FvWBÖVç2F†R6×ÆVB–ç7Fæ6RæWfW"v÷BFF¢"Â¥4ôâç7G&–æv–g’‡6×ÆVB’“°¢6öç6öÆRæÆör‚%µDU‚Ô”DTåD•E•ÒWÆöFVBÖ'WBÔäUdU"×6×ÆVB††–C§WÆöG2’(	B–bÆ&VÂ†W&RÖF6†W26×ÆVBWÆöG3ÓÆ&VÂÓâ7FÆR†æFÆS¢"Â¥4ôâç7G&–æv–g’‡WÆöFVDæ÷E6×ÆVB’“°¢6öç6öÆRæÆör‚%µDU‚ÔD”rÔÄDUÒ†g&ÖSã#’–ç7Fæ6W5W$Æ&VÇµ·WÆöG2W"–ç7Fæ6U×Ò²F÷FÇ2â–bÆ&VÂ6†÷w2–ç7Fæ6W2Æ–¶R³ÃãÒF†R6×ÆVB³ÒöæR—25DÄR†æFÆS²–bÆ&VÂ—2'6VçBg&öÒF÷FÇ2—BäUdU"WÆöFVC¢"Â¥4ôâç7G&–æv–g’†÷WB’“°¢&WGW&â÷WC°¢ÒÀ¢—5&VG“¢‚’Óâ&ööÆVâ†FWf–6R’À¢FW‡GW&UfÆ–FF–öå&W÷'C¢‚’Óà¢vÆö&ÅF†—2æÖ5vV$wSòå÷FW‡GW&UfÆ–FF–öâóò÷FW‡GW&TÆ–fWF–ÖRçfÆ–FF–öå&W÷'B‚’À¢òò&öw&W72†—7F÷'’Â–æFWVæFVçBöb6öç6öÆRæÆös¢6†GG’'Vâ6â÷fW&fÆ÷p¢òòF†R4E6öç6öÆR—RæBG&÷W†7FÇ’F†Rf–ÇW&RÆ–æR–÷RæVVBà¢7FvW3¢†6÷VçBÒC’ÓâF–væ÷7F–72ç7FvW2ç6Æ–6R‚Ö6÷VçB’À¢ò¢¢F†R6ÖR&–ærv—F‚vR×&VÆF—fRÖ–ÆÆ—6V6öæG2ÂæWvW7BÆ7Bâ¢ð¢7FvUF–ÖVÆ–æS¢†6÷VçBÒC’ÓâF–væ÷7F–72ç7FvW2ç6Æ–6R‚Ö6÷VçB¢æÖ‚‡7FvRÂ–æFW‚’Óâ¶F–væ÷7F–72ç7FvT×2ç6Æ–6R‚Ö6÷VçB•¶–æFW…ÒÂ7FvUÒ’À¢&VÆöE&ö&S¢†6÷VçBÒƒ’Óâ‡°¢WfVçG3¢F–væ÷7F–72ç&VÆöE&ö&Rç6Æ–6R‚Ö6÷VçB’À¢F‡&VG3¢vÆö&ÅF†—2æÖ5vV%F‡&VE'VçF–ÖSòæ–æfóòâ‚’óòçVÆÂÀ¢Ò’À¢6çf5v–GFƒ¢‚’Óâ6çf2çv–GF‚À¢6çf4†V–v‡C¢‚’Óâ6çf2æ†V–v‡BÀ¢FFW$æÖS¢‚’Óà¢FFW#òæ–æfóòæFW67&—F–öâÇÂFFW#òæ–æfóòæFWf–6RÇÂ$'&÷w6W"vV$uRFFW""À ¢7&VFUFW‡GW&R†Æ&VÂÂW6vRÂf÷&ÖBÂv–GF‚Â†V–v‡BÂFWF‚ÂÖ—2’°¢Ö&´6ÆÂ‚&7&VFUFW‡GW&R"Â¶Æ&VÂÂW6vRÂf÷&ÖBÂv–GF‚Â†V–v‡BÂFWF‚ÂÖ—7Ò“°¢6öç7BwTf÷&ÖBÒÖ–æV7&gDf÷&ÖB†f÷&ÖB“°¢6öç7Bö†æFÆRÒWB‡°¢¶–æC¢'FW‡GW&R"À¢FW‡GW&S¢FWf–6Ræ7&VFUFW‡GW&R‡°¢Æ&VÂÀ¢6—¦S¢·v–GF‚Â†V–v‡BÂFWF„÷$'&”Æ–W'3¢FWF‡ÒÀ¢Ö—ÆWfVÄ6÷VçC¢Ö—2À¢6×ÆT6÷VçC¢À¢F–ÖVç6–öã¢#&B"À¢f÷&ÖC¢wTf÷&ÖBÀ¢òòf÷&6RF†R6÷’&—G3¢Öö¦ærw2&W6VçFW"&Æ—G2F†RÖ–âF&vWBFð¢òòF†R6çf2v—F‚6÷•FW‡GW&UFõFW‡GW&RÂ'WBF†RÖ–âF&vWB—0¢òò7&VFVBv—F†÷WB4õ•õ5$2âW‡G&W6vR&—G2&R†&ÖÆW72à¢W6vS¢Ö–æV7&gEFW‡GW&UW6vR‡W6vR’ÂuUFW‡GW&UW6vRä4õ•õ5$2ÂuUFW‡GW&UW6vRä4õ•ôE5@¢Ò’À¢f÷&ÖC¢wTf÷&ÖBÀ¢v–GF‚À¢†V–v‡BÀ¢FWF‚À¢öÆ&VÃ¢Æ&VÂÀ¢ö†–C¢æW‡D†æFÆRÒÂòòD”s¢7F&ÆR†æFÆR–BöbF†—2FW‡GW&R–ç7Fæ6P¢÷WÆöG3¢ÂòòD”s¢†÷rÖç’w&—FUFW‡GW&ScBWÆöG2ÆæFVBöâF†—2FW‡GW&P¢÷WÆöD'—FW3¢À¢÷WÆöE&Vv–öç3¢µÐ¢Ò“°¢6öç7BöVçG'’Òö&¦V7G2ævWB…ö†æFÆR“°¢÷FW‡GW&TÆ–fWF–ÖRæ–æ—F–Æ—¦UFW‡GW&R…öVçG'’“°¢÷&V6VçD7&VFVBçW6‚‡¶Æ&VÂÂvƒ¢G·v–GF‡×‚G¶†V–v‡G×‚G¶FWF‡ÖÂf×C¢wTf÷&ÖBÂöS¢öVçG'—Ò“²òòD”r&Vv—7G'¢–b‚÷æ÷&Öö’çFW7B†Æ&VÂ’’÷æõ&ö&Ræ7&VFVBçW6‚‡²Æ&VÂÂs¢v–GF‚Âƒ¢†V–v‡BÂFWF‚Âf×C¢wTf÷&ÖBÂW6vRÂ†–C¢öVçG'’åö†–BÒ“°¢&WGW&âö†æFÆS°¢ÒÀ ¢7&VFUFW‡GW&Uf–Wr‡FW‡GW&T†æFÆRÂ&6TÖ—ÂÖ—ÆWfVÇ2ÂF–ÖVç6–öâ’°¢Ö&´6ÆÂ‚&7&VFUFW‡GW&Uf–Wr"Â·FW‡GW&T†æFÆRÂ&6TÖ—ÂÖ—ÆWfVÇ2ÂF–ÖVç6–öçÒ“°¢6öç7BVçG'’ÒvWB‡FW‡GW&T†æFÆRÂ'FW‡GW&R"“°¢6öç7Bf–WtVçG'’Ò°¢¶–æC¢'FW‡GW&Uf–Wr"À¢f–Ws¢VçG'’çFW‡GW&Ræ7&VFUf–Wr‡°¢F–ÖVç6–öã¢F–ÖVç6–öâÓÓÒ&7V&R"ò&7V&R"¢#&B"À¢&6TÖ—ÆWfVÃ¢&6TÖ—À¢Ö—ÆWfVÄ6÷VçC¢Ö—ÆWfVÇ0¢Ò’À¢FW‡GW&TVçG'“¢VçG'’À¢òòæVVFVBFòFVÆÂ'F†RFÆ2v27F—F6†VB"g&öÒ&öæÇ’Ö—v0¢òò7F—F6†VB#¢FW‡GW&TFÆ2çWÆöBÖ¶W2öæRf–WrW"Ö—æB&Æ—G2–çFð¢òòV6‚ÂæBF—7FçB&Æö6²f6R6×ÆW2†–v‚Ö—ââVæf–ÆÆVBÖ— ¢òò&VG22Væ–f÷&Òv&&vRv†–ÆRÖ—7F–ÆÂÆöö·2W&fV7BW6Æ÷6Rà¢&6TÖ— ¢Ó°¢÷FW‡GW&TÆ–fWF–ÖRç&WF–åf–Wr†VçG'’“°¢&WGW&âWB‡f–WtVçG'’“°¢ÒÀ ¢7&VFU6×ÆW$§6öâ‡7V4§6öâ’°¢6öç7B7V2Ò¥4ôâç'6R‡7V4§6öâ“°¢Ö&´6ÆÂ‚&7&VFU6×ÆW""Â7V2“°¢6öç7BFG&W72Ò†ÖöFR’Óâ†ÖöFRÓÓÒ%$UTB"ò'&WVB"¢&6Æ××FòÖVFvR"“°¢6öç7BÆ–æV"Ò†f–ÇFW"’Óâf–ÇFW"ÓÓÒ$Ä”äT"#°¢6öç7B†æFÆRÒWB‡°¢¶–æC¢'6×ÆW""À¢6×ÆW#¢FWf–6Ræ7&VFU6×ÆW"‡°¢FG&W74ÖöFUS¢FG&W72‡7V2æFG&W75R’À¢FG&W74ÖöFUc¢FG&W72‡7V2æFG&W75b’À¢Ö–äf–ÇFW#¢Æ–æV"‡7V2æÖ–â’ò&Æ–æV""¢&æV&W7B"À¢Ötf–ÇFW#¢Æ–æV"‡7V2æÖr’ò&Æ–æV""¢&æV&W7B"À¢Ö—Öf–ÇFW#¢Æ–æV"‡7V2æÖ–â’ò&Æ–æV""¢&æV&W7B"À¢Ö„ÆöC¢7V2æÖ„ÆöBÓÒçVÆÂò3"¢7V2æÖ„Æö@¢Ò¢Ò“°¢†vÆö&ÅF†—2æÖ5vV$wRå÷6×ÆW%7V72ÇÃÒµÒ’çW6‚‡¶†æFÆRÂââç7V7Ò“°¢&WGW&â†æFÆS°¢ÒÀ ¢FW7G&÷•FW‡GW&R††æFÆR’°¢6öç7BVçG'’ÒvWB††æFÆRÂ'FW‡GW&R"“°¢÷FW‡GW&TÆ–fWF–ÖRç&WVW7DFW7G&÷’†VçG'’“°¢ö&¦V7G2æFVÆWFR††æFÆR“°¢ÒÀ ¢FW7G&÷”ö&¦V7B††æFÆR’°¢6öç7Bö&¦V7BÒö&¦V7G2ævWB††æFÆR“°¢–b†ö&¦V7Còæ¶–æBÓÓÒ'FW‡GW&R"’÷FW‡GW&TÆ–fWF–ÖRç&WVW7DFW7G&÷’†ö&¦V7B“°¢–b†ö&¦V7Còæ¶–æBÓÓÒ'FW‡GW&Uf–Wr"’÷FW‡GW&TÆ–fWF–ÖRç&VÆV6Uf–Wr†ö&¦V7B“°¢–b†ö&¦V7Còæ¶–æBÓÓÒ&'VffW""bbö&¦V7Bæ'VffW"’FVfW$FW7G&÷”'VffW"†ö&¦V7Bæ'VffW"“°¢ö&¦V7G2æFVÆWFR††æFÆR“°¢ÒÀ ¢7&VFT6öÖÖæDVæ6öFW"‚’°¢Ö&´6ÆÂ‚&7&VFT6öÖÖæDVæ6öFW""“°¢&WGW&âWB‡¶¶–æC¢&Væ6öFW""ÂVæ6öFW#¢FWf–6Ræ7&VFT6öÖÖæDVæ6öFW"‡¶Æ&VÃ¢$Ö–æV7&gB6öÖÖæDVæ6öFW"'Ò—Ò“°¢ÒÀ ¢7&VFT'VffW"†Æ&VÂÂW6vRÂ6—¦R’°¢Ö&´6ÆÂ‚&7&VFT'VffW""Â¶Æ&VÂÂW6vRÂ6—¦WÒ“°¢–b‡W6vRb#Sb’°¢†vÆö&ÅF†—2æÖ5vV$wRå÷FW†VÄ'VffW'2ÇÃÒµÒ’çW6‚‡¶Æ&VÂÂW6vRÂ6—¦WÒ“°¢Ð¢&WGW&âWB‡°¢¶–æC¢&'VffW""À¢6—¦RÂòò&WF–æVB6òVæ–f÷&Ò&–æG26â6F†V—"–æfÆFVB&ævRFòF†R'VffW ¢öÆ&VÃ¢Æ&VÂÂòòD”s¢f÷"T$ò–ç7V7F–öà¢òòD”s¢5RÖ—'&÷"öb'VffW"6öçFVçG2Âf÷"F†RT$ò÷fW'FW‚ö–æFW€¢òòFV6öFW'2&VÆ÷râ6¶—VB&÷fR4„DõuôÄ”Ô•C¢FW'&–âw2F‡&VP¢òò%V&W$'VffW"6öÆ–Bö7WF÷WB÷G&ç6ÇV6VçB"&R#‚Ö”"V6‚Â6òÖ—'&÷&–æp¢òòF†VÒ6÷7G2ã3ƒBÖ”"öb¥2†Vf÷"F–væ÷7F–72F†BöæÇ’WfW"–ç7V7@¢òò6ÖÆÂVæ–f÷&ÒæBuT’'VffW'2âWfW'’&VFW"—2çVÆÂÖwV&FVBÂæBF†P¢òòGvòw&—FW'2‡w&—FT'VffW"Â6÷”'VffW"’FW7Bf÷"—B&Vf÷&RÖ—'&÷&–ærà¢÷6†F÷s¢6—¦RÃÒ4„DõuôÄ”Ô•BòæWrV–çC„'&’‡6—¦R’¢çVÆÂÀ¢'VffW#¢FWf–6Ræ7&VFT'VffW"‡°¢Æ&VÂÀ¢6—¦RÀ¢òòöÖ7vV%ö6÷—7&3ÓÖ¶W2WfW'’'VffW"&VF&ÆRâVæ–f÷&Ò'VffW'2&P¢òòæ÷&ÖÆÇ’Tä”dõ$×Ä4õ•ôE5BÂ6ò6÷”'VffW%Fô'VffW"öâF†VÒ—2¢òòfÆ–FF–öâW'&÷"F†BÆVfW2F†RFW7F–æF–öâ¦W&òÖf–ÆÆVBÒÒv†–6€¢òò—2–æF—7F–æwV—6†&ÆRg&öÒF†RVæ–f÷&ÒvVçV–æVÇ’&V–ær¦W&òÂæ@¢òòÇ&VG’&öGV6VBöæRfÇ6R%&ö¤ÖB—2ÆÂ¦W&÷2"&VF–ærà¢W6vS¢Ö–æV7&gD'VffW%W6vR‡W6vR’Â…öf÷&6T6÷•7&2òuT'VffW%W6vRä4õ•õ5$2¢¢Ò¢Ò“°¢ÒÀ ¢FW7G&÷”'VffW"††æFÆR’°¢6öç7BVçG'’ÒvWB††æFÆRÂ&'VffW""“°¢–b†VçG'“òæ'VffW"’FVfW$FW7G&÷”'VffW"†VçG'’æ'VffW"“°¢ö&¦V7G2æFVÆWFR††æFÆR“°¢ÒÀ ¢w&—FT'VffW#cB††æFÆRÂFW7F–æF–öäöfg6WBÂ&6ScB’°¢6öç7Bö'—FW3Ò&6ScEFô'—FW2†&6ScB“°¢–b…öwU&ö&R’°¢æ÷FUVæ–f÷&Õ&ö&R†vWB††æFÆRÂ&'VffW""’Â†æFÆRÂFW7F–æF–öäöfg6WBÀ¢ö'—FW3Â&6ScBò&6ScBæÆVæwF‚¢“°¢Ð¢Ö&´6ÆÂ‚'w&—FT'VffW""Â¶†æFÆRÂFW7F–æF–öäöfg6WBÂ&6ScDÆVæwFƒ¢&6ScCòæÆVæwF‡Ò“°¢6öç7Bö&RÒvWB††æFÆRÂ&'VffW""“°¢6öç7Bö'—FW2Òö'—FW3°¢òòD”s¢¶VW5R6†F÷rf÷"T$ò–ç7V7F–öà¢–b…ö&Rå÷6†F÷rbbFW7F–æF–öäöfg6WB²ö'—FW2æÆVæwF‚ÃÒö&Rå÷6†F÷ræÆVæwF‚’°¢ö&Rå÷6†F÷rç6WB…ö'—FW2ÂFW7F–æF–öäöfg6WB“°¢Ð¢öæ÷FT'—FW2…ö&RÂ'w&—FR"Âö'—FW2æÆVæwF‚“°¢öæ÷FUWÆöD'—FW2…ö&RåöÆ&VÂÇÂ#ò"Âö'—FW2æÆVæwF‚“°¢FWf–6RçVWVRçw&—FT'VffW"…ö&Ræ'VffW"ÂFW7F–æF–öäöfg6WBÂö'—FW2“°¢ÒÀ ¢òò'—FW27G&–v‡Bg&öÒF†R6ÆÆW"ÂæòVæ6öF–ærBÆÂâF†R÷Vä¤D²ÆæP¢òò†æG2—G2WÆöG2÷fW"2G—VB'&’Âv†–6‚F†R%26÷–W2öæ6R–çFð¢òò—G26†&VD'&”'VffW#²&6ScB6÷7BâVæ6öFRÂF‡&VR7G&–ær6÷–W2æB¢òòFV6öFRf÷"FFF†Bv2Çv—2'—FW2â6ÖR&öG’2F†RÆ–æV"ÖÖVÖ÷'¢òòF‚Âv†–6‚Ç&VG’F¶W2'—FW2à¢w&—FT'VffW$'—FW2††æFÆRÂFW7F–æF–öäöfg6WBÂ'—FW2’°¢&WGW&âF†—2çw&—FT'VffW%&r††æFÆRÂFW7F–æF–öäöfg6WBÂ'—FW2“°¢ÒÀ ¢òòFW‡GW&R6÷VçFW''Böbw&—FT'VffW$'—FW3¢æò&6ScBÂæò7G&–æw2à¢w&—FUFW‡GW&T'—FW2††æFÆRÂ'—FW2ÂÖ—ÆWfVÂÂFWF„÷$Æ–W"Â‚Â’Âv–GF‚Â†V–v‡BÂ'—FW5W%&÷rÂ&÷w5W$–ÖvR’°¢&WGW&âF†—2çw&—FUFW‡GW&U&r††æFÆRÂ'—FW2ÂÖ—ÆWfVÂÂFWF„÷$Æ–W"Â‚Â’Âv–GF‚Â†V–v‡BÂ'—FW5W%&÷rÂ&÷w5W$–ÖvR“°¢ÒÀ ¢w&—FT'VffW%FW‡B††æFÆRÂFW7F–æF–öäöfg6WBÂFW‡BÂ'—FTÆVæwF‚’°¢6öç7B'—FW2Ò6¶VEFW‡EFô'—FW2‡FW‡BÂ'—FTÆVæwF‚“°¢–b…öwU&ö&R’°¢æ÷FUVæ–f÷&Õ&ö&R†vWB††æFÆRÂ&'VffW""’Â†æFÆRÂFW7F–æF–öäöfg6WBÂ'—FW2Â'—FTÆVæwF‚“°¢Ð¢Ö&´6ÆÂ‚'w&—FT'VffW""Â°¢†æFÆRÂFW7F–æF–öäöfg6WBÂ'—FTÆVæwF‚Â6¶VD6†'3¢FW‡BæÆVæwF€¢Ò“°¢6öç7B'VffW"ÒvWB††æFÆRÂ&'VffW""“°¢–b†'VffW"å÷6†F÷rbbFW7F–æF–öäöfg6WB²'—FTÆVæwF‚ÃÒ'VffW"å÷6†F÷ræÆVæwF‚’°¢'VffW"å÷6†F÷rç6WB†'—FW2ÂFW7F–æF–öäöfg6WB“°¢Ð¢öæ÷FT'—FW2†'VffW"Â'w&—FR"Â'—FTÆVæwF‚“°¢öæ÷FUWÆöD'—FW2†'VffW"åöÆ&VÂÇÂ#ò"Â'—FTÆVæwF‚“°¢FWf–6RçVWVRçw&—FT'VffW"†'VffW"æ'VffW"ÂFW7F–æF–öäöfg6WBÂ'—FW2“°¢ÒÀ ¢ò¢ ¢¢G—VBÖ'&’WÆöBF‚âv6ÔÄÒ76W2f–Wr–çFò—G26†&VB¦f†V°¢¢v6Ôt2w2&r&VFW"'&–FvR76W2F†RW†7BFV6öFVB67&F6‚f–Wrv—F†÷W@¢¢ÖFW&–Æ—¦–ær¦f7G&–ærà¢¢ð¢w&—FT'VffW%&r††æFÆRÂFW7F–æF–öäöfg6WBÂ'—FW2’°¢6öç7B'—FTÆVæwF‚Ò'—FW3òæ'—FTÆVæwF‚óò°¢6öç7BVçG'’ÒvWB††æFÆRÂ&'VffW""“°¢òòGvòVæ–f÷&ÒÖ'VffW"&ö&W2W6VBFò'VâöâWfW'’WÆöC¢&VvW‚÷fW ¢òòF†RÆ&VÂÂæB(	Bf÷"ç’'VffW"ÃÒ#Sb"Âv†–6‚—2WfW'’T$ò6Æ÷B(	@¢òò6Æ–6RÇW2GvòG—VBÖ'&’ÖFW&–Æ—¦F–öç2v—F‚&÷VæF–ærÖà¢òòF†W’ç7vW"VW7F–öç2g&öÒF†RFÆ2÷Væ–f÷&Ò–çfW7F–vF–öç2Â6òF†W¢òò&R¶WBÂ&V†–æBF†RfÆrF†B6·2f÷"F†VÒà¢–b…öwU&ö&R’æ÷FUVæ–f÷&Õ&ö&R†VçG'’Â†æFÆRÂFW7F–æF–öäöfg6WBÂ'—FW2Â'—FTÆVæwF‚“°¢Ö&´6ÆÂ‚'w&—FT'VffW%&r"Â¶†æFÆRÂFW7F–æF–öäöfg6WBÂ'—FTÆVæwF‡Ò“°¢–b†VçG'’å÷6†F÷rbbFW7F–æF–öäöfg6WB²'—FTÆVæwF‚ÃÒVçG'’å÷6†F÷ræÆVæwF‚’°¢VçG'’å÷6†F÷rç6WB†'—FW2ÂFW7F–æF–öäöfg6WB“°¢Ð¢öæ÷FT'—FW2†VçG'’Â'w&—FR"Â'—FTÆVæwF‚“°¢öæ÷FUWÆöD'—FW2†VçG'’åöÆ&VÂÇÂ#ò"Â'—FTÆVæwF‚“°¢FWf–6RçVWVRçw&—FT'VffW"†VçG'’æ'VffW"ÂFW7F–æF–öäöfg6WBÂ'—FW2“°¢ÒÀ ¢w&—FUFW‡GW&ScB††æFÆRÂ&6ScBÂÖ—ÆWfVÂÂFWF„÷$Æ–W"Â‚Â’Âv–GF‚Â†V–v‡BÂ'—FW5W%&÷rÂ&÷w5W$–ÖvR’°¢Ö&´6ÆÂ‚'w&—FUFW‡GW&R"Â¶†æFÆRÂÖ—ÆWfVÂÂFWF„÷$Æ–W"Â‚Â’Âv–GF‚Â†V–v‡BÂ'—FW5W%&÷rÂ&÷w5W$–ÖvRÂ&6ScDÆVæwFƒ¢&6ScCòæÆVæwF‡Ò“°¢6öç7B÷FRÒvWB††æFÆRÂ'FW‡GW&R"“°¢÷FRå÷WÆöG2Ò…÷FRå÷WÆöG2ÇÂ’²²òòD”p¢òò7W'f—fW2FW7G&÷•FW‡GW&S¢&V6÷&G2F†BÆ&VÂv2w&—GFVâBÆÂÂæ@¢òòöâv†–6‚†æFÆRâ–bâFÆ26†÷w2w&—FW2†W&R'WBF†R†æFÆRFW'&–à¢òò6×ÆW2†2æöæRÂF†RWÆöBÆæFVBöâ6–æ6R×&WÆ6VB–ç7Fæ6RÒÐ¢òòF†R'7FÆR†æFÆR"66RF†R&ö&R&VÆ÷rv2w&—GFVâFò6F6‚à¢°¢6öç7BvÂÒ†vÆö&ÅF†—2æÖ5vV$wRå÷FW…w&—FTÆörÇÃÒ·Ò“°¢6öç7B¶W’Ò…÷FRåöÆ&VÂÇÂ#ò"“°¢6öç7B&V2Ò‡vÅ¶¶W•ÒÇÃÒ·w&—FW3¢Â†æFÆW3¢µ×Ò“°¢&V2çw&—FW2²³°¢–b‚&V2æ†æFÆW2æ–æ6ÇVFW2††æFÆR’’&V2æ†æFÆW2çW6‚††æFÆR“°¢Ð¢÷FRå÷WÆöD'—FW2Ò…÷FRå÷WÆöD'—FW2ÇÂ’²†&6ScBò&6ScBæÆVæwF‚¢“²òòD”r†&6ScBÆVâ(‰Ò'—FW2¢–b…÷FRå÷WÆöE&Vv–öç2æÆVæwF‚Â’°¢÷FRå÷WÆöE&Vv–öç2çW6‚‡¶Ö—ÆWfVÂÂFWF„÷$Æ–W"Â‚Â’Âv–GF‚Â†V–v‡BÂ'—FW5W%&÷rÂ&÷w5W$–ÖvWÒ“°¢Ð¢²6öç7Bö²Ò÷FRåöÆ&VÂÇÂ#ò#²6öç7B÷RÒ÷WÆöD'”Æ&VÂævWB…ö²’ÇÂ³ÂÓ²÷U³Ò²³²÷U³Ò³Ò&6ScBò&6ScBæÆVæwF‚¢²÷WÆöD'”Æ&VÂç6WB…ö²Â÷R“²ÒòòD”p¢–b‚÷æ÷&Öö’çFW7B…÷FRåöÆ&VÂ’’÷æõ&ö&RçWÆöG2çW6‚‡²†–C¢÷FRåö†–BÂÆ&VÃ¢÷FRåöÆ&VÂÂÆ–W#¢FWF„÷$Æ–W"Âs¢v–GF‚Âƒ¢†V–v‡BÂÖ—¢Ö—ÆWfVÂÂ#cFÆVã¢&6ScBò&6ScBæÆVæwF‚¢Ò“°¢FWf–6RçVWVRçw&—FUFW‡GW&R€¢·FW‡GW&S¢÷FRçFW‡GW&RÂÖ—ÆWfVÂÂ÷&–v–ã¢·‚Â’Â£¢FWF„÷$Æ–W'×ÒÀ¢&6ScEFô'—FW2†&6ScB’À¢¶'—FW5W%&÷rÂ&÷w5W$–ÖvWÒÀ¢·v–GF‚Â†V–v‡BÂFWF„÷$'&”Æ–W'3¢Ð¢“°¢ÒÀ ¢ò¢¢v6ÔÄÒFW‡GW&RWÆöC¢6öç7VÖRF†R6†&VBÆ–æV"ÖÖVÖ÷'’f–WrF—&V7FÇ’â¢ð¢w&—FUFW‡GW&U&r††æFÆRÂ'—FW2ÂÖ—ÆWfVÂÂFWF„÷$Æ–W"Â‚Â’Âv–GF‚Â†V–v‡BÂ'—FW5W%&÷rÂ&÷w5W$–ÖvR’°¢6öç7B'—FTÆVæwF‚Ò'—FW3òæ'—FTÆVæwF‚óò°¢Ö&´6ÆÂ‚'w&—FUFW‡GW&U&r"Â¶†æFÆRÂÖ—ÆWfVÂÂFWF„÷$Æ–W"Â‚Â’Âv–GF‚Â†V–v‡BÂ'—FW5W%&÷rÂ&÷w5W$–ÖvRÂ'—FTÆVæwF‡Ò“°¢6öç7B÷FRÒvWB††æFÆRÂ'FW‡GW&R"“°¢÷FRå÷WÆöG2Ò…÷FRå÷WÆöG2ÇÂ’²°¢°¢6öç7BvÂÒ†vÆö&ÅF†—2æÖ5vV$wRå÷FW…w&—FTÆörÇÃÒ·Ò“°¢6öç7B¶W’Ò…÷FRåöÆ&VÂÇÂ#ò"“°¢6öç7B&V2Ò‡vÅ¶¶W•ÒÇÃÒ·w&—FW3¢Â†æFÆW3¢µ×Ò“°¢&V2çw&—FW2²³°¢–b‚&V2æ†æFÆW2æ–æ6ÇVFW2††æFÆR’’&V2æ†æFÆW2çW6‚††æFÆR“°¢Ð¢÷FRå÷WÆöD'—FW2Ò…÷FRå÷WÆöD'—FW2ÇÂ’²'—FTÆVæwFƒ°¢–b…÷FRå÷WÆöE&Vv–öç2æÆVæwF‚Â’°¢÷FRå÷WÆöE&Vv–öç2çW6‚‡¶Ö—ÆWfVÂÂFWF„÷$Æ–W"Â‚Â’Âv–GF‚Â†V–v‡BÂ'—FW5W%&÷rÂ&÷w5W$–ÖvWÒ“°¢Ð¢²6öç7Bö²Ò÷FRåöÆ&VÂÇÂ#ò#²6öç7B÷RÒ÷WÆöD'”Æ&VÂævWB…ö²’ÇÂ³ÂÓ²÷U³Ò²³²÷U³Ò³Ò'—FTÆVæwFƒ²÷WÆöD'”Æ&VÂç6WB…ö²Â÷R“²Ð¢–b‚÷æ÷&Öö’çFW7B…÷FRåöÆ&VÂ’’÷æõ&ö&RçWÆöG2çW6‚‡¶†–C¢÷FRåö†–BÂÆ&VÃ¢÷FRåöÆ&VÂÂÆ–W#¢FWF„÷$Æ–W"Âs¢v–GF‚Âƒ¢†V–v‡BÂÖ—¢Ö—ÆWfVÂÂ'—FTÆVæwF‡Ò“°¢FWf–6RçVWVRçw&—FUFW‡GW&R€¢·FW‡GW&S¢÷FRçFW‡GW&RÂÖ—ÆWfVÂÂ÷&–v–ã¢·‚Â’Â£¢FWF„÷$Æ–W'×ÒÀ¢'—FW2À¢¶'—FW5W%&÷rÂ&÷w5W$–ÖvWÒÀ¢·v–GF‚Â†V–v‡BÂFWF„÷$'&”Æ–W'3¢Ð¢“°¢ÒÀ ¢6ÆV$6öÆ÷%FW‡GW&R†Væ6öFW$†æFÆRÂFW‡GW&T†æFÆRÂ"ÂrÂ"Â’°¢6öç7BVæ6öFW"ÒvWB†Væ6öFW$†æFÆRÂ&6öÖÖæBVæ6öFW""’æVæ6öFW#°¢6öç7BFW‡GW&RÒvWB‡FW‡GW&T†æFÆRÂ'FW‡GW&R"’çFW‡GW&S°¢6öç7B72ÒVæ6öFW"æ&Vv–å&VæFW%72‡°¢Æ&VÃ¢$Ö–æV7&gB6ÆV$6öÆ÷%FW‡GW&R"À¢6öÆ÷$GF6†ÖVçG3¢·°¢f–Ws¢FW‡GW&Ræ7&VFUf–Wr‚’À¢6ÆV%fÇVS¢·"ÂrÂ"ÂÒÀ¢ÆöD÷¢&6ÆV""À¢7F÷&T÷¢'7F÷&R ¢ÕÐ¢Ò“°¢72æVæB‚“°¢ÒÀ ¢6ÆV$6öÆ÷$æDFWF‚†Væ6öFW$†æFÆRÂ6öÆ÷$†æFÆRÂ"ÂrÂ"ÂÂFWF„†æFÆRÂFWF‚’°¢6öç7BVæ6öFW"ÒvWB†Væ6öFW$†æFÆRÂ&6öÖÖæBVæ6öFW""’æVæ6öFW#°¢6öç7B72ÒVæ6öFW"æ&Vv–å&VæFW%72‡°¢Æ&VÃ¢$Ö–æV7&gB6ÆV$6öÆ÷$æDFWF‚"À¢6öÆ÷$GF6†ÖVçG3¢·°¢f–Ws¢vWB†6öÆ÷$†æFÆRÂ'FW‡GW&R"’çFW‡GW&Ræ7&VFUf–Wr‚’À¢6ÆV%fÇVS¢·"ÂrÂ"ÂÒÀ¢ÆöD÷¢&6ÆV""À¢7F÷&T÷¢'7F÷&R ¢ÕÒÀ¢FWF…7FVæ6–ÄGF6†ÖVçC¢°¢f–Ws¢vWB†FWF„†æFÆRÂ'FW‡GW&R"’çFW‡GW&Ræ7&VFUf–Wr‚’À¢FWF„6ÆV%fÇVS¢FWF‚À¢FWF„ÆöD÷¢&6ÆV""À¢FWF…7F÷&T÷¢'7F÷&R ¢Ð¢Ò“°¢72æVæB‚“°¢ÒÀ ¢6ÆV$6öÆ÷$æDFWF…&Vv–öâ€¢Væ6öFW$†æFÆRÀ¢6öÆ÷$†æFÆRÀ¢"À¢rÀ¢"À¢À¢FWF„†æFÆRÀ¢FWF‚À¢‚À¢’À¢v–GF‚À¢†V–v‡@¢’°¢6öç7BVæ6öFW"ÒvWB†Væ6öFW$†æFÆRÂ&6öÖÖæBVæ6öFW""’æVæ6öFW#°¢6öç7B6öÆ÷$VçG'’ÒvWB†6öÆ÷$†æFÆRÂ'FW‡GW&R"“°¢6öç7BFWF„VçG'’ÒvWB†FWF„†æFÆRÂ'FW‡GW&R"“°¢6öç7B6öÆ÷$f÷&ÖBÒ6öÆ÷$VçG'’æf÷&ÖBÇÂ'&v&‡Væ÷&Ò#°¢6öç7BFWF„f÷&ÖBÒFWF„VçG'’æf÷&ÖBÇÂ&FWFƒ3&fÆöB#°¢6öç7BfÇVW2Ò·"ÂrÂ"ÂÂFWF…ÒæÖ‚‡fÇVR’ÓâçVÖ&W"‡fÇVR’çFôf—†VBƒ‚’“°¢6öç7B¶W’ÒG¶6öÆ÷$f÷&ÖG×ÂG¶FWF„f÷&ÖG×ÂG·fÇVW2æ¦ö–â‚'Â"—Ö°¢ÆWB—VÆ–æRÒ&Vv–öä6ÆV%—VÆ–æW2ævWB†¶W’“°¢–b‚—VÆ–æR’°¢6öç7BÖöGVÆRÒFWf–6Ræ7&VFU6†FW$ÖöGVÆR‡°¢Æ&VÃ¢$Ö–æV7&gB&Vv–öæÂ6öÆ÷"öFWF‚6ÆV""À¢6öFS¢ §7G'V7B6ÆV$÷WGWB°¢Æö6F–öâƒ’6öÆ÷#¢fV3CÆc3#âÀ¢'V–ÇF–â†g&uöFWF‚’FWFƒ¢c3"À§Ó° ¤fW'FW€¦fâg5öÖ–â„'V–ÇF–â‡fW'FW…ö–æFW‚’fW'FW„–æFWƒ¢S3"’Óâ'V–ÇF–â‡÷6—F–öâ’fV3CÆc3#â°¢ÆWB÷6—F–öç2Ò'&“ÇfV3#Æc3#âÂ3â€¢fV3#Æc3#â‚ÓãÂÓã’À¢fV3#Æc3#âƒ2ãÂÓã’À¢fV3#Æc3#â‚ÓãÂ2ã¢“°¢&WGW&âfV3CÆc3#â‡÷6—F–öç5·fW'FW„–æFW…ÒÂãÂã“°§Ð ¤g&vÖVç@¦fâg5öÖ–â‚’Óâ6ÆV$÷WGWB°¢f"÷WGWC¢6ÆV$÷WGWC°¢÷WGWBæ6öÆ÷"ÒfV3CÆc3#â‚G·fÇVW2ç6Æ–6RƒÂB’æ¦ö–â‚"Â"—Ò“°¢÷WGWBæFWF‚ÒG·fÇVW5³E×Ó°¢&WGW&â÷WGWC°§Ö ¢Ò“°¢—VÆ–æRÒFWf–6Ræ7&VFU&VæFW%—VÆ–æR‡°¢Æ&VÃ¢$Ö–æV7&gB&Vv–öæÂ6öÆ÷"öFWF‚6ÆV""À¢Æ–÷WC¢&WFò"À¢fW'FWƒ¢¶ÖöGVÆRÂVçG'•ö–çC¢'g5öÖ–â'ÒÀ¢g&vÖVçC¢°¢ÖöGVÆRÀ¢VçG'•ö–çC¢&g5öÖ–â"À¢F&vWG3¢·¶f÷&ÖC¢6öÆ÷$f÷&ÖGÕÐ¢ÒÀ¢&–Ö—F—fS¢·F÷öÆöw“¢'G&–ævÆRÖÆ—7B'ÒÀ¢FWF…7FVæ6–Ã¢°¢f÷&ÖC¢FWF„f÷&ÖBÀ¢FWF…w&—FTVæ&ÆVC¢G'VRÀ¢FWF„6ö×&S¢&Çv—2 ¢Ð¢Ò“°¢&Vv–öä6ÆV%—VÆ–æW2ç6WB†¶W’Â—VÆ–æR“°¢Ð ¢6öç7B72ÒVæ6öFW"æ&Vv–å&VæFW%72‡°¢Æ&VÃ¢$Ö–æV7&gB6ÆV$6öÆ÷$æDFWF…&Vv–öâ"À¢6öÆ÷$GF6†ÖVçG3¢·°¢f–Ws¢6öÆ÷$VçG'’çFW‡GW&Ræ7&VFUf–Wr‚’À¢ÆöD÷¢&ÆöB"À¢7F÷&T÷¢'7F÷&R ¢ÕÒÀ¢FWF…7FVæ6–ÄGF6†ÖVçC¢°¢f–Ws¢FWF„VçG'’çFW‡GW&Ræ7&VFUf–Wr‚’À¢FWF„ÆöD÷¢&ÆöB"À¢FWF…7F÷&T÷¢'7F÷&R ¢Ð¢Ò“°¢6öç7B6ÆV%v–GF‚ÒÖF‚æÖ‚ƒÂÖF‚æÖ–â‡v–GF‚Â6öÆ÷$VçG'’çv–GF‚Ò‚’“°¢6öç7B6ÆV$†V–v‡BÒÖF‚æÖ‚ƒÂÖF‚æÖ–â††V–v‡BÂ6öÆ÷$VçG'’æ†V–v‡BÒ’’“°¢òòÖ–æV7&gBW‡÷6W2÷VätÂw2&÷GFöÒÖÆVgBFW‡GW&R6ö÷&F–æFW3²vV$uP¢òò66—76÷"&V7FævÆW2W6RF÷ÖÆVgB÷&–v–âà¢6öç7BvV$wU’ÒÖF‚æÖ‚ƒÂ6öÆ÷$VçG'’æ†V–v‡BÒ’Ò6ÆV$†V–v‡B“°¢72ç6WE66—76÷%&V7B€¢ÖF‚æÖ‚ƒÂ‚’À¢vV$wU’À¢6ÆV%v–GF‚À¢6ÆV$†V–v‡@¢“°¢72ç6WE—VÆ–æR‡—VÆ–æR“°¢72æG&rƒ2“°¢72æVæB‚“°¢ÒÀ ¢6ÆV$FWF‚†Væ6öFW$†æFÆRÂFW‡GW&T†æFÆRÂFWF‚’°¢†vÆö&ÅF†—2æÖ5vV$wRåöFWF„6ÆV'2ÇÃÒ·Ò•²&6ÆV$FWFƒ¢"²FWF…ÒÐ¢‚†vÆö&ÅF†—2æÖ5vV$wRåöFWF„6ÆV'2ÇÂ·Ò•²&6ÆV$FWFƒ¢"²FWF…ÒÇÂ’²°¢6öç7BVæ6öFW"ÒvWB†Væ6öFW$†æFÆRÂ&6öÖÖæBVæ6öFW""’æVæ6öFW#°¢6öç7B72ÒVæ6öFW"æ&Vv–å&VæFW%72‡°¢Æ&VÃ¢$Ö–æV7&gB6ÆV$FWF‚"À¢òò6öÆ÷$GF6†ÖVçG2—2&WV—&VBvV$”DÂÖVÖ&W"WfVâf÷"FWF‚ÖöæÇ¢òò76W2(	BâV×G’6WVVæ6R—2F†RfÆ–BFWF‚ÖöæÇ’f÷&Òà¢6öÆ÷$GF6†ÖVçG3¢µÒÀ¢FWF…7FVæ6–ÄGF6†ÖVçC¢°¢f–Ws¢vWB‡FW‡GW&T†æFÆRÂ'FW‡GW&R"’çFW‡GW&Ræ7&VFUf–Wr‚’À¢FWF„6ÆV%fÇVS¢FWF‚À¢FWF„ÆöD÷¢&6ÆV""À¢FWF…7F÷&T÷¢'7F÷&R ¢Ð¢Ò“°¢72æVæB‚“°¢ÒÀ ¢6÷•FW‡GW&R†Væ6öFW$†æFÆRÂ6÷W&6T†æFÆRÂFW7F–æF–öä†æFÆRÀ¢6÷W&6U‚Â6÷W&6U’ÂFW7F–æF–öå‚ÂFW7F–æF–öå’À¢v–GF‚Â†V–v‡BÂÖ—ÆWfVÂ’°¢6öç7BVæ6öFW"ÒvWB†Væ6öFW$†æFÆRÂ&6öÖÖæBVæ6öFW""’æVæ6öFW#°¢6öç7B6÷W&6RÒvWB‡6÷W&6T†æFÆRÂ'6÷W&6RFW‡GW&R"“°¢6öç7BFW7F–æF–öâÒvWB†FW7F–æF–öä†æFÆRÂ&FW7F–æF–öâFW‡GW&R"“°¢òòD”r†öæR×6†÷BW"FW7BÆ&VÂ“¢—2F†RFÆ2öwV’76VÖ&ÆVB'’uR&Æ—BÀ¢òòæBg&öÒ6÷W&6RF†B7GVÆÇ’†2WÆöG3ò&VÖ÷fRv—F‚F†Rf—‚à¢°¢6öç7BFÂÒFW7F–æF–öâåöÆ&VÂÇÂ#ò#°¢–b‚öFÆ7ÆwV—Çv–FvWGÇF—FÆWÆföçBòçFW7B†FÂ’bb†6÷•FW‡GW&Rå÷6VVâÇÂ†6÷•FW‡GW&Rå÷6VVâÒæWr6WB‚’’’æ†2†FÂ’’°¢6÷•FW‡GW&Rå÷6VVâæFB†FÂ“°¢6öç6öÆRæÆör‚%´4õ’ÕDU…ÒFW7CÒ"²FÂ²"††–CÒ"²FW7F–æF–öâåö†–B²"ÇWÆöG3Ò"²†FW7F–æF–öâå÷WÆöG2ÇÂ’²"’ÂÒ7&3Ò"²‡6÷W&6RåöÆ&VÂÇÂ#ò"’²"††–CÒ"²6÷W&6Råö†–B²"ÇWÆöG3Ò"²‡6÷W&6Rå÷WÆöG2ÇÂ’²"’"²v–GF‚²'‚"²†V–v‡B“°¢Ð¢Ð¢FW7F–æF–öâåö6÷–W4–âÒ†FW7F–æF–öâåö6÷–W4–âÇÂ’²°¢6÷W&6Råö6÷–W4÷WBÒ‡6÷W&6Råö6÷–W4÷WBÇÂ’²°¢òò6Æ×Fòv†B7GVÆÇ’&VÖ–ç2–âV6‚FW‡GW&Rg&öÒ—G2÷vâ÷&–v–ââF†P¢òòöfg6WG2W6VBFò&RG&÷VBVçF—&VÇ’Âv†–6‚6–ÆVçFÇ’GW&æVBWfW'¢òò7V"×&V7FævÆR&Æ—B–çFò6÷’öbF†RF÷ÖÆVgB6÷&æW#²F†RÖ—ÆWfVÂv0¢òòG&÷VBv—F‚F†VÒÂ6òÖ—&Æ—G2÷fW'w&÷FRÖ—à¢6öç7BÖ—ÒÖF‚æÖ‚ƒÂÖ—ÆWfVÂÂ“°¢6öç7B7‚ÒÖF‚æÖ‚ƒÂ6÷W&6U‚Â“°¢6öç7B7’ÒÖF‚æÖ‚ƒÂ6÷W&6U’Â“°¢6öç7BG‚ÒÖF‚æÖ‚ƒÂFW7F–æF–öå‚Â“°¢6öç7BG’ÒÖF‚æÖ‚ƒÂFW7F–æF–öå’Â“°¢6öç7BÖ—W‡FVçBÒ‡6—¦R’ÓâÖF‚æÖ‚ƒÂ‡6—¦Róò’ãâÖ—“°¢6öç7BrÒÖF‚æÖ‚ƒÂÖF‚æÖ–â€¢v–GF‚À¢Ö—W‡FVçB‡6÷W&6Rçv–GF‚’Ò7‚À¢Ö—W‡FVçB†FW7F–æF–öâçv–GF‚’ÒG€¢’“°¢6öç7B‚ÒÖF‚æÖ‚ƒÂÖF‚æÖ–â€¢†V–v‡BÀ¢Ö—W‡FVçB‡6÷W&6Ræ†V–v‡B’Ò7’À¢Ö—W‡FVçB†FW7F–æF–öâæ†V–v‡B’ÒG¢’“°¢–b‚rÇÂ‚’&WGW&ã°¢Væ6öFW"æ6÷•FW‡GW&UFõFW‡GW&R€¢·FW‡GW&S¢6÷W&6RçFW‡GW&RÂÖ—ÆWfVÃ¢Ö—Â÷&–v–ã¢·ƒ¢7‚Â“¢7’Â£¢×ÒÀ¢·FW‡GW&S¢FW7F–æF–öâçFW‡GW&RÂÖ—ÆWfVÃ¢Ö—Â÷&–v–ã¢·ƒ¢G‚Â“¢G’Â£¢×ÒÀ¢·v–GFƒ¢rÂ†V–v‡C¢‚ÂFWF„÷$'&”Æ–W'3¢Ð¢“°¢ÒÀ ¢6÷”'VffW"†Væ6öFW$†æFÆRÂ6÷W&6T†æFÆRÂ6÷W&6Töfg6WBÂFW7F–æF–öä†æFÆRÂFW7F–æF–öäöfg6WBÂ6—¦R’°¢6öç7BVæ6öFW"ÒvWB†Væ6öFW$†æFÆRÂ&6öÖÖæBVæ6öFW""’æVæ6öFW#°¢6öç7B6÷W&6RÒvWB‡6÷W&6T†æFÆRÂ'6÷W&6R'VffW""“°¢6öç7BFW7F–æF–öâÒvWB†FW7F–æF–öä†æFÆRÂ&FW7F–æF–öâ'VffW""“°¢–b‚ôWFò7F÷&vRö’çFW7B†FW7F–æF–öãòåöÆ&VÂÇÂ""’’°¢6öç7B"Ò†vÆö&ÅF†—2æÖ5vV$wRåöWFô–æFW…w&—FW2ÇÃÒ·w&—FT'VffW#¢Â'—FW3¢Â6÷–W3¢Ò“°¢"æ6÷–W2²³°¢Ð¢òò¶VWF†RF–væ÷7F–25RÖ—'&÷"6ö†W&VçBv—F‚F†RuR6÷’âW'6—7FVç@¢òòuT’÷FW‡BfW'FW‚'VffW'2&Rf–ÆÆVBg&öÒG&ç6–VçB7Fv–ær'VffW'2Â6ð¢òò–ç7V7F–æröæÇ’VWVRçw&—FT'VffW"6ÆÇ2÷F†W'v—6R&W÷'G2Ö—6ÆVF–æp¢òòÆÂ×¦W&òFW7F–æF–öâfW'F–6W2à¢–b‡6÷W&6Rå÷6†F÷rbbFW7F–æF–öâå÷6†F÷p¢bb6÷W&6Töfg6WBãÒbbFW7F–æF–öäöfg6WBãÒ ¢bb6÷W&6Töfg6WB²6—¦RÃÒ6÷W&6Rå÷6†F÷ræÆVæwF€¢bbFW7F–æF–öäöfg6WB²6—¦RÃÒFW7F–æF–öâå÷6†F÷ræÆVæwF‚’°¢FW7F–æF–öâå÷6†F÷rç6WB€¢6÷W&6Rå÷6†F÷rç7V&'&’‡6÷W&6Töfg6WBÂ6÷W&6Töfg6WB²6—¦R’À¢FW7F–æF–öäöfg6W@¢“°¢Ð¢öæ÷FT'—FW2†FW7F–æF–öâÂ&6÷’"Â6—¦R“°¢Væ6öFW"æ6÷”'VffW%Fô'VffW"€¢6÷W&6Ræ'VffW"À¢6÷W&6Töfg6WBÀ¢FW7F–æF–öâæ'VffW"À¢FW7F–æF–öäöfg6WBÀ¢6—¦P¢“°¢ÒÀ ¢7V&Ö—B†Væ6öFW$†æFÆR’°¢Ö&´6ÆÂ‚'7V&Ö—B"Â¶Væ6öFW$†æFÆWÒ“°¢6öç7BVçG'’ÒvWB†Væ6öFW$†æFÆRÂ&6öÖÖæBVæ6öFW""“°¢òòW'&÷"66÷W2&W6öÇfR7–æ6‡&öæ÷W6Ç’âg&VW¦RF†R6æF–FFRf–WrÂ—G0¢òò&VçB7FFRÂF†R6ÆÂF–ÂÂæBF†R%2&F6‚BF†—27V&Ö—B&÷VæF'¢òò6òÆFW"g&ÖR6ææ÷B÷fW'w&—FRF†RWf–FVæ6R&Vf÷&RF†R66÷R÷2à¢6öç7BfÆ–FF–öä6æF–FFRÒ6æ6†÷EFW‡GW&UfÆ–FF–öâ‚“°¢öÆ7E7V&Ö—EFW‡GW&T6æF–FFRÒfÆ–FF–öä6æF–FFS°¢6öç7BwU7V&Ö—E7F'FVBÒ÷W&bæöâòW&f÷&Öæ6Rææ÷r‚’¢°¢òòfÆ–FF–öâW'&÷'2ö—6öâF†RFWf–6S²6GW&RF†VÒW"7V&Ö—B6òF†P¢òòf—'7BöffVæF–ær6öÖÖæB—2&W÷'FVB&Vf÷&RF†RFWf–6R—2Æ÷7Bà¢–b‡G—VöbFWf–6RçW6„W'&÷%66÷RÓÓÒ&gVæ7F–öâ"’°¢FWf–6RçW6„W'&÷%66÷R‚'fÆ–FF–öâ"“°¢FWf–6RçW6„W'&÷%66÷R‚&÷WBÖöbÖÖVÖ÷'’"“°¢Ð¢FWf–6RçVWVRç7V&Ö—B…¶VçG'’æVæ6öFW"æf–æ—6‚‚•Ò“°¢–b…÷W&bæöâbbG—VöbFWf–6RçVWVRæöå7V&Ö—GFVEv÷&´FöæRÓÓÒ&gVæ7F–öâ"’°¢÷W&bæwU7V&Ö—G2²³°¢FWf–6RçVWVRæöå7V&Ö—GFVEv÷&´FöæR‚’çF†Vâ‚‚’Óâ°¢÷W&bæwUVWVT×2çW6‚‡W&f÷&Öæ6Rææ÷r‚’ÒwU7V&Ö—E7F'FVB“°¢Ò’æ6F6‚‚‚’Óâ·Ò“°¢Ð¢òòGF6‚WfW'—F†–ærVWVVB6–æ6RF†R&–÷"7V&Ö—BFòF†—27V&Ö—76–öâw0¢òò6ö×ÆWF–öâfVæ6R&Vf÷&R&VÆV6–ærF†RVæFW&Ç––æruRö&¦V7G2à¢fÇW6„w&fW–&B‚“°¢–b‡G—VöbFWf–6Rç÷W'&÷%66÷RÓÓÒ&gVæ7F–öâ"’°¢6öç7Böå66÷TW'&÷"Ò†Æ&VÂ’Óâ†W'&÷"’Óâ°¢–b†W'&÷"’°¢6öç7B×6rÒµvV$uRG¶Æ&VÇÕÒG¶W'&÷"æÖW76vWÖ°¢æ÷FUFW‡GW&UfÆ–FF–öâ†×6rÂfÆ–FF–öä6æF–FFR“°¢6öç6öÆRæW'&÷"†×6r“°¢–b‚vÆö&ÅF†—2æÖ5vV$wRåöf—'7DwTW'&÷"’°¢vÆö&ÅF†—2æÖ5vV$wRåöf—'7DwTW'&÷"Ò×6s°¢Ð¢òòD”s¢¶VWF†Rf—'7BâfÆ–FF–öâÖW76vW2TâÖFVGWÆ–6FVB6òF†P¢òò$ôõBW'&÷"†Rærâ7&VFT&–æDw&÷W'Föò6ÖÆÂ"ö÷fW''Vâ’—2f—6–&ÆP¢òòæBæ÷B†–FFVâ&V†–æBÆFW"&–çfÆ–BGVRFò&Wf–÷W2W'&÷" ¢òò666FW2âVW'–&ÆRf–vÆö&ÅF†—2æÖ5vV$wRå÷fÄW'&÷'2à¢6öç7BfRÒ†vÆö&ÅF†—2æÖ5vV$wRå÷fÄW'&÷'2ÇÃÒµÒ“°¢–b‡fRæÆVæwF‚Âb’fRçW6‚†×6rç6Æ–6RƒÂC’“°¢Ð¢Ó°¢òò$–ç7Fæ6RG&÷VB"&V¦V7F–öç2&R&Væ–vâ††VFÆW727v–gE6†FW ¢òòV—&²Â÷"FWf–6RF÷&âF÷vâB&ö6W72W†—B“²7vÆÆ÷rF†VÒV–WFÇ’à¢6öç7B7vÆÆ÷tG&÷VBÒ‚’Óâ·Ó°¢FWf–6Rç÷W'&÷%66÷R‚’çF†Vâ†öå66÷TW'&÷"‚&ööÒ"’Â7vÆÆ÷tG&÷VB“°¢FWf–6Rç÷W'&÷%66÷R‚’çF†Vâ†öå66÷TW'&÷"‚'fÆ–FF–öâ"’Â7vÆÆ÷tG&÷VB“°¢Ð¢ö&¦V7G2æFVÆWFR†Væ6öFW$†æFÆR“°¢ÒÀ ¢7&VFU—VÆ–æR‡7V4§6öâ’°¢6öç7B7V2Ò¥4ôâç'6R‡7V4§6öâ“°¢†vÆö&ÅF†—2æÖ5vV$wRå÷—VÆ–æU7V72ÇÃÒ·Ò•·7V2æÆ&VÅÒÒ°¢fW'FW…6†FW#¢7V2çfW'FW…6†FW"À¢g&vÖVçE6†FW#¢7V2æg&vÖVçE6†FW"À¢FVf–æW3¢7V2æFVf–æW2À¢Væ–f÷&×3¢‡7V2æ&–æDw&÷W2ÇÂµÒ’æfÆDÖ‚†r’ÓârçVæ–f÷&×2ÇÂµÒ’À¢6×ÆW'3¢‡7V2æ&–æDw&÷W2ÇÂµÒ’æfÆDÖ‚†r’Óârç6×ÆW'2ÇÂµÒ’À¢fW'FW„VÆVÖVçG3¢‡7V2çfW'FW„f÷&ÖG3òå³ÓòæVÆVÖVçG2ÇÂµÒ’æÖ‚†R’ÓâRææÖR’À¢Ó°¢–b‚öVçF—G—Æ—FVÕ÷ÇG&ç7&Væ7’òçFW7B‡7V2æÆ&VÂÇÂ""’’°¢†vÆö&ÅF†—2æÖ5vV$wRå÷&u—VÆ–æU7V72ÇÃÒ·Ò•·7V2æÆ&VÅÒÒ7V3°¢Ð¢òòD”s¢v†BFWF‚7FFRV6‚—VÆ–æRFV6Æ&W2ÂæBv†B—B&W6öÇfW2Fòà¢òò4ôÕ$Uôõ6–ÆVçFÇ’fÆÇ2&6²Fò&ÆW72ÖWVÂ"f÷"ç’æÖR—BFöW2æ÷@¢òò¶æ÷rÂv†–6‚VæFW"Öö¦ærw2&WfW'6RÕ¢&ö¦V7F–öâ†æV"Ö2FòÂf"Fð¢òò’&V¦V7G2WfW'’g&vÖVçBv–ç7BãFWF‚6ÆV"ÒÒ–çf—6–&ÆP¢òòvVöÖWG'’v—F‚6÷'&V7BG&r6ÆÇ2æBæòfÆ–FF–öâW'&÷"à¢†vÆö&ÅF†—2æÖ5vV$wRå÷—VÆ–æTFWF‚ÇÃÒ·Ò•·7V2æÆ&VÅÒÒ7V2æFWF…7FVæ6–À¢ò°¢FV6Æ&VC¢7V2æFWF…7FVæ6–ÂæFWF…FW7BÀ¢&W6öÇfVC¢4ôÕ$Uôõ·7V2æFWF…7FVæ6–ÂæFWF…FW7EÒÇÂ&ÆW72ÖWVÂ„dÄÄ$4²’"À¢w&—FS¢7V2æFWF…7FVæ6–Âçw&—FTFWF€¢Ð¢¢çVÆÃ°¢–b‚÷æ÷&Öö’çFW7B‡7V2æÆ&VÂ’’÷æõ&ö&Rç—T&Vv–âçW6‚‡²Æ&VÃ¢7V2æÆ&VÂÂg3¢7V2çfW'FW…6†FW"ÂF÷ó¢7V2çF÷öÆöw’Ò“°¢Ö&´6ÆÂ‚&7&VFU—VÆ–æR"Â¶Æ&VÃ¢7V2æÆ&VÇÒ“°¢G'’°¢òòf÷"fÖ–Æ–W2v†÷6R7V2FV6Æ&W2æòFWF‚7FFRÂF†RæGW&Â&6R—0¢òòF†RäòÖFWF‚—VÆ–æS²F†RFWF‚f&–çB—2F†RÇB&VÆ÷râ…76–æp¢òòF†RFVfVÇBv÷VÆB7–çF†W6—¦RFWF‚–çFòF†R&6RæBÆVfRF†P¢òòæòÖFWF‚72VæÖF6†VBâ’fÖ–Æ–W2v—F‚FWF…7FVæ6–Â¶VWF†RFVfVÇBà¢6öç7B&6TFWF„&rÒ7V2æFWF…7FVæ6–ÂòVæFVf–æVB¢çVÆÃ°¢6öç7B'V–ÇBÒ'V–ÆE—VÆ–æR‡7V2Â&6TFWF„&r“°¢–b‚'V–ÇB’°¢&V6÷&E7FvR†—VÆ–æR×6¶—VC¢G·7V2æÆ&VÇÖ“°¢–b‚÷æ÷&Öö’çFW7B‡7V2æÆ&VÂ’’÷æõ&ö&Rç—U6¶—çW6‚‡7V2æÆ&VÂ“°¢&WGW&â°¢Ð¢òò&RÖ'V–ÆBF†R¦÷F†W"¢FWF‚GF6†ÖVçB7FFRWg&öçB6ò'6WE—VÆ–æP¢òò6â–6²âW†7BÖF6‚'’F—&V7BÆöö·W‡F†RÆ§’f&–çBF‚&6V@¢òòF†R66†VB&6R†æFÆRæBÆVgBF†RæòÖFWF‚—VÆ–æR&÷VæB–â¢òòFWF‚72’âÖ¶W’çVÆÂÒæòFWF‚GF6†ÖVçBà¢6öç7B'”FWF‚ÒæWrÖ‚“°¢'”FWF‚ç6WB†'V–ÇBæFWF„f÷&ÖBÂ'V–ÇBç—VÆ–æR“°¢6öç7B&6TFWF‚Ò'V–ÇBæFWF„f÷&ÖC°¢6öç7BÇDFWF‚Ò7V2æFWF…7FVæ6–ÂòçVÆÂ¢&FWFƒ3&fÆöB#°¢–b†ÇDFWF‚ÓÒ&6TFWF‚’°¢G'’°¢6öç7BÇBÒ'V–ÆE—VÆ–æR‡7V2ÂÇDFWF‚“°¢–b†ÇB’'”FWF‚ç6WB†ÇBæFWF„f÷&ÖBÂÇBç—VÆ–æR“°¢Ò6F6‚†ÇDW'&÷"’°¢&V6÷&E7FvR†—VÆ–æRÖÇBÖf–ÆVC¢G·7V2æÆ&VÇÓ¢G¶ÇDFWF‡Ó¢G¶ÇDW'&÷"æÖW76vWÖ“°¢Ð¢Ð¢&V6÷&E7FvR†—VÆ–æRÖö³¢G·7V2æÆ&VÇÖ“°¢–b‚÷æ÷&Öö’çFW7B‡7V2æÆ&VÂ’’÷æõ&ö&Rç—Tö²çW6‚‡7V2æÆ&VÂ“°¢&WGW&âWB‡¶¶–æC¢'—VÆ–æR"Âââæ'V–ÇBÂ'”FWF‡Ò“°¢Ò6F6‚†W'&÷"’°¢&V6÷&E7FvR†—VÆ–æRÖf–ÆVC¢G·7V2æÆ&VÇÓ¢G¶W'&÷"æÖW76vWÖ“°¢–b‚÷æ÷&Öö’çFW7B‡7V2æÆ&VÂ’’÷æõ&ö&Rç—Tf–ÂçW6‚‡7V2æÆ&VÂ²#¢"²W'&÷"æÖW76vR“°¢6öç6öÆRçv&â‚'—VÆ–æRf–ÆVC¢"Â7V2æÆ&VÂÂW'&÷"“°¢&WGW&â°¢Ð¢ÒÀ ¢&Vv–å&VæFW%72†Væ6öFW$†æFÆRÂFW67&—F÷$§6öâ’°¢6öç7BFW67&—F÷"Ò¥4ôâç'6R†FW67&—F÷$§6öâ“°¢Ö&´6ÆÂ‚&&Vv–å&VæFW%72"ÂFW67&—F÷"“°¢6öç7BVæ6öFW"ÒvWB†Væ6öFW$†æFÆRÂ&6öÖÖæBVæ6öFW""’æVæ6öFW#°¢6öç7B6öÆ÷$GF6†ÖVçG2ÒFW67&—F÷"æ6öÆ÷"æÖ‚†GF6†ÖVçB’Óâ°¢–b‚GF6†ÖVçB’&WGW&âçVÆÃ°¢6öç7Bf–WtVçG'’ÒvWB†GF6†ÖVçBçf–WrÂ'FW‡GW&Rf–Wr"“°¢÷FW‡GW&TÆ–fWF–ÖRææ÷FUf–WuW6R†GF6†ÖVçBçf–WrÂf–WtVçG'’“°¢6öç7BwTGF6†ÖVçBÒ°¢f–Ws¢f–WtVçG'’çf–WrÀ¢7F÷&T÷¢'7F÷&R ¢Ó°¢–b†GF6†ÖVçBæ6ÆV"’°¢wTGF6†ÖVçBæÆöD÷Ò&6ÆV"#°¢wTGF6†ÖVçBæ6ÆV%fÇVRÒ°¢#¢GF6†ÖVçBæ6ÆV%³ÒÀ¢s¢GF6†ÖVçBæ6ÆV%³ÒÀ¢#¢GF6†ÖVçBæ6ÆV%³%ÒÀ¢¢GF6†ÖVçBæ6ÆV%³5Ð¢Ó°¢ÒVÇ6R°¢wTGF6†ÖVçBæÆöD÷Ò&ÆöB#°¢Ð¢&WGW&âwTGF6†ÖVçC°¢Ò“°¢òò&VæFW"×F&vWB6Vç7W2â#bã"f–ÆÇ2âFÆ2'’¦G&v–ær¢7&—FW2–çFò—BÀ¢òò6òæV—F†W"÷WÆöG2‡w&—FUFW‡GW&R’æ÷"ö6÷–W4–â†6÷•FW‡GW&R’6÷VçG0¢òòF†BF‚ÒÒâFÆ26â&VBóæB7F–ÆÂ&RgVÆÇ’÷VÆFVBÂ÷ ¢òòóæBæWfW"F÷V6†VBÂæBF†÷6RÆöö²–FVçF–6Âv—F†÷WBF†—2â¶W–VB'¢òòF†R6öÆ÷W"GF6†ÖVçBw2FW‡GW&RÆ&VÂà¢°¢6öç7B6Vç7W2Ò†vÆö&ÅF†—2æÖ5vV$wRå÷&VæFW%F&vWG2ÇÃÒ·Ò“°¢f÷"†6öç7BGF6†ÖVçBöbFW67&—F÷"æ6öÆ÷"’°¢–b‚GF6†ÖVçB’6öçF–çVS°¢6öç7Bf–WtVçG'’ÒvWB†GF6†ÖVçBçf–WrÂ'FW‡GW&Rf–Wr"“°¢6öç7BÆ&VÂÒ7G&–ær‡f–WtVçG'’çFW‡GW&TVçG'“òåöÆ&VÂóò#ò"¢²"Ö—"²‡f–WtVçG'’æ&6TÖ—óò“°¢6öç7B&V6÷&BÒ†6Vç7W5¶Æ&VÅÒÇÃÒ·76W3¢ÂG&w3¢Â6ÆV&VC¢Ò“°¢&V6÷&Bç76W2²³°¢–b†GF6†ÖVçBæ6ÆV"’&V6÷&Bæ6ÆV&VB²³°¢Ð¢Ð¢6öç7B74FW67&—F÷"Ò¶Æ&VÃ¢$Ö–æV7&gB&VæFW"72"Â6öÆ÷$GF6†ÖVçG7Ó°¢ÆWBFWF„f÷&ÖBÒçVÆÃ°¢–b†FW67&—F÷"æFWF‚’°¢6öç7Bf–WtVçG'’ÒvWB†FW67&—F÷"æFWF‚çf–WrÂ'FW‡GW&Rf–Wr"“°¢÷FW‡GW&TÆ–fWF–ÖRææ÷FUf–WuW6R†FW67&—F÷"æFWF‚çf–WrÂf–WtVçG'’“°¢FWF„f÷&ÖBÒf–WtVçG'’çFW‡GW&TVçG'’æf÷&ÖBÇÂ&FWFƒ3&fÆöB#°¢6öç7B†57FVæ6–ÂÒFWF„f÷&ÖBæ–æ6ÇVFW2‚'7FVæ6–Â"“°¢74FW67&—F÷"æFWF…7FVæ6–ÄGF6†ÖVçBÒ°¢f–Ws¢f–WtVçG'’çf–WrÀ¢FWF…7F÷&T÷¢'7F÷&R"À¢òò7FVæ6–Â÷2öæÇ’f÷"7FVæ6–ÂÖ&V&–ærf÷&ÖG2à¢âââ††57FVæ6–Âò·7FVæ6–Å7F÷&T÷¢'7F÷&R'Ò¢·Ò¢Ó°¢–b†FW67&—F÷"æFWF‚æ6ÆV"ÒçVÆÂ’°¢74FW67&—F÷"æFWF…7FVæ6–ÄGF6†ÖVçBæFWF„ÆöD÷Ò&6ÆV"#°¢74FW67&—F÷"æFWF…7FVæ6–ÄGF6†ÖVçBæFWF„6ÆV%fÇVRÒFW67&—F÷"æFWF‚æ6ÆV#°¢†vÆö&ÅF†—2æÖ5vV$wRåöFWF„6ÆV'2ÇÃÒ·Ò•µ7G&–ær†FW67&—F÷"æFWF‚æ6ÆV"•ÒÐ¢‚†vÆö&ÅF†—2æÖ5vV$wRåöFWF„6ÆV'2ÇÂ·Ò•µ7G&–ær†FW67&—F÷"æFWF‚æ6ÆV"•ÒÇÂ’²°¢–b††57FVæ6–Â’°¢74FW67&—F÷"æFWF…7FVæ6–ÄGF6†ÖVçBç7FVæ6–ÄÆöD÷Ò&6ÆV"#°¢74FW67&—F÷"æFWF…7FVæ6–ÄGF6†ÖVçBç7FVæ6–Ä6ÆV%fÇVRÒ°¢Ð¢ÒVÇ6R°¢74FW67&—F÷"æFWF…7FVæ6–ÄGF6†ÖVçBæFWF„ÆöD÷Ò&ÆöB#°¢–b††57FVæ6–Â’74FW67&—F÷"æFWF…7FVæ6–ÄGF6†ÖVçBç7FVæ6–ÄÆöD÷Ò&ÆöB#°¢Ð¢Ð¢6öç7B72ÒVæ6öFW"æ&Vv–å&VæFW%72‡74FW67&—F÷"“°¢6öç7Bf—'7D6öÆ÷"ÒFW67&—F÷"æ6öÆ÷"æf–æB‚†’Óâ’ÇÂçVÆÃ°¢6öç7Bf—'7D6öÆ÷$VçG'’Òf—'7D6öÆ÷"òvWB†f—'7D6öÆ÷"çf–WrÂ'FW‡GW&Rf–Wr"’çFW‡GW&TVçG'’¢çVÆÃ°¢6öç7B†V–v‡BÒFW67&—F÷"æ†V–v‡BÇÂ†f—'7D6öÆ÷$VçG'’òf—'7D6öÆ÷$VçG'’æ†V–v‡B¢6çf2æ†V–v‡B“°¢òòF†R66VæRÖ–âF&vWB—2v†–6†WfW"æöâÖ6çf2F&vWBF†Rg&ÖRG&w2Fð¢òòÖ÷7B‡F†RuT’÷F—FÆR&VæFW"’ÂäõBF†RÆ&vW7B'’&Vâ6÷VçBG&w2W ¢òòF&vWBF†—2g&ÖRæB6†ö÷6RB&W6VçB‚’F–ÖRà¢ÆWB757FFU÷F–BÒ°¢–b†f—'7D6öÆ÷$VçG'’bbf—'7D6öÆ÷$VçG'’æ—46çf2’°¢–b†f—'7D6öÆ÷$VçG'’å÷F–BÓÒçVÆÂ’²f—'7D6öÆ÷$VçG'’å÷F–BÒ²·FW…6W²FW„–çfVçF÷'’çW6‚†f—'7D6öÆ÷$VçG'’“²Ð¢757FFU÷F–BÒf—'7D6öÆ÷$VçG'’å÷F–C°¢ÒVÇ6R°¢757FFU÷F–BÒf—'7D6öÆ÷$VçG'’bbf—'7D6öÆ÷$VçG'’æ—46çf2òÓ¢°¢Ð¢&WGW&âWB‡°¢¶–æC¢'&VæFW%72"À¢72À¢òò&WF–æVB6òF†RFWF‚GF6†ÖVçB6â&R6æ6†÷GFVBF†R–ç7FçBF†P¢òòv÷&ÆB72VæG2â&VF–ær—BBVæBöbg&ÖR—2W6VÆW73¢uT’76W0¢òò6ÆV"FWF‚†6ÆV$FWFƒ£f—&W2cC“RF–ÖW2'Vâ’Â6òÆFR&V@¢òòÇv—26†÷w2F†R6ÆV&VBfÇVRæB†–FW2v†WF†W"FW'&–âWfW"w&÷FRà¢öVæ6öFW#¢Væ6öFW"À¢öFWF„VçG'“¢FW67&—F÷"æFWF‚òvWB†FW67&—F÷"æFWF‚çf–WrÂ'FW‡GW&Rf–Wr"’çFW‡GW&TVçG'’¢çVÆÂÀ¢÷6uFW'&–ã¢fÇ6RÀ¢†V–v‡BÀ¢FWF„f÷&ÖBÀ¢&V¢FW67&—F÷"æ&VÇÂçVÆÂÀ¢÷F–C¢757FFU÷F–BÀ¢öG&vã¢À¢—VÆ–æS¢çVÆÂÀ¢&W6÷W&6W3¢æWrÖ‚’À¢G&uFW„&–æG3¢µÒÂòò÷6—F–öæÂFW‡GW&R&–æG2F†—2G&r†æÖRÖ–æFWVæFVçBfÆÆ&6²¢fW'FW„'VffW'3¢µÒÀ¢–æFW„'VffW#¢çVÆÂÀ¢&÷VæDw&÷W3¢µÒÀ¢òòD”s¢&VæFW"F&vWB–FVçF—G’f÷"FÆ2Ö76VÖ&Ç’FV'Vvv–æp¢÷F&vWDÆ&VÃ¢f—'7D6öÆ÷$VçG'¢òf—'7D6öÆ÷$VçG'’åöÆ&VÂ²"Ö—"²†vWB†f—'7D6öÆ÷"çf–WrÂ'FW‡GW&Rf–Wr"’æ&6TÖ—óò¢¢çVÆÂÀ¢÷F&vWEtƒ¢f—'7D6öÆ÷$VçG'’ò†f—'7D6öÆ÷$VçG'’çv–GF‚²'‚"²f—'7D6öÆ÷$VçG'’æ†V–v‡B’¢çVÆÂÀ¢÷F&vWEF–C¢f—'7D6öÆ÷$VçG'’òf—'7D6öÆ÷$VçG'’å÷F–B¢çVÆÂÀ¢òò÷&FW&VB72G&6Rf÷"öÖ7vV%öG&v6Vç7W2âFW'&–âG&v–ær–çFòF†P¢òò&–v‡BF&vWBæB7F–ÆÂæ÷BV&–ærö–çG2Bg&ÖR÷&FW#¢ÆFW ¢òò72F†B6ÆV'2F†R6ÖRGF6†ÖVçBv÷VÆBW&6R—Bà¢÷G&6TVçG'“¢öG&t6Vç7W0¢ò‚‚’Óâ°¢6öç7BVçG'’Ò°¢F&vWC¢f—'7D6öÆ÷$VçG'’ò7G&–ær†f—'7D6öÆ÷$VçG'’åöÆ&VÂ’¢#ò"À¢6ÆV#¢†f—'7D6öÆ÷"bbf—'7D6öÆ÷"æ6ÆV"’ÂG&w3¢À¢òòFWF‚7FFRÖGFW'22×V6‚26öÆ÷W"†W&S¢6·’G&w2v—F€¢òòæòFWF‚FW7BÂFW'&–â—2FWF‚×FW7FVBÂ6òFWF‚'VffW ¢òòF†B—2æWfW"6ÆV&VB&V¦V7G2WfW'’FW'&–âg&vÖVçBv†–ÆP¢òòF†R6·’7F–ÆÂ6†÷w2à¢FWFƒ¢FW67&—F÷"æFWF€¢ò†FW67&—F÷"æFWF‚æ6ÆV"ÒçVÆÂò&6ÆV""²FW67&—F÷"æFWF‚æ6ÆV"¢&ÆöB"¢¢&æöæR"À¢Ó°¢ög&ÖU75G&6RçW6‚†VçG'’“°¢&WGW&âVçG'“°¢Ò’‚¢¢çVÆÂÀ¢÷66—76÷#¢çVÆÀ¢Ò“°¢ÒÀ ¢'VæB‡74†æFÆR’°¢–b…÷&VæFW$6öÖÖæE&WÆ”FWF‚ÓÓÒ’Ö&´6ÆÂ‚''VæB"Â·74†æFÆWÒ“°¢6öç7B7FFRÒ757FFR‡74†æFÆR“°¢7FFRç72æVæB‚“°¢–b‡7FFRåöG&vâ’°¢6öç7B&V6÷&BÒ†vÆö&ÅF†—2æÖ5vV$wRå÷&VæFW%F&vWG2ÇÃÒ·Ò•·7FFRå÷F&vWDÆ&VÂóò#ò%Ó°¢–b‡&V6÷&B’&V6÷&BæG&w2³Ò7FFRåöG&vã°¢Ð¢òò6GW&R72F†B7GVÆÇ’G&WrÆ÷BöbFW'&–âÂæ÷BÖW&VÇ’F†P¢òòf—'7B72F†B&÷VæBFW'&–â—VÆ–æS¢FW'&–âFöW2æ÷B7F'@¢òòG&v–ærVçF–ÂçF–6²#C#RÂ6òâV&Ç’72––VÆG2âÆÂ×¦W&òFWF€¢òò'VffW"F†B&÷fW2æ÷F†–ærâ&V6÷&BF†RG&r6÷VçB6òâÆÂ×¦W&ð¢òò&W7VÇB6â&RFöÆB'Bg&öÒâV×G’72à¢–b‡7FFRå÷6uFW'&–â’°¢òò6Vç7W2f—'7C¢†÷rÖç’G&w2FW'&–â72&VÆÇ’6'&–W2Âv†WF†W ¢òò—B†2FWF‚GF6†ÖVçBBÆÂÂæBBv†–6‚F–6·2âF†R&Wf–÷W0¢òòF‡&W6†öÆBöbSG&w2æWfW"G&–vvW&VBÒÒFW'&–âG&w2ã3bF–ÖW2W ¢òòg&ÖR7Æ—B7&÷7276W2ÒÒ6òF†R&æòFWF‚6GW&VB"&W7VÇB6–@¢òòæ÷F†–ær&÷WBF†R&VæFW&W"à¢6öç7B2Ò†vÆö&ÅF†—2æÖ5vV$wRå÷FW'&–å746Vç7W2ÇÃÒ°¢76W3¢ÂF÷FÄG&w3¢ÂÖ„G&w3¢Âv—F„FWFƒ¢Âf—'7EF–6³¢çVÆÂÂÆ7EF–6³¢çVÆÀ¢Ò“°¢2ç76W2²³°¢2çF÷FÄG&w2³Ò7FFRåöG&vã°¢2æÖ„G&w2ÒÖF‚æÖ‚†2æÖ„G&w2Â7FFRåöG&vâ“°¢–b‡7FFRåöFWF„VçG'’’2çv—F„FWF‚²³°¢6öç7BF–6²ÒvÆö&ÅF†—2æÖ5vV%V×òçF–6·2ÇÂ°¢–b†2æf—'7EF–6²ÓÒçVÆÂ’2æf—'7EF–6²ÒF–6³°¢2æÆ7EF–6²ÒF–6³°¢Ð¢–b‡7FFRå÷6uFW'&–âbb7FFRåöFWF„VçG'’bböFWF…6æ6†÷@¢bb7FFRåöG&vâãÒP¢bb…öG&t6Vç7W2ÇÂ†vÆö&ÅF†—2æÖ5vV%V×òçF–6·2ÇÂ’â#c’’°¢6öç7BFW‚Ò7FFRåöFWF„VçG'“°¢6öç7B'—FW5W%&÷rÒÖF‚æ6V–Â‡FW‚çv–GF‚¢Bò#Sb’¢#Sc°¢G'’°¢öFWF…6æ6†÷BÒ°¢'VffW#¢FWf–6Ræ7&VFT'VffW"‡°¢6—¦S¢'—FW5W%&÷r¢FW‚æ†V–v‡BÀ¢W6vS¢uT'VffW%W6vRä4õ•ôE5BÂuT'VffW%W6vRäÔõ$T@¢Ò’À¢'—FW5W%&÷rÂv–GFƒ¢FW‚çv–GF‚Â†V–v‡C¢FW‚æ†V–v‡BÂÆ&VÃ¢FW‚åöÆ&VÂÀ¢G&vã¢7FFRåöG&vâÂF–6³¢vÆö&ÅF†—2æÖ5vV%V×òçF–6·2ÇÂ ¢Ó°¢7FFRåöVæ6öFW"æ6÷•FW‡GW&UFô'VffW"€¢·FW‡GW&S¢FW‚çFW‡GW&RÂ7V7C¢&FWF‚ÖöæÇ’'ÒÀ¢¶'VffW#¢öFWF…6æ6†÷Bæ'VffW"Â'—FW5W%&÷rÂ&÷w5W$–ÖvS¢FW‚æ†V–v‡GÒÀ¢·v–GFƒ¢FW‚çv–GF‚Â†V–v‡C¢FW‚æ†V–v‡BÂFWF„÷$'&”Æ–W'3¢Ð¢“°¢Ò6F6‚†W'&÷"’°¢öFWF…6æ6†÷BÒ¶W'&÷#¢7G&–ær†W'&÷"’ç6Æ–6RƒÂ#—Ó°¢Ð¢Ð¢òòVæ–f÷&Ò6æ6†÷BÂF¶VâF†R6ÖRv’F†RFWF‚6æ6†÷B—3¢v—F‚F†P¢òò72w2÷vâVæ6öFW"Â–ÖÖVF–FVÇ’gFW"72æVæB‚’Â6òF†R'—FW2&RF†P¢òòöæW2F†—27V&Ö—76–öâW6VBâ&VF–ærVæ–f÷&Ò'VffW"B&W6VçB‚’F–ÖP¢òòÖV7W&W2&V7–6ÆVB&–ær'VffW"æB&W÷'G2¦W&÷2f÷"WfW'’—VÆ–æRÀ¢òò–æ6ÇVF–æröæW2F†Bf—6–&Ç’&VæFW"à¢–b…öG&t6Vç7W2bb7FFRå÷6uFW'&–âbb÷Væ–f÷&Õ6æ6†÷@¢bbvÆö&ÅF†—2æÖ5vV$wRå÷FW'&–äG&u6×ÆSòç&ö¦V7F–öâ’°¢6öç7B&ævRÒvÆö&ÅF†—2æÖ5vV$wRå÷FW'&–äG&u6×ÆRç&ö¦V7F–öã°¢6öç7BVçG'’Òö&¦V7G2ævWB‡&ævRæ'VffW$†æFÆR“°¢–b†VçG'’bbVçG'’æ'VffW"’°¢G'’°¢÷Væ–f÷&Õ6æ6†÷BÒ°¢'VffW#¢FWf–6Ræ7&VFT'VffW"‡°¢6—¦S¢cBÀ¢W6vS¢uT'VffW%W6vRä4õ•ôE5BÂuT'VffW%W6vRäÔõ$T@¢Ò’À¢G&vã¢7FFRåöG&và¢Ó°¢7FFRåöVæ6öFW"æ6÷”'VffW%Fô'VffW"†VçG'’æ'VffW"Â&ævRæöfg6WBÀ¢÷Væ–f÷&Õ6æ6†÷Bæ'VffW"ÂÂcB“°¢Ò6F6‚†W'&÷"’°¢÷Væ–f÷&Õ6æ6†÷BÒ¶W'&÷#¢7G&–ær†W'&÷"’ç6Æ–6RƒÂc—Ó°¢Ð¢Ð¢Ð¢–b…öG&t6Vç7W2bb7FFRå÷6uf—6–&ÆRbb÷f—6–&ÆUVæ–f÷&Õ6æ6†÷@¢bbvÆö&ÅF†—2æÖ5vV$wRå÷f—6–&ÆU&ö¥&ævR’°¢6öç7B&ævRÒvÆö&ÅF†—2æÖ5vV$wRå÷f—6–&ÆU&ö¥&ævS°¢6öç7BVçG'’Òö&¦V7G2ævWB‡&ævRæ'VffW$†æFÆR“°¢–b†VçG'’bbVçG'’æ'VffW"’°¢G'’°¢÷f—6–&ÆUVæ–f÷&Õ6æ6†÷BÒ°¢'VffW#¢FWf–6Ræ7&VFT'VffW"‡°¢6—¦S¢cBÀ¢W6vS¢uT'VffW%W6vRä4õ•ôE5BÂuT'VffW%W6vRäÔõ$T@¢Ò’À¢G&vã¢7FFRåöG&và¢Ó°¢7FFRåöVæ6öFW"æ6÷”'VffW%Fô'VffW"†VçG'’æ'VffW"Â&ævRæöfg6WBÀ¢÷f—6–&ÆUVæ–f÷&Õ6æ6†÷Bæ'VffW"ÂÂcB“°¢Ò6F6‚†W'&÷"’°¢÷f—6–&ÆUVæ–f÷&Õ6æ6†÷BÒ¶W'&÷#¢7G&–ær†W'&÷"’ç6Æ–6RƒÂc—Ó°¢Ð¢Ð¢Ð¢òòG&6²6çf276W2…÷F–BÓÓÒÓ’6W&FVÇ“¢Öö¦ærG&w2F†R7Æ6€¢òò7G&–v‡BFòF†R6çf2Â6òv†VâF†R6çf2—2F†RÆ7BÖG&vâF&vWBvP¢òò×W7BäõB6ö×÷6—FR†—Bv÷VÆB÷fW'w&—FRÖö¦ærw26÷'&V7B÷WGWB’à¢–b‡7FFRå÷F–BÓÓÒÓbb7FFRåöG&vâ’°¢g&ÖTÆ7EF–BÒÓ°¢g&ÖTÆ7D—46çf2ÒG'VS°¢Ð¢–b‡7FFRå÷F–Bâbb7FFRåöG&vâ’°¢g&ÖTG&w2ç6WB‡7FFRå÷F–BÂ†g&ÖTG&w2ævWB‡7FFRå÷F–B’ÇÂ’²7FFRåöG&vâ“°¢òò7F×G&r÷&FW"f÷"æöâÖ6çf2F&vWG2à¢7FFRå÷6WÒ²¶G&u6W°¢g&ÖTG&u6Wç6WB‡7FFRå÷F–BÂ7FFRå÷6W“°¢g&ÖTÆ7EF–BÒ7FFRå÷F–C°¢òòæöâÖ6çf2F&vWBG&vâgFW"ç’6çf272ÖVç2Öö¦ær—2äõ@¢òò&W6VçF–ærFòF†R6çf2F—&V7FÇ’‡F—FÆR67&VVâ&VæFW'2öfg67&VVâ’à¢g&ÖTÆ7D—46çf2ÒfÇ6S°¢Ð¢ö&¦V7G2æFVÆWFR‡74†æFÆR“°¢ÒÀ ¢'6WE—VÆ–æR‡74†æFÆRÂ—VÆ–æT†æFÆR’°¢–b…÷&VæFW$6öÖÖæE&WÆ”FWF‚ÓÓÒ’°¢Ö&´6ÆÂ‚''6WE—VÆ–æR"Â·74†æFÆRÂ—VÆ–æT†æFÆWÒ“°¢Ð¢6öç7B7FFRÒ757FFR‡74†æFÆR“°¢–b‚—VÆ–æT†æFÆR’°¢7FFRç—VÆ–æRÒçVÆÃ°¢&WGW&ã°¢Ð¢6öç7BVçG'’ÒvWB‡—VÆ–æT†æFÆRÂ'—VÆ–æR"“°¢6öç7B74FWF‚Ò7FFRæFWF„f÷&ÖBÇÂçVÆÃ°¢òò–6²F†R&RÖ'V–ÇB—VÆ–æRv†÷6RFWF‚GF6†ÖVçBÖF6†W2F†—270¢òò†7&VFU—VÆ–æR'V–ÇB&÷F‚7FFW2–çFòVçG'’æ'”FWF‚’âF—&V7BÆöö·WÀ¢òòæòÆ§’66†–ær&6RâfÆÂ&6²Fò§W7BÖ–â×F–ÖR'V–ÆBf÷"ç’FWF€¢òòf÷&ÖBæ÷B&RÖ'V–ÇB†RærâFWFƒ#GÇW2×7FVæ6–Ã‚’ÂF†VâFòF†R&6Rà¢ÆWB6†÷6VâÒVçG'’æ'”FWFƒòævWB‡74FWF‚“°¢ÆWB6†÷6VäFWF‚Ò74FWFƒ°¢–b‚6†÷6Vâbb74FWF‚’°¢ÆWBÆ§’ÒVçG'’çf&–çG3òævWB‡74FWF‚“°¢–b‚Æ§’’°¢G'’°¢6öç7B'V–ÇBÒ'V–ÆE—VÆ–æR†VçG'’ç7V2Â74FWF‚“°¢–b†'V–ÇB’°¢Æ§’Ò·—VÆ–æS¢'V–ÇBç—VÆ–æRÂFWF„f÷&ÖC¢74FWF‡Ó°¢†VçG'’çf&–çG2óóÒæWrÖ‚’’ç6WB‡74FWF‚ÂÆ§’“°¢&V6÷&E7FvR†FWF‚×f&–çBÖö³¢G¶VçG'’ç7V2æÆ&VÇÓ¢G·74FWF‡Ö“°¢Ð¢Ò6F6‚†W'&÷"’°¢&V6÷&E7FvR†FWF‚×f&–çBÖf–ÆVC¢G¶VçG'’ç7V2æÆ&VÇÓ¢G¶W'&÷"æÖW76vWÖ“°¢Ð¢Ð¢–b†Æ§’’²6†÷6VâÒÆ§’ç—VÆ–æS²6†÷6VäFWF‚ÒÆ§’æFWF„f÷&ÖC²Ð¢Ð¢–b‚6†÷6Vâ’²6†÷6VâÒVçG'’ç—VÆ–æS²6†÷6VäFWF‚ÒVçG'’æFWF„f÷&ÖC²Ð¢–b†VçG'’ç7V2bb÷æ÷&Öö’çFW7B†VçG'’ç7V2æÆ&VÂ’’÷æõ&ö&Rç6WB²³°¢–b…ôD$rbbVçG'’ç7V2bbö&Æ—GÆ–çFW'öÆFWÇæ÷&ÖÇ6·—Ç7F'2òçFW7B†VçG'’ç7V2æÆ&VÂ’bb…÷'F&tâÒ…÷'F&tâÇÂ’²’ÃÒb’°¢6öç6öÆRæÆör‚%·'6WE—VÆ–æRÖF&uÒ"ÂVçG'’ç7V2æÆ&VÂÂ'74FWFƒÒ"Â7G&–ær‡74FWF‚’À¢&'”FWF„¶W—3Ò"Â¥4ôâç7G&–æv–g’…²âââ†VçG'’æ'”FWFƒòæ¶W—2‚’ÇÂµÒ•ÒæÖ‚†²’Óâ7G&–ær†²’’’À¢'f&–çG4¶W—3Ò"Â¥4ôâç7G&–æv–g’…²âââ†VçG'’çf&–çG3òæ¶W—2‚’ÇÂµÒ•ÒæÖ‚†²’Óâ7G&–ær†²’’’À¢&6†÷6VäFWFƒÒ"Â7G&–ær†6†÷6VäFWF‚’À¢&VçG'”FWFƒÒ"Â7G&–ær†VçG'’æFWF„f÷&ÖB’“°¢Ð¢–b‚÷FW'&–âòçFW7B†VçG'’ç7V3òæÆ&VÂÇÂ""’’7FFRå÷6uFW'&–âÒG'VS°¢òò6öçG&öÃ¢—VÆ–æRv†÷6R÷WGWB—2f—6–&ÆRöâ67&VVâÂ6×ÆVBF†P¢òò6ÖRv’Â6ò'FW'&–âw2&ö¦V7F–öâ—2¦W&ò"6â&RFöÆB'Bg&öÐ¢òò&WfW'’&ö¦V7F–öâ&VG2¦W&ò"à¢–b…öG&t6Vç7W2bbõÂò‡6·—Æ6VÆW7F–Â’BòçFW7B†VçG'’ç7V3òæÆ&VÂÇÂ""’’°¢7FFRå÷6uf—6–&ÆRÒG'VS°¢6öç7B"Ò7FFRç&W6÷W&6W2ævWB‚%&ö¦V7F–öâ"“°¢–b‡"bbvÆö&ÅF†—2æÖ5vV$wRå÷f—6–&ÆU&ö¥&ævR’°¢vÆö&ÅF†—2æÖ5vV$wRå÷f—6–&ÆU&ö¥&ævRÐ¢¶'VffW$†æFÆS¢"æ'VffW$†æFÆRÂöfg6WC¢"æöfg6WBÂ6—¦S¢"ç6—¦WÓ°¢Ð¢Ð¢7FFRç—VÆ–æRÒ²ââæVçG'’Â—VÆ–æS¢6†÷6VâÂFWF„f÷&ÖC¢6†÷6VäFWF‡Ó°¢òòöÖ7vV%÷7W&W73ÓÇ&VvWƒâG&÷2G&w2g&öÒÖF6†–ær—VÆ–æW2âF†—2—2à¢òò—6öÆF–öâFööÂöæÇ“²F†Ræ÷&ÖÂF‚&VæFW'26Æ÷VDf6W2F‡&÷Vv‚F†P¢òòf÷&ÖGFVB×FW†VÂ6ö×F–&–Æ—G’FFW"&÷fRà¢7FFRå÷7W&W76VBÒö—5—VÆ–æU7W&W76VB†VçG'’ç7V3òæÆ&VÂÇÂ""“°¢7FFRç72ç6WE—VÆ–æR†6†÷6Vâ“°¢7FFRæ&÷VæDw&÷W2ÒµÓ°¢ÒÀ ¢òò&VæÖW2g&W6†Ç’7&VFVBö&¦V7Bw2†æFÆRà¢òð¢òòf÷"F†R÷Vä¤D²ÆæRÂv†÷6R%2†2Fòç7vW"¦f&Vf÷&RF†R†÷7B†0¢òò'VâF†R6ÆÃ¢F†R6Æ–VçB†æG2¦fÆ6V†öÆFW"ÂF†R†÷7B7&VFW2F†P¢òòö&¦V7BVæFW"—G2÷vâ†æFÆRÂæBF†—2Ö÷fW2—BöçFòF†RÆ6V†öÆFW"6ð¢òòF†RGvò&RF†R6ÖRçVÖ&W"g&öÒF†VâöââWfW'’Æöö·WvöW2F‡&÷Vv‚F†P¢òòöæRö&¦V7G6ÖÂ6òæ÷F†–ærVÇ6RæVVG2Fò¶æ÷râ&WGW&ç2fÇ6R–bF†P¢òò†æFÆRæÖW2æòö&¦V7BÂv†–6‚¶VW2æöâÖ†æFÆR&WGW&âfÇVR†v–GF‚Â¢òò&ööÆVâ’g&öÒ&VæÖ–ær6öÖWF†–ærB&æFöÒà¢&V¶W”ö&¦V7B†g&öÒÂFò’°¢–b†g&öÒÓÓÒFò’&WGW&âG'VS°¢6öç7Bö&¦V7BÒö&¦V7G2ævWB†g&öÒ“°¢–b†ö&¦V7BÓÓÒVæFVf–æVB’&WGW&âfÇ6S°¢ö&¦V7G2æFVÆWFR†g&öÒ“°¢–b†ö&¦V7BbbG—Vöbö&¦V7BÓÓÒ&ö&¦V7B"’ö&¦V7Båö†æFÆRÒFó°¢ö&¦V7G2ç6WB‡FòÂö&¦V7B“°¢&WGW&âG'VS°¢ÒÀ ¢òòV&Æ—6†W2öæR–çFW&æVB&–æF–æræÖRâ–ÖvW2W6VBFòw&—FRö&–æF–ætæÖW0¢òòF—&V7FÇ’g&öÒF†V—"¥2&öG’Âv†–6‚öæÇ’v÷&·2v†VâF†R†÷7Bö&¦V7B—0¢òòF†R†÷7C¢÷fW"F†R÷Vä¤D²ÆæRw2%2&÷‡’F†Rw&—FRÆæG2öâÆö6À¢òò7FæBÖ–âæBWfW'’ÆFW"'6WEVæ–f÷&Òf–Ç2Fò&W6öÇfR—G2æÖRâvö–æp¢òòF‡&÷Vv‚ÖWF†öBÖVç2F†R6ÆÂ—2f÷'v&FVBÆ–¶Rç’÷F†W"à¢&Vv—7FW$&–æF–ætæÖR†–BÂæÖR’°¢‡F†—2åö&–æF–ætæÖW2ÇÃÒµÒ•¶–EÒÒæÖS°¢ÒÀ ¢òòæWr–ÖvW272â–çFW&æVB–çFVvW"–B†W&Râ¶VW66WF–ær7G&–ær0¢òòvVÆÃ¢7FvVBv6ÔÄÒ–ÖvW2&RW‡Vç6—fRFò&V'V–ÆBæBöÆFW"'F–f7G0¢òò6ÆÂF†—26ÖR†÷7BVçG'’ö–çBv—F‚F†R&RÖ–çFW&æ–ær7G&–ær$’âFòæ÷@¢òò–æFW‚ö&–æF–ætæÖW2v—F‚F†BfÇVRÒÒv6ÔÄÒ¦f7G&–ær—2&÷‡’À¢òòæB6öW&6–ær—BFò&÷W'G’¶W’&RÖVçFW'2F†Rv6Ò7G&–ær'&–FvRVçF–À¢òòF†R¦f7F6²÷fW&fÆ÷w2à¢'&–æEFW‡GW&R‡74†æFÆRÂæÖT–BÂf–Wt†æFÆRÂ6×ÆW$†æFÆR’°¢6öç7BæÖRÒ&W6öÇfT&–æF–ætæÖR†æÖT–BÂ'FW‡GW&R"“°¢–b…÷&VæFW$6öÖÖæE&WÆ”FWF‚ÓÓÒ’Ö&´6ÆÂ‚''&–æEFW‡GW&R"Â·74†æFÆRÂæÖWÒ“°¢6öç7B7FFRÒ757FFR‡74†æFÆR“°¢6öç7B÷f–WtVçG'’ÒvWB‡f–Wt†æFÆRÂ'FW‡GW&Rf–Wr"“°¢÷FW‡GW&TÆ–fWF–ÖRææ÷FUf–WuW6R‡f–Wt†æFÆRÂ÷f–WtVçG'’“°¢6öç7BFW…&V2Ò°¢¶–æC¢'FW‡GW&R"À¢f–Ws¢÷f–WtVçG'’çf–WrÀ¢f–Wt†æFÆRÀ¢6×ÆW#¢vWB‡6×ÆW$†æFÆRÂ'6×ÆW""’ç6×ÆW"À¢6×ÆW$†æFÆRÀ¢öæÖS¢æÖRÂòòD”s¢æÖRÖö¦ær&÷VæBVæFW ¢÷FW„VçG'“¢÷f–WtVçG'’çFW‡GW&TVçG'’òòD”s¢VæFW&Ç––ærFW‡GW&RVçG'’‡WÆöG2÷6—¦R¢Ó°¢7FFRç&W6÷W&6W2ç6WB†æÖRÂFW…&V2“°¢òò÷6—F–öæÂ&V6÷&BFöó¢Öö¦ærw2&–æEFW‡GW&RæÖRæVVBæ÷BWVÂF†P¢òò—VÆ–æR7V2w26×ÆW"æÖR‡F†RÆöö·W¶W’–âVç7W&T&–æDw&÷W2’âv†Và¢òòF†RæÖRÆöö·WÖ—76W2vRfÆÂ&6²Fò&–æB÷&FW"„çF‚&–æB(i"çF€¢òò6×ÆW"6Æ÷B’Âv†–6‚—2æÖRÖ–æFWVæFVçBæB6÷'&V7Bf÷"F†P¢òò6–ævÆR×6×ÆW"FW‡GW&VBfÖ–Æ–W2‡FW‡B÷÷6—F–öå÷FW‚¢÷æ÷&Ö’à¢7FFRæG&uFW„&–æG2çW6‚‡FW…&V2“°¢ÒÀ ¢'6WEVæ–f÷&Ò‡74†æFÆRÂæÖT–BÂ'VffW$†æFÆRÂöfg6WBÂ6—¦R’°¢6öç7BæÖRÒ&W6öÇfT&–æF–ætæÖR†æÖT–BÂ'Væ–f÷&Ò"“°¢–b…÷&VæFW$6öÖÖæE&WÆ”FWF‚ÓÓÒ’Ö&´6ÆÂ‚''6WEVæ–f÷&Ò"Â·74†æFÆRÂæÖWÒ“°¢6öç7B7FFRÒ757FFR‡74†æFÆR“°¢6öç7Bö&VçG'’ÒvWB†'VffW$†æFÆRÂ&'VffW""“°¢òòD”s¢FW'&–âæg6‚VæG2v—F€¢òò6öÆ÷"ÒÖ—‚„föt6öÆ÷"¢fV3BƒÃÃÆ6öÆ÷"æ’Â6öÆ÷"Â6‡Væµf—6–&–Æ—G’¢òò6ò6‡Væµf—6–&–Æ—G’ÓÒ–çG2F†Rv†öÆR6‡Væ²–âföt6öÆ÷"æòÖGFW ¢òòv†BF†RFÆ26×ÆR&WGW&æVBÒÒVæ–f÷&ÒÆRÖ&ÇVRv6‚÷fW"ÆÀ¢òòFW'&–âÂv†–ÆRVçF—G’æBuT’6†FW'2†æò6‡Væµf—6–&–Æ—G’’7F¢òò6÷'&V7Bâ6GW&RF†R'—FW27GVÆÇ’&÷VæBÂ7FCC ¢òòÖCBÖöFVÅf–WtÖBÂfÆöB6‡Væµf—6–&–Æ—G’cBÀ¢òò—fV3"FW‡GW&U6—¦Rs"Â—fV326‡Væµ÷6—F–öâƒà¢–b†æÖRÓÓÒ$6‡Væµ6V7F–öâ"bbö&VçG'’å÷6†F÷r’°¢6öç7B&–ærÒ†vÆö&ÅF†—2æÖ5vV$wRåö6‡Væµ6V7F–öå&–ærÇÃÒµÒ“°¢–b‡&–æræÆVæwF‚ÂC’°¢6öç7B&6RÒ…ö&VçG'’å÷6†F÷ræ'—FTöfg6WBÇÂ’²öfg6WC°¢–b†&6R²“"ÃÒö&VçG'’å÷6†F÷ræ'VffW"æ'—FTÆVæwF‚’°¢6öç7BbÒæWrfÆöC3$'&’…ö&VçG'’å÷6†F÷ræ'VffW"Â&6RÂ#2“°¢6öç7B’ÒæWr–çC3$'&’…ö&VçG'’å÷6†F÷ræ'VffW"Â&6RÂ#2“°¢&–ærçW6‚‡°¢6‡Væµf—6–&–Æ—G“¢e³eÒÀ¢FW‡GW&U6—¦S¢¶•³…ÒÂ•³•ÕÒÀ¢6‡Væµ÷6—F–öã¢¶•³#ÒÂ•³#ÒÂ•³#%ÕÒÀ¢òògVÆÂÖG&—‚Âæ÷B§W7BF†RF–vöæÃ¢FW'&–â&÷f&Ç’FöW2æ÷@¢òò&7FW&—6R†72v—F‚‚G&w2w&—FW2¦W&òFWF‚’Â6ð¢òòvÅõ÷6—F–öâ×W7B&R&V6ö×WFVB'’†æBg&öÒF†RÖV7W&V@¢òò–çWG2Fòf–æBv†–6‚f7F÷"6öÆÆ6W2÷"6Æ—2—Bà¢ÖöFVÅf–Ws¢'&’æg&öÒ‡¶ÆVæwFƒ¢gÒÂ…òÂ²’Óâe¶µÒ¢Ò“°¢Ð¢Ð¢Ð¢7FFRç&W6÷W&6W2ç6WB†æÖRÂ°¢¶–æC¢'Væ–f÷&Ò"À¢'VffW#¢ö&VçG'’æ'VffW"À¢'VffW$†æFÆRÀ¢'VffW%6—¦S¢ö&VçG'’ç6—¦RÂòògVÆÂ'VffW"6—¦RÂf÷"6fRVæ–f÷&Ò×&ævR–æfÆFP¢öfg6WBÀ¢6—¦P¢Ò“°¢ÒÀ ¢'6WEfW'FW„'VffW"‡74†æFÆRÂ6Æ÷BÂ'VffW$†æFÆRÂöfg6WBÂ6—¦R’°¢6öç7B7FFRÒ757FFR‡74†æFÆR“°¢7FFRçfW'FW„'VffW'5·6Æ÷EÒÒ¶'VffW#¢vWB†'VffW$†æFÆRÂ&'VffW""’æ'VffW"Âöfg6WBÂ6—¦RÂö†æFÆS¢'VffW$†æFÆWÓ°¢ÒÀ ¢'6WD–æFW„'VffW"‡74†æFÆRÂ'VffW$†æFÆRÂf÷&ÖB’°¢6öç7B7FFRÒ757FFR‡74†æFÆR“°¢7FFRæ–æFW„'VffW"Ò¶'VffW#¢vWB†'VffW$†æFÆRÂ&'VffW""’æ'VffW"Âf÷&ÖBÂö†æFÆS¢'VffW$†æFÆWÓ°¢ÒÀ ¢'66—76÷"‡74†æFÆRÂ‚Â’Âv–GF‚Â†V–v‡B’°¢6öç7B7FFRÒ757FFR‡74†æFÆR“°¢òò&÷GFöÒÖÆVgB÷&–v–â„Ö–æV7&gB’ÓâF÷ÖÆVgB÷&–v–â…vV$uR’à¢6öç7B—’ÒÖF‚æÖ‚ƒÂ7FFRæ†V–v‡BÒ’Ò†V–v‡B“°¢6öç7BwrÒÖF‚æÖ‚ƒÂv–GF‚“°¢6öç7B†‚ÒÖF‚æÖ‚ƒÂ†V–v‡B“°¢7FFRå÷66—76÷"Ò·‚Â—’ÂwrÂ†…Ó°¢7FFRç72ç6WE66—76÷%&V7B‡‚Â—’ÂwrÂ†‚“°¢ÒÀ ¢'F—6&ÆU66—76÷"‡74†æFÆR’°¢6öç7B7FFRÒ757FFR‡74†æFÆR“°¢–b‡7FFRæ&V’°¢7FFRå÷66—76÷"Ò7FFRæ&Vç6Æ–6R‚“°¢7FFRç72ç6WE66—76÷%&V7B‡7FFRæ&V³ÒÂ7FFRæ&V³ÒÂ7FFRæ&V³%ÒÂ7FFRæ&V³5Ò“°¢ÒVÇ6R°¢7FFRå÷66—76÷"Ò³ÂÂ3#scrÂ3#scuÓ°¢7FFRç72ç6WE66—76÷%&V7BƒÂÂ3#scrÂ3#scr“°¢Ð¢ÒÀ ¢'6öÖÖæE7G&VÕ&r‡74†æFÆRÂ'—FW2Â'—FTÆVæwF‚ÂVæB’°¢&WGW&â&WÆ•&VæFW%746öÖÖæG2‡F†—2Â74†æFÆRÂ'—FW2Â'—FTÆVæwF‚ÂVæBÂ'&r"“°¢ÒÀ ¢'6öÖÖæE7G&VÓcB‡74†æFÆRÂ&6ScBÂ'—FTÆVæwF‚ÂVæB’°¢&WGW&â&WÆ•&VæFW%746öÖÖæG2‡F†—2Â74†æFÆRÂ&6ScBÂ'—FTÆVæwF‚ÂVæBÂ&&6ScB"“°¢ÒÀ ¢'6öÖÖæE7G&VÕFW‡B‡74†æFÆRÂFW‡BÂv÷&D6÷VçBÂVæB’°¢&WGW&â&WÆ•&VæFW%746öÖÖæG2€¢F†—2Â74†æFÆRÂFW‡BÂv÷&D6÷VçB¢BÂVæBÂ'6¶VB×FW‡B ¢“°¢ÒÀ ¢'6öÖÖæE7G&VÕv6Ôv2‡74†æFÆRÂv÷&G2Âv÷&D6÷VçBÂVæBÂ&VEv÷&B’°¢&WGW&â&WÆ•&VæFW%746öÖÖæG2€¢F†—2Â74†æFÆRÂv÷&G2Âv÷&D6÷VçB¢BÂVæBÂ'v6Öv2×&VFW""Â&VEv÷&@¢“°¢ÒÀ ¢G&t&F6„Væ&ÆVB‚’°¢&WGW&âæWrU$Å6V&6…&×2†vÆö&ÅF†—2æÆö6F–öãòç6V&6‚ÇÂ""’æ†2‚&Ö7vV%öwUö–ÖÖVF–FR"’ò¢°¢ÒÀ ¢'G&t–æFW†VD&F6‚‡74†æFÆRÂ&6ScBÂG&t6÷VçB’°¢6öç7B'—FW2Ò&6ScEFô'—FW2†&6ScB“°¢–b†'—FW2æÆVæwF‚ÂG&t6÷VçB¢#’F‡&÷ræWrW'&÷"‚&–æFW†VBG&r&F6‚—2G'Væ6FVB"“°¢6öç7Bf–WrÒæWrFFf–Wr†'—FW2æ'VffW"Â'—FW2æ'—FTöfg6WBÂ'—FW2æ'—FTÆVæwF‚“°¢f÷"†ÆWB’Ò²’ÂG&t6÷VçC²’²²’°¢6öç7B&6RÒ’¢#°¢F†—2ç'G&t–æFW†VB‡74†æFÆRÂf–WrævWD–çC3"†&6RÂG'VR’Âf–WrævWD–çC3"†&6R²BÂG'VR’À¢f–WrævWD–çC3"†&6R²‚ÂG'VR’Âf–WrævWD–çC3"†&6R²"ÂG'VR’Âf–WrævWD–çC3"†&6R²bÂG'VR’“°¢Ð¢ÒÀ ¢'G&t&F6‚‡74†æFÆRÂ&6ScBÂG&t6÷VçB’°¢6öç7B'—FW2Ò&6ScEFô'—FW2†&6ScB“°¢–b†'—FW2æÆVæwF‚ÂG&t6÷VçB¢b’F‡&÷ræWrW'&÷"‚&G&r&F6‚—2G'Væ6FVB"“°¢6öç7Bf–WrÒæWrFFf–Wr†'—FW2æ'VffW"Â'—FW2æ'—FTöfg6WBÂ'—FW2æ'—FTÆVæwF‚“°¢f÷"†ÆWB’Ò²’ÂG&t6÷VçC²’²²’°¢6öç7B&6RÒ’¢c°¢F†—2ç'G&r‡74†æFÆRÂf–WrævWD–çC3"†&6RÂG'VR’Âf–WrævWD–çC3"†&6R²BÂG'VR’À¢f–WrævWD–çC3"†&6R²‚ÂG'VR’Âf–WrævWD–çC3"†&6R²"ÂG'VR’“°¢Ð¢ÒÀ ¢'G&r‡74†æFÆRÂf—'7EfW'FW‚ÂfW'FW„6÷VçBÂ–ç7Fæ6T6÷VçBÂ&6T–ç7Fæ6R’°¢–b…÷&VæFW$6öÖÖæE&WÆ”FWF‚ÓÓÒ’Ö&´6ÆÂ‚''G&r"Â·74†æFÆRÂfW'FW„6÷VçGÒ“°¢6öç7B7FFRÒ757FFR‡74†æFÆR“°¢7FFRåöG&vâ²³°¢òòöÖ7vV%öG&v6Vç7W3Ó¢v†–6‚—VÆ–æW27GVÆÇ’—77VRG&w2ÂæB–çFð¢òòv†–6‚F&vWBâ6‡Væ²6÷VçFW'26’FW'&–â—2&VæFW&&ÆS²F†—26—0¢òòv†WF†W"ç—F†–ær—2G&vâf÷"—Bâ–æW'BVæÆW72F†RfÆr—2&W6VçBà¢–b…öG&t6Vç7W2’öæ÷FTG&t6Vç7W2‡7FFRÂfW'FW„6÷VçBÂ–ç7Fæ6T6÷VçB“°¢–b‚7FFRç—VÆ–æRÇÂ7FFRå÷7W&W76VB’&WGW&ã°¢öæ÷FTföçDG&r‡7FFRÂ&G&r"Â¶f—'7EfW'FW‚ÂfW'FW„6÷VçBÂ–ç7Fæ6T6÷VçGÒ“°¢Vç7W&T&–æDw&÷W2‡7FFR“°¢7FFRæG&uFW„&–æG2æÆVæwF‚Ò²òò&–æG26öç7VÖVBeDU"Vç7W&T&–æDw&÷W2&VG2F†VÐ¢òòD”s¢öæR×6†÷Bæ–ÖFU÷7&—FRT$ò²F&vWBGV× ¢–b‚öæ–ÔF&tFöæRbb7FFRç—VÆ–æRç7V2bböæ–ÖFU÷7&—FRòçFW7B‡7FFRç—VÆ–æRç7V2æÆ&VÂ’’°¢öæ–ÔF&tFöæRÒG'VS°¢6öç7BVæ’Ò7FFRç&W6÷W&6W2ævWB‚%7&—FTæ–ÖF–öä–æfò"“°¢ÆWBV&ôGV×Ò&æò7&—FTæ–ÖF–öä–æfò&÷VæB#°¢–b‡Væ’bbVæ’æ¶–æBÓÓÒ'Væ–f÷&Ò"’°¢6öç7B&RÒö&¦V7G2ævWB‡Væ’æ'VffW$†æFÆR“°¢–b†&Rbb&Rå÷6†F÷r’°¢6öç7BbÒæWrfÆöC3$'&’†&Rå÷6†F÷ræ'VffW"ÂVæ’æöfg6WBÂ3"“°¢6öç7B“3"ÒæWr–çC3$'&’†&Rå÷6†F÷ræ'VffW"ÂVæ’æöfg6WBÂ3R“°¢V&ôGV×Ò¥4ôâç7G&–æv–g’‡°¢'VdÆ&VÃ¢&RåöÆ&VÂÂ'Ve6—¦S¢&Rç6—¦RÂVæ”öfg6WC¢Væ’æöfg6WBÂVæ•6—¦S¢Væ’ç6—¦RÀ¢&ö¤ÖC¢'&’æg&öÒ†bç6Æ–6RƒÂb’’À¢7&—FTÖC¢'&’æg&öÒ†bç6Æ–6RƒbÂ3"’’À¢UFF–æs¢e³3%ÒÂeFF–æs¢e³35ÒÂÖ—ÖÆWfVÃ¢“3%³3EÐ¢Ò“°¢ÒVÇ6R²V&ôGV×Ò&'VffW"†æFÆR"²Væ’æ'VffW$†æFÆR²"†2æò6†F÷r#²Ð¢Ð¢6öç7B7"Ò7FFRç&W6÷W&6W2ævWB‚%7&—FR"“°¢6öç7B7$–æfòÒ7"bb7"æ¶–æBÓÓÒ'FW‡GW&R"bb7"å÷FW„VçG'¢ò¶Æ&VÃ¢7"å÷FW„VçG'’åöÆ&VÂÂWÆöG3¢7"å÷FW„VçG'’å÷WÆöG2Âvƒ¢7"å÷FW„VçG'’çv–GF‚²'‚"²7"å÷FW„VçG'’æ†V–v‡GÐ¢¢&æ÷B&÷VæB÷"æòVçG'’#°¢6öç6öÆRæÆör‚%´ä”ÒÕ5$•DRÔD”uÒF&vWCÒ"²7FFRå÷F&vWDÆ&VÂ²""²7FFRå÷F&vWEt€¢²"ÂT$ó¢"²V&ôGV× ¢²"Â7&—FRFWƒ¢"²¥4ôâç7G&–æv–g’‡7$–æfò¢²"ÂfW'FW„6÷VçCÒ"²fW'FW„6÷VçB²"f—'7EfW'FWƒÒ"²f—'7EfW'FW‚“°¢Ð¢–b‡7FFRç—VÆ–æRbb7FFRç—VÆ–æRç7V2bböæ–ÖFU÷7&—FRòçFW7B‡7FFRç—VÆ–æRç7V2æÆ&VÂ’bböæ–Õ&–æræÆVæwF‚ÂC’°¢6öç7BöRÒ7FFRç&W6÷W&6W2ævWB‚%7&—FTæ–ÖF–öä–æfò"“°¢ÆWBö6ÒÒçVÆÂÂöÒÒçVÆÃ°¢–b…öRbböRæ¶–æBÓÓÒ'Væ–f÷&Ò"’²6öç7Bö&RÒö&¦V7G2ævWB…öRæ'VffW$†æFÆR“²–b…ö&Rbbö&Rå÷6†F÷r’²6öç7BöbÒæWrfÆöC3$'&’…ö&Rå÷6†F÷ræ'VffW"Â…ö&Rå÷6†F÷ræ'—FTöfg6WBÇÂ’²öRæöfg6WBÂ3"“²öÒÒµöe³ÒÂöe³UÕÓ²ö6ÒÒµöe³eÒÂöe³#ÒÂöe³#…ÒÂöe³#•ÕÓ²ÒÐ¢6öç7Bö7Ò7FFRç&W6÷W&6W2ævWB‚%7&—FR"“²6öç7Bö6RÒö7bbö7æ¶–æBÓÓÒ'FW‡GW&R"bbö7å÷FW„VçG'“°¢öæ–Õ&–ærçW6‚‡²FwC¢7FFRå÷F&vWDÆ&VÂÂFwEtƒ¢7FFRå÷F&vWEt‚ÂÓ¢öÒÂ6Ó¢ö6ÒÂ7#¢ö6Rò…ö6RåöÆ&VÂÇÂ#ò"’ç7Æ—B‚"ò"’ç÷‚’¢çVÆÂÂ7vƒ¢ö6Rò…ö6Rçv–GF‚²'‚"²ö6Ræ†V–v‡B’¢çVÆÂÂ7W¢ö6Ròö6Rå÷WÆöG2¢çVÆÂÒ“°¢–b…ö6Ô&BæÆVæwF‚Â"bb7FFRå÷F&vWDÆ&VÂbbõÂöFÆ5ÂòòçFW7B‡7FFRå÷F&vWDÆ&VÂ’’ö6Ô&BçW6‚‡²FwC¢7FFRå÷F&vWDÆ&VÂÂFwEtƒ¢7FFRå÷F&vWEt‚ÂÓ¢öÒÂ7#¢ö6Rò…ö6RåöÆ&VÂÇÂ#ò"’ç7Æ—B‚"ò"’ç÷‚’¢çVÆÂÒ“°¢Ð¢–b‡7FFRç—VÆ–æRbb7FFRç—VÆ–æRç7V2bböæ–ÖFU÷7&—FRòçFW7B‡7FFRç—VÆ–æRç7V2æÆ&VÂ’’°¢6öç7BF&vWBÒ7FFRå÷F&vWDÆ&VÂÇÂ#ò#°¢öæ–ÕF&vWD6÷VçG2ç6WB‡F&vWBÂ…öæ–ÕF&vWD6÷VçG2ævWB‡F&vWB’ÇÂ’²“°¢–b‚öFÆ5ÂöwV•ÂçæròçFW7B‡F&vWB’bböwV”FÆ5&–æræÆVæwF‚ÂC’°¢6öç7BVæ–f÷&ÒÒ7FFRç&W6÷W&6W2ævWB‚%7&—FTæ–ÖF–öä–æfò"“°¢ÆWB&ö¦V7F–öâÒçVÆÃ°¢ÆWB7&—FTÖG&—‚ÒçVÆÃ°¢–b‡Væ–f÷&ÒbbVæ–f÷&Òæ¶–æBÓÓÒ'Væ–f÷&Ò"’°¢6öç7B'VffW"Òö&¦V7G2ævWB‡Væ–f÷&Òæ'VffW$†æFÆR“°¢–b†'VffW"bb'VffW"å÷6†F÷r’°¢6öç7BfÇVW2ÒæWrfÆöC3$'&’€¢'VffW"å÷6†F÷ræ'VffW"À¢†'VffW"å÷6†F÷ræ'—FTöfg6WBÇÂ’²Væ–f÷&Òæöfg6WBÀ¢3 ¢“°¢&ö¦V7F–öâÒ·fÇVW5³ÒÂfÇVW5³UÕÓ°¢7&—FTÖG&—‚Ò·fÇVW5³eÒÂfÇVW5³#ÒÂfÇVW5³#…ÒÂfÇVW5³#•ÕÓ°¢Ð¢Ð¢6öç7B7&—FRÒ7FFRç&W6÷W&6W2ævWB‚%7&—FR"“°¢6öç7BFW‡GW&RÒ7&—FRbb7&—FRæ¶–æBÓÓÒ'FW‡GW&R"bb7&—FRå÷FW„VçG'“°¢öwV”FÆ5&–ærçW6‚‡°¢F&vWBÀ¢&ö¦V7F–öâÀ¢7&—FTÖG&—‚À¢7&—FS¢FW‡GW&RòFW‡GW&RåöÆ&VÂ¢çVÆÂÀ¢6—¦S¢FW‡GW&RòG·FW‡GW&Rçv–GF‡×‚G·FW‡GW&Ræ†V–v‡GÖ¢çVÆÂÀ¢WÆöG3¢FW‡GW&RòFW‡GW&Rå÷WÆöG2ÇÂ¢ ¢Ò“°¢Ð¢Ð¢öÖ–&UFW„G&tF–r‡7FFRÂ''G&r"“°¢öFV6öFTwV”G&r‡7FFRÂ&G&r"Â·fW'FW„6÷VçBÂf—'7EfW'FW‚Â&6UfW'FWƒ¢Â–æFW„6÷VçC¢Ò“°¢öæ÷FU66GFW"‡7FFR“°¢Ç•fW'FW„æD–æFW‚‡7FFR“°¢–b†æVVG4Æ÷vW&–ær‡7FFR’’°¢6öç7BÆ÷vW&VBÒÆ÷vW&VD–æF–6W2‡7FFRç—VÆ–æRç7V2çF÷öÆöw’Âf—'7EfW'FW‚²fW'FW„6÷VçB“°¢–b†Æ÷vW&VB’°¢7FFRç72ç6WD–æFW„'VffW"†Æ÷vW&VBæ'VffW"Â'V–çC3""“°¢7FFRç72æG&t–æFW†VB†Æ÷vW&VBæ6÷VçBÂÖF‚æÖ‚ƒÂ–ç7Fæ6T6÷VçB’ÂÂÂ“°¢&WGW&ã°¢Ð¢Ð¢7FFRç72æG&r‡fW'FW„6÷VçBÂÖF‚æÖ‚ƒÂ–ç7Fæ6T6÷VçB’Âf—'7EfW'FW‚Â“°¢ÒÀ ¢'G&t–æFW†VB‡74†æFÆRÂ–æFW„6÷VçBÂ–ç7Fæ6T6÷VçBÂf—'7D–æFW‚Â&6UfW'FW‚Âf—'7D–ç7Fæ6R’°¢–b…÷&VæFW$6öÖÖæE&WÆ”FWF‚ÓÓÒ’°¢Ö&´6ÆÂ‚''G&t–æFW†VB"Â·74†æFÆRÂ–æFW„6÷VçGÒ“°¢Ð¢6öç7B7FFRÒ757FFR‡74†æFÆR“°¢7FFRåöG&vâ²³°¢òò–æFW†VBG&w2&R†÷rv÷&ÆBvVöÖWG'’7GVÆÇ’&V6†W2F†RuS²F†P¢òòæöâÖ–æFW†VBF‚&÷fR—2Ö÷7FÇ’FÆ2&Æ—G2â6Vç7W2&÷F‚÷"F†P¢òò–â×v÷&ÆB–7GW&RÆöö·2V×G’f÷"F†Rw&öær&V6öâà¢–b…öG&t6Vç7W2’öæ÷FTG&t6Vç7W2‡7FFRÂ–æFW„6÷VçBÂ–ç7Fæ6T6÷VçB“°¢òò6öçG&öÂ6×ÆS¢F†R6ÖRVæ–f÷&Ò&ævW2f÷"—VÆ–æRF†B—2f—6–&Ç¢òò&VæFW&–ærâ%FW'&–âw2&ö¦V7F–öâ&VG22¦W&ò"öæÇ’ÖVç26öÖWF†–æp¢òò–bv÷&¶–ærG&rw2&ö¦V7F–öâFöW2æ÷Bà¢–b…öG&t6Vç7W2bbvÆö&ÅF†—2æÖ5vV$wRå÷f—6–&ÆTG&u6×ÆP¢bbö6VÆW7F–ÇÆ6Æ÷VG7ÆVçF—G•òòçFW7B‡7FFRç—VÆ–æSòç7V3òæÆ&VÂÇÂ""¢bb7FFRç&W6÷W&6W2ævWB‚%&ö¦V7F–öâ"’’°¢6öç7B"Ò7FFRç&W6÷W&6W2ævWB‚%&ö¦V7F–öâ"“°¢vÆö&ÅF†—2æÖ5vV$wRå÷f—6–&ÆTG&u6×ÆRÒ°¢Æ&VÃ¢7FFRç—VÆ–æRç7V2æÆ&VÂÀ¢&ö¦V7F–öã¢¶'VffW$†æFÆS¢"æ'VffW$†æFÆRÂöfg6WC¢"æöfg6WBÂ6—¦S¢"ç6—¦WÒÀ¢Ó°¢Ð¢òòöæR×6†÷C¢&VÖVÖ&W"v†–6‚fW'FW‚'VffW"FW'&–âG&r&VBÂ6ò—G0¢òò7GVÂ'—FW26â&RFV6öFVBÆFW"‡6VR&VEFW'&–åfW'F–6W2’à¢–b‚vÆö&ÅF†—2æÖ5vV$wRå÷FW'&–äG&u6×ÆP¢bb÷6öÆ–E÷FW'&–âòçFW7B‡7FFRç—VÆ–æSòç7V3òæÆ&VÂÇÂ""¢bb7FFRçfW'FW„'VffW'5³Ò’°¢6öç7Bf"Ò7FFRçfW'FW„'VffW'5³Ó°¢6öç7BVæ–f÷&Õ&ævRÒ†æÖR’Óâ°¢6öç7B"Ò7FFRç&W6÷W&6W2ævWB†æÖR“°¢&WGW&â"ò¶'VffW$†æFÆS¢"æ'VffW$†æFÆRÂöfg6WC¢"æöfg6WBÂ6—¦S¢"ç6—¦WÒ¢çVÆÃ°¢Ó°¢vÆö&ÅF†—2æÖ5vV$wRå÷FW'&–äG&u6×ÆRÒ°¢'VffW$†æFÆS¢f"åö†æFÆRÀ¢öfg6WC¢f"æöfg6WBÀ¢7G&–FS¢7FFRç—VÆ–æRç7V2çfW'FW„f÷&ÖG3òå³Óòç7G&–FRóò#‚À¢–æFW„6÷VçBÂ&6UfW'FW‚Âf—'7D–æFW‚À¢òòF†RG&ç6f÷&Ò–çWG2Â6GW&VBBF†RG&rF†BW6VBF†VÓ ¢òò÷2Ò÷6—F–öâ²„6‡Væµ÷6—F–öâÒ6ÖW&&Æö6µ÷2’²6ÖW&öfg6W@¢òòvÅõ÷6—F–öâÒ&ö¤ÖB¢ÖöFVÅf–WtÖB¢fV3B‡÷2Â¢òòfW'FW‚FFæBWfW'’FW‡GW&RÖV7W&VB6÷'&V7BÂ6ò–bFW'&–â—0¢òò'6VçB&F†W"F†â&Æ6²ÂöæRöbF†W6R—2Æ6–ær—Böfb×67&VVâà¢f$öfg6WC¢f"æöfg6WBÀ¢f%6—¦S¢f"ç6—¦RÀ¢f$'VffW%6—¦S¢ö&¦V7G2ævWB‡f"åö†æFÆR“òç6—¦RóòçVÆÂÀ¢òòF†R6ö×&—6öâF†BÖGFW'3¢&÷VæB&ævRöbf%6—¦R'—FW2@¢òò7G&–FR#‚†öÆG2f%6—¦Ró#‚fW'F–6W2ÂæBF†RG&r–æFW†W2WFð¢òò&6UfW'FW‚²†Ö‚–æFW‚–âF†R'Vâ’â–bF†BW†6VVG2F†R&ævRF†P¢òò'&÷w6W"&V¦V7G2F†RG&r÷WG&–v‡Bà¢fW'FW„66—G“¢ÖF‚æfÆö÷"‚‡f"ç6—¦Róò’ò#‚’À¢–æFW„'VffW$†æFÆS¢7FFRæ–æFW„'VffW#òåö†æFÆRóòçVÆÂÀ¢–æFW„f÷&ÖC¢7FFRæ–æFW„'VffW#òæf÷&ÖBóòçVÆÂÀ¢vÆö&Ç3¢Væ–f÷&Õ&ævR‚$vÆö&Ç2"’À¢&ö¦V7F–öã¢Væ–f÷&Õ&ævR‚%&ö¦V7F–öâ"’À¢6‡Væµ6V7F–öã¢Væ–f÷&Õ&ævR‚$6‡Væµ6V7F–öâ"¢Ó°¢Ð¢–b‡7FFRå÷7W&W76VB’°¢öæ÷FT6Æ÷VDG&r‡7FFRÀ¢¶–æFW„6÷VçBÂ–ç7Fæ6T6÷VçBÂf—'7D–æFW‚Â&6UfW'FW‚Âf—'7D–ç7Fæ6WÒÂfÇ6R“°¢&WGW&ã°¢Ð¢–b‚7FFRç—VÆ–æR’°¢òò6–ÆVçFÇ’G&÷VC¢æò—VÆ–æR&÷VæBâ6÷VçFVB6òv†öÆRfÖ–Ç’ö`¢òòÖ—76–ærvVöÖWG'’6ææ÷B†–FR&V†–æB6ÆVâfÆ–FF–öâÆörà¢6öç7B6Vç7W2Ò†vÆö&ÅF†—2æÖ5vV$wRåöG&t6Vç7W2ÇÃÒ·Ò“°¢6öç7B&÷rÒ†6Vç7W5²#ÆG&÷VBÖæò×—VÆ–æSâ%ÒÇÃÒ¶G&w3¢ÂÖ…f#¢Â¶–æG3¢·ÒÂ6×ÆS¢çVÆÇÒ“°¢&÷ræG&w2²³°¢&WGW&ã°¢Ð¢öæ÷FTföçDG&r‡7FFRÂ&–æFW†VB"Â¶–æFW„6÷VçBÂ–ç7Fæ6T6÷VçBÂf—'7D–æFW‚Â&6UfW'FW‚Âf—'7D–ç7Fæ6WÒ“°¢Vç7W&T&–æDw&÷W2‡7FFR“°¢7FFRæG&uFW„&–æG2æÆVæwF‚Ò°¢öÖ–&UFW„G&tF–r‡7FFRÂ''G&t–æFW†VB"“°¢öFV6öFTwV”G&r‡7FFRÂ&–G‚"Â¶–æFW„6÷VçBÂf—'7D–æFW‚Â&6UfW'FW‚Âf—'7EfW'FWƒ¢Ò“°¢öæ÷FU66GFW"‡7FFR“°¢Ç•fW'FW„æD–æFW‚‡7FFR“°¢öæ÷FTG&r‡7FFRÂ&–æFW†VB"Â¶–æFW„6÷VçBÂf—'7D–æFW‚Â&6UfW'FW‡Ò“°¢öæ÷FT6Æ÷VDG&r‡7FFRÀ¢¶–æFW„6÷VçBÂ–ç7Fæ6T6÷VçBÂf—'7D–æFW‚Â&6UfW'FW‚Âf—'7D–ç7Fæ6WÒÂG'VR“°¢7FFRç72æG&t–æFW†VB†–æFW„6÷VçBÂÖF‚æÖ‚ƒÂ–ç7Fæ6T6÷VçB’Âf—'7D–æFW‚Â&6UfW'FW‚Âf—'7D–ç7Fæ6R“°¢ÒÀ ¢'G&t–æF—&V7B‡74†æFÆRÂ'VffW$†æFÆRÂöfg6WBÂG&t6÷VçB’°¢6öç7B7FFRÒ757FFR‡74†æFÆR“°¢7FFRåöG&vâ²³°¢–b‚7FFRç—VÆ–æR’&WGW&ã°¢öæ÷FTföçDG&r‡7FFRÂ&–æF—&V7B"Â¶'VffW$†æFÆRÂöfg6WBÂG&t6÷VçGÒ“°¢Vç7W&T&–æDw&÷W2‡7FFR“°¢7FFRæG&uFW„&–æG2æÆVæwF‚Ò°¢Ç•fW'FW„æD–æFW‚‡7FFR“°¢6öç7B'VffW"ÒvWB†'VffW$†æFÆRÂ&'VffW""’æ'VffW#°¢f÷"†ÆWB’Ò²’ÂG&t6÷VçC²’²²’°¢7FFRç72æG&t–æF—&V7B†'VffW"Âöfg6WB²’¢b“°¢Ð¢ÒÀ ¢'G&t–æFW†VD–æF—&V7B‡74†æFÆRÂ'VffW$†æFÆRÂöfg6WBÂG&t6÷VçB’°¢6öç7B7FFRÒ757FFR‡74†æFÆR“°¢7FFRåöG&vâ²³°¢–b‚7FFRç—VÆ–æR’&WGW&ã°¢öæ÷FTföçDG&r‡7FFRÂ&–æFW†VD–æF—&V7B"Â¶'VffW$†æFÆRÂöfg6WBÂG&t6÷VçGÒ“°¢Vç7W&T&–æDw&÷W2‡7FFR“°¢7FFRæG&uFW„&–æG2æÆVæwF‚Ò°¢Ç•fW'FW„æD–æFW‚‡7FFR“°¢6öç7B'VffW"ÒvWB†'VffW$†æFÆRÂ&'VffW""’æ'VffW#°¢f÷"†ÆWB’Ò²’ÂG&t6÷VçC²’²²’°¢7FFRç72æG&t–æFW†VD–æF—&V7B†'VffW"Âöfg6WB²’¢#“°¢Ð¢ÒÀ ¢'W6„FV'Vtw&÷W‡74†æFÆRÂÆ&VÂ’°¢6öç7B7FFRÒ757FFR‡74†æFÆR“°¢–b‡G—Vöb7FFRç72çW6„FV'Vtw&÷WÓÓÒ&gVæ7F–öâ"’7FFRç72çW6„FV'Vtw&÷W†Æ&VÂ“°¢ÒÀ ¢'W6„FV'Vtw&÷W–B‡74†æFÆRÂÆ&VÄ–B’°¢6öç7BÆ&VÂÒ&W6öÇfT&–æF–ætæÖR†Æ&VÄ–BÂ&FV'Vrw&÷W"“°¢6öç7B7FFRÒ757FFR‡74†æFÆR“°¢–b‡G—Vöb7FFRç72çW6„FV'Vtw&÷WÓÓÒ&gVæ7F–öâ"’7FFRç72çW6„FV'Vtw&÷W†Æ&VÂ“°¢ÒÀ ¢'÷FV'Vtw&÷W‡74†æFÆR’°¢6öç7B7FFRÒ757FFR‡74†æFÆR“°¢–b‡G—Vöb7FFRç72ç÷FV'Vtw&÷WÓÓÒ&gVæ7F–öâ"’7FFRç72ç÷FV'Vtw&÷W‚“°¢ÒÀ ¢6öæf–wW&T6çf2‡v–GF‚Â†V–v‡B’°¢6çf2çv–GF‚Òv–GFƒ°¢6çf2æ†V–v‡BÒ†V–v‡C°¢6öçFW‡Bæ6öæf–wW&R‡°¢FWf–6RÀ¢f÷&ÖC¢'&v&‡Væ÷&Ò"À¢W6vS¢uUFW‡GW&UW6vRå$TäDU%ôED4„ÔTåBÂuUFW‡GW&UW6vRä4õ•ôE5BÀ¢Ç†ÖöFS¢&÷VR ¢Ò“°¢ÒÀ ¢7V—&T6çf5FW‡GW&R‚’°¢&WGW&âWB‡¶¶–æC¢'FW‡GW&R"Â—46çf3¢G'VRÂFW‡GW&S¢6öçFW‡BævWD7W'&VçEFW‡GW&R‚’Âf÷&ÖC¢'&v&‡Væ÷&Ò"Âv–GFƒ¢6çf2çv–GF‚Â†V–v‡C¢6çf2æ†V–v‡BÂFWFƒ¢Ò“°¢ÒÀ ¢&W6VçB††æFÆR’°¢Ö&´6ÆÂ‚'&W6VçB"Â¶†æFÆWÒ“°¢öÆ7E&W6VçDBÒFFRææ÷r‚“°¢÷&W6VçD6÷VçB²³°¢–b…öG&t6Vç7W2bböÆ7E&W6VçDBÒ÷&W6VçDVçFW$Bâ’°¢÷&W6VçDVçFW$BÒöÆ7E&W6VçDC°¢6öç6öÆRæÆör‚%¶G&rÖ6Vç7W5Ò&W6VçBVçFW"2"²÷&W6VçD6÷VçB“°¢Ð¢òòVæBöbg&ÖS¢F†RW"×F&vWBG&rÖ2&R6ö×ÆWFRâ6æ6†÷B²&W6WBà¢Æ7Dg&ÖTG&w2Òg&ÖTG&w3°¢g&ÖTG&w2ÒæWrÖ‚“°¢Æ7Dg&ÖTG&u6WÒg&ÖTG&u6W°¢g&ÖTG&u6WÒæWrÖ‚“°¢Æ7Dg&ÖT—46çf2Òg&ÖTÆ7D—46çf3°¢g&ÖTÆ7EF–BÒ²g&ÖTÆ7D—46çf2ÒfÇ6S°¢òòD”s¢&W6W'fRF†—2g&ÖRw26×ÆVB6WBf÷"÷FW„F–rÂF†Vâ6ÆV"f÷"æW‡Bà¢öÆ7Dg&ÖU6×ÆVBÒ÷6×ÆVEF†—4g&ÖS°¢÷6×ÆVEF†—4g&ÖRÒæWr6WB‚“°¢6öç7B÷2ÒæWrU$Å6V&6…&×2†Æö6F–öâç6V&6‚“°¢òòD”s¢v—F‚öÖ7vV%÷FW†F–rÂ6æ6†÷B·&VF&6²F†R6×ÆVBFW‡GW&W2ôä4RF†P¢òòF—FÆR67&VVâ—2W†g&ÖSãC’â6öç6öÆRçF&ÆRF†R&W7VÇC²æò&Æ–æBFW7F–ærà¢–b…÷2æ†2‚&Ö7vV%÷FW†F–r"’bb÷FW„F–tFöæRbb†vÆö&ÅF†—2æÖ5vV%V×òçF–6·2ÇÂ’âCbböÆ7Dg&ÖU6×ÆVBç6—¦R’°¢÷FW„F–tFöæRÒG'VS°¢vÆö&ÅF†—2æÖ5vV$wRå÷FW„F–r‚“°¢Ð¢òòD”s¢ÄDRÆ–fWF–ÖRGV×†g&ÖSã#“¢W"ÖÆ&VÂF÷FÂWÆöG2²†÷rÖç¢òòFW‡GW&R”å5Dä4U2W†—7BW"Æ&VÂæBV6‚öæRw2WÆöB6÷VçBâç7vW'0¢òò&F–BF†RFÆ2UdU"WÆöB†§W7BÆFR“ò"æB&—2F†R6×ÆVBFÆ2¢òòF–ffW&VçB–ç7Fæ6RF†âF†RWÆöFVBöæR‡7FÆR†æFÆR“ò"à¢òòvFRöâfWrF–6·2Âæ÷B#¢v—F‚F†RW"Ög&ÖR&ÇW"fÆ–FF–öâ7Ð¢òòV6‚F–6²F¶W2ãg2Â6ò#F–6·2æWfW"'&—fW2–â&ö&Rv–æF÷rà¢òò÷6×ÆVDVçG&–W2—27V×VÆF—fRÂ6òfWrg&ÖW2Ç&VG’†öÆBF†RF—FÆP¢òò67&VVâw2FW‡GW&W2à¢–b…÷2æ†2‚&Ö7vV%÷FW†F–r"’bb÷FW„F–tÆFTFöæRbb†vÆö&ÅF†—2æÖ5vV%V×òçF–6·2ÇÂ’ãÒ2’°¢÷FW„F–tÆFTFöæRÒG'VS°¢vÆö&ÅF†—2æÖ5vV$wRå÷FW„F–tÆFR‚“°¢Ð¢–b‚öwV•&–ætGV×VBbböwV”G&u&–æræÆVæwF‚bb†vÆö&ÅF†—2æÖ5vV%V×òçF–6·2ÇÂ’ãÒ"’°¢öwV•&–ætGV×VBÒG'VS°¢6öç6öÆRæÆör‚%´uT’ÔE$rÕ$”äuÒ"²¥4ôâç7G&–æv–g’…öwV”G&u&–ær’“°¢Ð¢–b‚÷æôGV×VBbb†vÆö&ÅF†—2æÖ5vV%V×òçF–6·2ÇÂ’ãÒ"’°¢÷æôGV×VBÒG'VS°¢6öç6öÆRæÆör‚%µäòÕ$ô$UÒ"²¥4ôâç7G&–æv–g’…÷æõ&ö&R’“°¢Ð¢–b‚÷&ö&S$GV×VBbb†vÆö&ÅF†—2æÖ5vV%V×òçF–6·2ÇÂ’ãÒ"’°¢÷&ö&S$GV×VBÒG'VS°¢6öç6öÆRæÆör‚%µ$ô$S%Òæ–Õ&–æsÒ"²¥4ôâç7G&–æv–g’…öæ–Õ&–ær’²"Â¦fW'#Ò"²¥4ôâç7G&–æv–g’…ö¦fW'$'Vb’“°¢Ð¢–b‚÷&ö&S4GV×VBbb†vÆö&ÅF†—2æÖ5vV%V×òçF–6·2ÇÂ’ãÒ"’°¢÷&ö&S4GV×VBÒG'VS°¢6öç6öÆRæÆör‚%µ$ô$S5Ò6Ô&CÒ"²¥4ôâç7G&–æv–g’…ö6Ô&B’²"Â66GFW#Ò"²¥4ôâç7G&–æv–g’…÷66GFW$G&w2’²"Â6ö×Ò"²¥4ôâç7G&–æv–g’†6ö×÷6—FU6÷W&6Rò¶Æ&VÃ¢6ö×÷6—FU6÷W&6RåöÆ&VÂÂvƒ¢6ö×÷6—FU6÷W&6Rçv–GF‚²'‚"²6ö×÷6—FU6÷W&6Ræ†V–v‡BÂF–C¢6ö×÷6—FU6÷W&6Rå÷F–GÒ¢çVÆÂ’“°¢òòw&—FR‡VÖâ×&VF&ÆRfW&F–7BFòF†Röâ×vRF—b6ò67&VVç6†÷B7Vff–6W2à¢6öç7B÷dÆ–æW2ÒµÓ°¢6öç7Bö6ö×Æ&ÂÒ6ö×÷6—FU6÷W&6Rò†6ö×÷6—FU6÷W&6RåöÆ&VÂÇÂ#ò"’²""²6ö×÷6—FU6÷W&6Rçv–GF‚²'‚"²6ö×÷6—FU6÷W&6Ræ†V–v‡B¢&çVÆÂ#°¢÷dÆ–æW2çW6‚‚&6ö×Ò"²ö6ö×Æ&Â“°¢–b…ö6Ô&BæÆVæwF‚’°¢÷dÆ–æW2çW6‚‚%dU$D”5C¢FÆ2Ö76VÖ&Ç’Ô•2ÕD$tUDTB‚"²ö6Ô&BæÆVæwF‚²"G&w2öçFòæöâÖFÆ2’"“°¢÷dÆ–æW2çW6‚‚"f—'7BFwCÒ"²…ö6Ô&E³ÒçFwBÇÂ#ò"’²"7&3Ò"²…ö6Ô&E³Òç7&2ÇÂ#ò"’“°¢ÒVÇ6R–b…÷66GFW$G&w2æÆVæwF‚’°¢÷dÆ–æW2çW6‚‚%dU$D”5C¢67&VVâG&w26×ÆR&r7&—FW2‚"²÷66GFW$G&w2æÆVæwF‚²"G&w2’"“°¢÷dÆ–æW2çW6‚‚"f—'7B7&3Ò"²…÷66GFW$G&w5³Òç7&2ÇÂ#ò"’²"FwCÒ"²…÷66GFW$G&w5³ÒçFwBÇÂ#ò"’“°¢ÒVÇ6R°¢÷dÆ–æW2çW6‚‚%dU$D”5C¢6Ô&CÓ66GFW#Ó(i"66GFW"äõBg&öÒ76VÖ&Ç’÷"67&VVâÖG&rF‚"“°¢÷dÆ–æW2çW6‚‚"†6†V6²6ö×÷6—FR6÷W&6R&÷fS²–b6ö×ÖFÆ2(i"6ö×÷6—FR–6·2w&öærFW‡GW&R’"“°¢Ð¢6öç7B÷fBÒFö7VÖVçBævWDVÆVÖVçD'”–B‚&Ö7vV"×&ö&R×fW&F–7B"“°¢–b…÷fB’÷fBçFW‡D6öçFVçBÒ÷dÆ–æW2æ¦ö–â‚%Æâ"“°¢Ð¢6öç7BöF–rÒ÷2ævWB‚&Ö7vV%öF–r"“°¢òò6ö×÷6—FR×6÷W&6RöÆ–7’âÖö¦ærG&w2F†RÆöF–ær5Ä4‚7G&–v‡BFòF†P¢òò6çf2Â'WB&VæFW'2F†RD•DÄR67&VVâ‡æ÷&Ö²uT’’–çFòâöfg67&VVà¢òòÖ–âF&vWBF†B—G2&W6VçFW"FöW2äõB6÷’FòF†R6çf2–â÷W ¢òò&6¶VæB(	B6òv—F‚æò6ö×÷6—FRF†RF—FÆRvöW2&Æ6²‡F†RW6W"w0¢òò'7Æ6‚(i"&Æ6²"&W÷'B’âF†R6÷'&V7B6÷W&6R—2F†RF&vWBG&vâÄ5@¢òò–âF†Rg&ÖR‡F†RuT’÷F—FÆR6ö×÷6—F–öã²F†Ræ÷&ÖFÆ2—2G&và¢òòV&Ç’æB6×ÆW22fÆB&Æ6²Âv†–6‚—2v†BF†RöÆBÖ‚ÖG&w2–6°¢òòw&&&VB’âF†R6ö×÷6—FR—2æòÖ÷f÷"F†R7Æ6‚‡F†W&RF†RÆ7BG&p¢òò—2F†R6çf2—G6VÆbÂv†–6‚vRæWfW"6ö×÷6—FR’Â6ò—B—26fRFð¢òòVæ&ÆR'’FVfVÇBâ÷fW'&–FW3¢öÖ7vV%öæö6ö×÷6—FR†öfb’Â÷ ¢òòöÖ7vV%ö6ö×÷6—FSÖÆ7FG&wÆÖ†G&w7ÃÇF–Câà¢6öç7Bö7fÂÒ÷2ævWB‚&Ö7vV%ö6ö×÷6—FR"“°¢6öç7Böæô6ö×÷6—FRÒ÷2æ†2‚&Ö7vV%öæö6ö×÷6—FR"“°¢6öç7BöÖöFRÒö7fÂò&Æ7FG&r"¢…ö7fÂÓÓÒ&Ö†G&w2"ò&Ö†G&w2"¢…ö7fÂÓÓÒ&Æ7FG&r"ò&Æ7FG&r"¢'F–B"’“°¢6öç7Böf÷&6UF–BÒöÖöFRÓÓÒ'F–B"òçVÖ&W"…ö7fÂ’¢°¢–b‚öF–rbböæô6ö×÷6—FRbbÆ7Dg&ÖT—46çf2’°¢–b…öf÷&6UF–B’°¢6öç7BRÒFW„–çfVçF÷'’æf–æB‚‡B’ÓâBå÷F–BÓÓÒöf÷&6UF–B“°¢–b†R’6ö×÷6—FU6÷W&6RÒS°¢ÒVÇ6R–b…öÖöFRÓÓÒ&Ö†G&w2"’°¢ÆWB&W7EF–BÒÂ&W7DG&w2Ò°¢f÷"†6öç7B·F–BÂåÒöbÆ7Dg&ÖTG&w2’²–b†ââ&W7DG&w2’²&W7DG&w2Òã²&W7EF–BÒF–C²ÒÐ¢–b†&W7EF–B’°¢6öç7BRÒFW„–çfVçF÷'’æf–æB‚‡B’ÓâBå÷F–BÓÓÒ&W7EF–B“°¢–b†R’6ö×÷6—FU6÷W&6RÒS°¢Ð¢ÒVÇ6R°¢òò6ö×÷6—FR×6÷W&6R6VÆV7F–öââÖö¦ærw2g&ÖRG&w2F†Ræ÷&Ö²uT¢òò6ö×÷6—F–öâ–çFòF†RÖ–âF&vWB†7&VFVBBW†7FÇ’6çf2—†VÀ¢òò6—¦R’ÂF†VâFW‡GW&TFÆ2çF–6²‚’(i"WÆöDæ–ÖF–öäg&ÖW2‚’÷Vç2¢òò&VæFW"72öâF†RFÆ2†&÷F‚F–×2÷vW"Ööb×Gvò’v†–6‚vWG2F†P¢òò†–v†W7BG&u6WâF†RöÆBæ—fRÖ‚×6W–6²w&&&VBF†RFÆ2æ@¢òò7G&WF6†VB—G26¶VB7&—FW27&÷72F†R6çf2‡F†R66GFW&VB–6öà¢òòw&–B–âF†R'&ö¶Vâ67&VVç6†÷B’âf—ƒ¢&VfW"F†RF&vWBv†÷6P¢òòF–ÖVç6–öç2U„5DÅ’ÖF6‚F†R6çf2‡F†RÖ–âF&vWB—27&VFVB@¢òò6çf2çv–GF‚9r6çf2æ†V–v‡B'’Öö¦ærw2&W6VçFW"’ÂF†VâfÆÂ&6°¢òòFò7V7B×&F–òÖF6‚W†6ÇVF–ærFÆ6W2ÂF†VâÆ–âÆ7FG&rà¢6öç7B—5õBÒ†â’Óâââbb†âb†âÒ’’ÓÓÒ°¢6öç7B—4FÆ2Ò†R’Óâ°¢–b‚RÇÂRçv–GF‚ÇÂRæ†V–v‡B’&WGW&âG'VS°¢òò&÷F‚F–×2÷vW"Ööb×GvòÒFW‡GW&RFÆ2†wV’÷v–FvWG2ö&Æö6·2’à¢–b†—5õB†Rçv–GF‚’bb—5õB†Ræ†V–v‡B’’&WGW&âG'VS°¢òòfW'’v–FR÷"fW'’FÆÂæöâ×67&VVâÖ7V7BFW‡GW&W2‡7&—FR6†VWG2’à¢6öç7BÒRçv–GF‚òRæ†V–v‡C°¢–b†â2ÇÂÂã32’&WGW&âG'VS°¢&WGW&âfÇ6S°¢Ó°¢6öç7B6çf47V7BÒ6çf2çv–GF‚ò6çf2æ†V–v‡C°¢6öç7B7V7DÖF6‚Ò†R’Óâ°¢–b‚RÇÂRçv–GF‚ÇÂRæ†V–v‡B’&WGW&âfÇ6S°¢6öç7BÒRçv–GF‚òRæ†V–v‡C°¢&WGW&âÖF‚æ'2†Ò6çf47V7B’ò6çf47V7BÂãS°¢Ó°¢òò72¢Ö–æV7&gBæÖW2F†R66VæR&W6VçFW"F&vWBÖ–âò6öÆ÷&à¢òò&VfW"F†B6VÖçF–2–FVçF—G’&Vf÷&R6öç6–FW&–ærF–ÖVç6–öç2÷"G&p¢òò÷&FW"â÷'FÂ÷G&ç7&Væ7’÷÷7B&ö6W76–ær7&VFW2d$òæBd$ò¢òòBF†RW†7B6ÖR6çf26—¦S²6†ö÷6–ærF†RÆ7BöbF†÷6R—2'&÷w6W ¢òò66†VGVÆ–ærFWVæFVçBæB6â&W6VçB6ÆV&VB&Æ6²W†–Æ–'’d$òà¢ÆWB&W7EF–BÒÂ&W7E6WÒ°¢f÷"†6öç7B·F–BÂ7ÒöbÆ7Dg&ÖTG&u6W’°¢6öç7BRÒFW„–çfVçF÷'’æf–æB‚‡B’ÓâBå÷F–BÓÓÒF–B“°¢–b†Rbb7G&–ær†RåöÆ&VÂÇÂ""’çFôÆ÷vW$66R‚’ÓÓÒ&Ö–âò6öÆ÷" ¢bb7â&W7E6W’°¢&W7E6WÒ7²&W7EF–BÒF–C°¢Ð¢Ð¢òò72#¢W†7B6çf2ÖF–ÖVç6–öâÖF6‚âF†—2&VÖ–ç2F†RvVæW&–0¢òòfÆÆ&6²f÷"V&Ç’öF–væ÷7F–2–ÖvW2F†BFòæ÷BæÖRÖ–âF&vWBà¢–b‚&W7EF–B’°¢f÷"†6öç7B·F–BÂ7ÒöbÆ7Dg&ÖTG&u6W’°¢6öç7BRÒFW„–çfVçF÷'’æf–æB‚‡B’ÓâBå÷F–BÓÓÒF–B“°¢–b†RbbRçv–GF‚ÓÓÒ6çf2çv–GF‚bbRæ†V–v‡BÓÓÒ6çf2æ†V–v‡Bbb7â&W7E6W’°¢&W7E6WÒ7²&W7EF–BÒF–C°¢Ð¢Ð¢Ð¢òò723¢7V7BÖF6‚²æ÷BFÆ2à¢–b‚&W7EF–B’°¢f÷"†6öç7B·F–BÂ7ÒöbÆ7Dg&ÖTG&u6W’°¢6öç7BRÒFW„–çfVçF÷'’æf–æB‚‡B’ÓâBå÷F–BÓÓÒF–B“°¢–b†Rbb—4FÆ2†R’bb7V7DÖF6‚†R’bb7â&W7E6W’²&W7E6WÒ7²&W7EF–BÒF–C²Ð¢Ð¢Ð¢òò72C¢Æ7BÖG&vâæöâÖFÆ2†ç’7V7B’à¢–b‚&W7EF–B’°¢f÷"†6öç7B·F–BÂ7ÒöbÆ7Dg&ÖTG&u6W’°¢6öç7BRÒFW„–çfVçF÷'’æf–æB‚‡B’ÓâBå÷F–BÓÓÒF–B“°¢–b†Rbb—4FÆ2†R’bb7â&W7E6W’²&W7E6WÒ7²&W7EF–BÒF–C²Ð¢Ð¢Ð¢òò72S¢Æ–âÆ7FG&r†fÆÆ&6²’à¢–b‚&W7EF–B’°¢f÷"†6öç7B·F–BÂ7ÒöbÆ7Dg&ÖTG&u6W’²–b‡7â&W7E6W’²&W7E6WÒ7²&W7EF–BÒF–C²ÒÐ¢Ð¢–b†&W7EF–B’°¢6öç7BRÒFW„–çfVçF÷'’æf–æB‚‡B’ÓâBå÷F–BÓÓÒ&W7EF–B“°¢–b†R’6ö×÷6—FU6÷W&6RÒS°¢Ð¢Ð¢Ð¢òò6ö×÷6—FRF†R66VæRÖ–âF&vWBFòF†R7vÖ6†–â6çf3¢Öö¦ærw2#bã ¢òò&W6VçFW"7V—&W2²&W6VçG2F†R6çf2FW‡GW&R'WBæWfW"G&w2÷ ¢òò6÷–W2–çFò—BÂ6òv—F†÷WBF†—2F†R6çf27F—2V×G’âF†R6çf0¢òòFW‡GW&R—27F–ÆÂF†R7W'&VçBöæR†W&R‡fÆ–BVçF–Â6öçFW‡Bç&W6VçB‚’’à¢òòVæFW"öÖ7vV%öG&v6Vç7W2F†R6Vç7W2Ç&VG’6—2v†–6‚—VÆ–æW2G&Wp¢òò–çFòv†–6‚F&vWC²—"—Bv—F‚v†BF†R6ö×÷6—FR7GVÆÇ’WBöâF†P¢òò6çf2Â÷"'FW'&–âG&Wr'WBæ÷F†–ærV&VB"7F—2Ö&–wV÷W2à¢–b…öG&t6Vç7W2’°¢6öç7Bæ÷rÒFFRææ÷r‚“°¢–b†æ÷rÒö6ö×÷6—FTÆötBâ’°¢ö6ö×÷6—FTÆötBÒæ÷s°¢6öç6öÆRæÆör‚%¶G&rÖ6Vç7W5Ò6ö×÷6—FRÂÒ ¢²†6ö×÷6—FU6÷W&6Rò†6ö×÷6—FU6÷W&6RåöÆ&VÂÇÂ#ò"’²" ¢²6ö×÷6—FU6÷W&6Rçv–GF‚²'‚"²6ö×÷6—FU6÷W&6Ræ†V–v‡@¢²"F–CÒ"²6ö×÷6—FU6÷W&6Rå÷F–B¢&çVÆÂ"¢²"æô6ö×÷6—FSÒ"²öæô6ö×÷6—FR²"Æ7Dg&ÖT—46çf3Ò"²Æ7Dg&ÖT—46çf2“°¢Ð¢Ð¢–b‚öæô6ö×÷6—FRbb6ö×÷6—FU6÷W&6Rbb6ö×÷6—FU6÷W&6RçFW‡GW&R’°¢G'’°¢6öç7B6çf5FW‡GW&RÒ6öçFW‡BævWD7W'&VçEFW‡GW&R‚“°¢6öç7BVæ2ÒFWf–6Ræ7&VFT6öÖÖæDVæ6öFW"‡¶Æ&VÃ¢&Ö7vV"Ö6ö×÷6—FRÖVæ6öFW"'Ò“°¢òòöÖ7vV%öF–sÖÖvVçF(i"6ÆV"F†R6çf2FòÖvVçFæBG&ræ÷F†–ærà¢òò–bÖvVçFV'2öâ67&VVâÂF†—272&V6†W2F†R&W6VçFV@¢òòG&v&ÆR‡6ò&Æ6²67&VVâÖVç2F†R4õU$4R—2V×G’÷w&öær“²–`¢òòF†R67&VVâ7F—2&Æ6²ÂF†—272—6âwB&V–ær&W6VçFVBBÆÂà¢6öç7BF–rÒöF–s°¢6öç7B6ÆV"ÒF–rÓÓÒ&ÖvVçF"ò·#¢Âs¢Â#¢Â¢Ò¢·#¢Âs¢Â#¢Â¢Ó°¢6öç7B72ÒVæ2æ&Vv–å&VæFW%72‡¶6öÆ÷$GF6†ÖVçG3¢·°¢f–Ws¢6çf5FW‡GW&Ræ7&VFUf–Wr‚’À¢ÆöD÷¢&6ÆV""Â7F÷&T÷¢'7F÷&R"Â6ÆV%fÇVS¢6ÆV ¢Õ×Ò“°¢–b†F–rÓÒ&ÖvVçF"’°¢6öç7B—VÆ–æRÒVç7W&T6ö×÷6—FR†6çf2æ†V–v‡B“°¢òòöÖ7vV%öF–sÖ6†V6¶W"(i"6×ÆR¶æ÷vâÖvööB–â×vRFW‡GW&R–ç7FV@¢òòöbF†RG&6¶VB66VæRF&vWBâ6†V6¶W"öâ67&VVâ(y"6×Æ–ærv÷&·0¢òòæBF†RG&6¶VB6÷W&6R—2F†R&ö&ÆVÓ²&Æ6²(y"6×Æ–ær—2'&ö¶Vâà¢6öç7B7&5FW‚ÒF–rÓÓÒ&6†V6¶W""òVç7W&TF–t6†V6¶W"‚’¢6ö×÷6—FU6÷W&6RçFW‡GW&S°¢6öç7B&rÒFWf–6Ræ7&VFT&–æDw&÷W‡¶Æ–÷WC¢—VÆ–æRævWD&–æDw&÷WÆ–÷WBƒ’ÂVçG&–W3¢°¢¶&–æF–æs¢Â&W6÷W&6S¢6ö×÷6—FU6×ÆW'ÒÀ¢¶&–æF–æs¢Â&W6÷W&6S¢7&5FW‚æ7&VFUf–Wr‚—Ð¢×Ò“°¢72ç6WE—VÆ–æR‡—VÆ–æR“°¢72ç6WD&–æDw&÷WƒÂ&r“°¢72æG&rƒ2“°¢Ð¢72æVæB‚“°¢FWf–6RçVWVRç7V&Ö—B…¶Væ2æf–æ—6‚‚•Ò“°¢fÇW6„w&fW–&B‚“°¢Ö&´6ÆÂ‚&6ö×÷6—FR"Â·6÷W&6S¢6ö×÷6—FU6÷W&6Rçv–GF‚²'‚"²6ö×÷6—FU6÷W&6Ræ†V–v‡BÂ&V¢6ö×÷6—FU6÷W&6Råö&VÂF–s¢F–rÇÂ&&Æ—B'Ò“°¢Ò6F6‚†W'&÷"’°¢Ö&´6ÆÂ‚&6ö×÷6—FRÖf–ÆVB"Â¶W'&÷#¢7G&–ær†W'&÷"’ç6Æ–6RƒÂ#—Ò“°¢–b…öG&t6Vç7W2’6öç6öÆRæÆör‚%¶G&rÖ6Vç7W5Ò6ö×÷6—FRd”ÄTB"²7G&–ær†W'&÷"’ç6Æ–6RƒÂc’“°¢Ð¢Ð¢–b…öG&t6Vç7W2bbFFRææ÷r‚’Ò÷&W6VçDW†—DBâ’°¢÷&W6VçDW†—DBÒFFRææ÷r‚“°¢6öç6öÆRæÆör‚%¶G&rÖ6Vç7W5Ò&W6VçBW†—B2"²÷&W6VçD6÷VçB“°¢òòöæÇ’F†R76W2F†BF÷V6†VBF†R6ö×÷6—FVBF&vWBÖGFW"†W&Rà¢6öç7BÖ–âÒög&ÖU75G&6P¢æf–ÇFW"‚†VçG'’’ÓâöÖ–âÂò6öÆ÷"ö’çFW7B†VçG'’çF&vWB’¢æÖ‚†VçG'’’Óâ†VçG'’æ6ÆV"ò$4ÄT""¢&ÆöB"’²"öCÒ"²VçG'’æFWF€¢²"÷63Ò"²†VçG'’ç66—76÷"óò"Ò"’²"ö#Ò"²†VçG'’æ&Vóò"Ò"¢²#¢"²VçG'’æG&w2²%²"²²âââ†VçG'’ç—W2ÇÂµÒ•Òæ¦ö–â‚"Â"’²%Ò"“°¢6öç6öÆRæÆör‚%¶G&rÖ6Vç7W5Òg&ÖR76W2öâÖ–âô6öÆ÷#¢"²Ö–âç6Æ–6RƒÂ‚’æ¦ö–â‚"Óâ"’“°¢òòF†RVW7F–öâ—2v†B'Vç2¦gFW"¢FW'&–â–âF†R6ÖRF&vWBà¢6öç7BFW'&–äBÒÖ–âæf–æDÆ7D–æFW‚‚†VçG'’’Óâ÷FW'&–âòçFW7B†VçG'’’“°¢òòv†–6‚FWF‚6ÆV"fÇVW2F†Rg&ÖRW6VBBÆÂâfæ–ÆÆ6ÆV'2F†P¢òòv÷&ÆBFWF‚&Vf÷&RFW'&–ã²–böæÇ’uT’w26ÆV"×FòÓWfW"V'2À¢òòFW'&–â—2FWF‚×FW7F–ærv–ç7B'VffW"F†B6—2&æV&W7B"à¢òòöæR×6†÷C¢&VB&6²v†BFW'&–âG&r7GVÆÇ’fVBF†RuRâ–bF†P¢òò÷6—F–öç2&RFVvVæW&FR÷"'7W&BÂF†RvVöÖWG'’æWfW"†B6†æ6P¢òòöbÆæF–æröâ67&VVâæBæ÷F†–ærF÷vç7G&VÒÖGFW'2à¢òòF–BFW'&–â&7FW&—6RBÆÃòF†R726ÆV'2FWF‚FòæBFW'&–à¢òòw&—FW2FWF‚Â6òæöâ×¦W&òFW†VÂ—2vVöÖWG'’F†B76VBF†RFWF€¢òòFW7BæBw&÷FRâÆÂ×¦W&òÖVç2æ÷F†–ær&7FW&—6VBÂv†FWfW"F†P¢òò6öÆ÷W"'VffW"6†÷w2Òv†–6‚6W&FW2&vVöÖWG'’æWfW"ÆæFVB"g&öÐ¢òò&vVöÖWG'’ÆæFVBæBv2æ÷B6†FVBö&ÆVæFVB–çFòf–Wr"à¢–b‚÷FW'&–äFWF„GV×VBbböFWF…6æ6†÷B’°¢÷FW'&–äFWF„GV×VBÒG'VS°¢&öÖ—6Rç&W6öÇfR†vÆö&ÅF†—2æÖ5vV$wRç&VEFW'&–å74FWF‚‚’’çF†Vâ‚‡&W7VÇB’Óâ°¢6öç6öÆRæÆör‚%¶G&rÖ6Vç7W5ÒFW'&–â72FWF‚"²¥4ôâç7G&–æv–g’‡&W7VÇB’“°¢Ò’æ6F6‚‚†W'&÷"’Óâ°¢6öç6öÆRæÆör‚%¶G&rÖ6Vç7W5ÒFW'&–âFWF‚f–ÆVB"²7G&–ær†W'&÷"’ç6Æ–6RƒÂ#’“°¢Ò“°¢Ð¢–b‚÷Væ–f÷&Õ6æ6†÷DGV×VBbb÷Væ–f÷&Õ6æ6†÷Bbb÷Væ–f÷&Õ6æ6†÷BæW'&÷"’°¢÷Væ–f÷&Õ6æ6†÷DGV×VBÒG'VS°¢6öç7B6æ6†÷BÒ÷Væ–f÷&Õ6æ6†÷C°¢6æ6†÷Bæ'VffW"æÖ7–æ2„uTÖÖöFRå$TB’çF†Vâ‚‚’Óâ°¢6öç7BfÆöG2ÒæWrfÆöC3$'&’‡6æ6†÷Bæ'VffW"ævWDÖVE&ævR‚’ç6Æ–6Rƒ’“°¢6æ6†÷Bæ'VffW"çVæÖ‚“°¢6öç6öÆRæÆör‚%¶G&rÖ6Vç7W5Ò$ô¤T5D”ôâBFW'&–â72†G&vãÒ ¢²6æ6†÷BæG&vâ²"’ ¢²¥4ôâç7G&–æv–g’„'&’æg&öÒ†fÆöG2’æÖ‚‡b’ÓâçVÖ&W"‡bçFôf—†VBƒB’’’’“°¢Ò’æ6F6‚‚†W'&÷"’Óâ°¢6öç6öÆRæÆör‚%¶G&rÖ6Vç7W5Ò&ö¦V7F–öâ6æ6†÷Bf–ÆVB ¢²7G&–ær†W'&÷"’ç6Æ–6RƒÂ#’“°¢Ò“°¢Ð¢–b‚÷f—6–&ÆU6æ6†÷DGV×VBbb÷f—6–&ÆUVæ–f÷&Õ6æ6†÷@¢bb÷f—6–&ÆUVæ–f÷&Õ6æ6†÷BæW'&÷"’°¢÷f—6–&ÆU6æ6†÷DGV×VBÒG'VS°¢6öç7B6æ6†÷BÒ÷f—6–&ÆUVæ–f÷&Õ6æ6†÷C°¢6æ6†÷Bæ'VffW"æÖ7–æ2„uTÖÖöFRå$TB’çF†Vâ‚‚’Óâ°¢6öç7BfÆöG2ÒæWrfÆöC3$'&’‡6æ6†÷Bæ'VffW"ævWDÖVE&ævR‚’ç6Æ–6Rƒ’“°¢6æ6†÷Bæ'VffW"çVæÖ‚“°¢6öç6öÆRæÆör‚%¶G&rÖ6Vç7W5Ò$ô¤T5D”ôâB6·’72†G&vãÒ ¢²6æ6†÷BæG&vâ²"’ ¢²¥4ôâç7G&–æv–g’„'&’æg&öÒ†fÆöG2’æÖ‚‡b’ÓâçVÖ&W"‡bçFôf—†VBƒB’’’’“°¢Ò’æ6F6‚‚‚’Óâ·Ò“°¢Ð¢òòv—F‚öÖ7vV%öwU÷&ö&RF†R†÷7B&V6÷&G2F†RfÆöG2öbWfW'’T$ò×6—¦V@¢òòw&—FR¶W–VB'’Æ&VÂ6†æFÆRâ—"F†Bv—F‚F†R†æFÆRF†RFW'&–à¢òòG&r7GVÆÇ’&÷VæC¢–bvööBÖG&—‚—2w&—GFVâFòöæR–ç7Fæ6Ræ@¢òòF†RG&r&–æG2æ÷F†W"ÂF†RG&r6VW2g&W6†Ç’×¦W&öVB'VffW"à¢–b‚÷w&—FU&ö&TGV×VBbbvÆö&ÅF†—2æÖ5vV$wRå÷6ÖÆÄ'VffW%w&—FW0¢bbvÆö&ÅF†—2æÖ5vV$wRå÷FW'&–äG&u6×ÆSòç&ö¦V7F–öâ’°¢÷w&—FU&ö&TGV×VBÒG'VS°¢6öç7B&÷VæBÒvÆö&ÅF†—2æÖ5vV$wRå÷FW'&–äG&u6×ÆRç&ö¦V7F–öã°¢6öç6öÆRæÆör‚%¶G&rÖ6Vç7W5ÒFW'&–â&–æG2&ö¦V7F–öâ†æFÆSÒ ¢²&÷VæBæ'VffW$†æFÆR²"öfg6WCÒ"²&÷VæBæöfg6WB²"6—¦SÒ"²&÷VæBç6—¦R“°¢6öç7B†—7F÷'’ÒvÆö&ÅF†—2æÖ5vV$wRå÷6ÖÆÄ'VffW%w&—FT†—7F÷'’ÇÂ·Ó°¢f÷"†6öç7B¶¶W’ÂÆ—7EÒöbö&¦V7BæVçG&–W2††—7F÷'’’’°¢–b‚'&’æ—4'&’†Æ—7B’ÇÂöÆWfVÂö’çFW7B†¶W’’’6öçF–çVS°¢Æ—7Bæf÷$V6‚‚‡"Â’’Óâ°¢6öç6öÆRæÆör‚%¶G&rÖ6Vç7W5Ò†—7F÷'’"²¶W’²"2"²¢²"6WÒ"²"ç6W²"cÒ"²¥4ôâç7G&–æv–g’‡"æfÆöG2ç6Æ–6RƒÂb’’“°¢Ò“°¢Ð¢f÷"†6öç7B¶¶W’ÂfÇVUÒöbö&¦V7BæVçG&–W2†vÆö&ÅF†—2æÖ5vV$wRå÷6ÖÆÄ'VffW%w&—FW2’’°¢–b‚õ&ö§ÄG–æÖ–7ÅG&ç6f÷&×ÄvÆö&Ç2ö’çFW7B†¶W’’’6öçF–çVS°¢6öç6öÆRæÆör‚%¶G&rÖ6Vç7W5Òw&—FR"²¶W’²""²fÇVRæöfg6W@¢²"cÒ"²¥4ôâç7G&–æv–g’‡fÇVRæfÆöG2ç6Æ–6RƒÂb’’“°¢òò–çG2Föó¢v&&vRfÆöG2F†B&R'—FR×6†–gFVB÷"–çBÖVæ6öFV@¢òòf–Wröb6æRÖG&—‚6†÷rW6ÆV&Ç’–âF†R&rv÷&G2à¢6öç6öÆRæÆör‚%¶G&rÖ6Vç7W5Òw&—FR"²¶W’²"“Ò ¢²¥4ôâç7G&–æv–g’‡fÇVRæ–çG2ç6Æ–6RƒÂb’’“°¢Ð¢Ð¢–b‚÷FW'&–åVæ–f÷&ÔGV×VBbbvÆö&ÅF†—2æÖ5vV$wRå÷FW'&–äG&u6×ÆR’°¢÷FW'&–åVæ–f÷&ÔGV×VBÒG'VS°¢f÷"†6öç7Bv†–6‚öb²'&ö¦V7F–öâ"Â&vÆö&Ç2"Â&6‡Væµ6V7F–öâ%Ò’°¢&öÖ—6Rç&W6öÇfR†vÆö&ÅF†—2æÖ5vV$wRç&VEFW'&–åVæ–f÷&Ò‡v†–6‚’’çF†Vâ‚‡"’Óâ°¢6öç6öÆRæÆör‚%¶G&rÖ6Vç7W5ÒVæ–f÷&Ò"²v†–6‚²" ¢²‡"æW'&÷"ò"æW'&÷"¢¥4ôâç7G&–æv–g’‡"æfÆöG2’’“°¢Ò’æ6F6‚‚‚’Óâ·Ò“°¢Ð¢&öÖ—6Rç&W6öÇfR†vÆö&ÅF†—2æÖ5vV$wRç&VEFW'&–åVæ–f÷&Ò‚'&ö¦V7F–öâ"Â'f—6–&ÆR"’¢çF†Vâ‚‡"’Óâ°¢6öç6öÆRæÆör‚%¶G&rÖ6Vç7W5ÒVæ–f÷&Ò4ôåE$ôÂ&ö¦V7F–öâ‚ ¢²†vÆö&ÅF†—2æÖ5vV$wRå÷f—6–&ÆTG&u6×ÆSòæÆ&VÂÇÂ#ò"’²"’ ¢²‡"æW'&÷"ò"æW'&÷"¢¥4ôâç7G&–æv–g’‡"æfÆöG2’’“°¢Ò’æ6F6‚‚‚’Óâ·Ò“°¢Ð¢–b‚÷FW'&–åfW'G4GV×VBbbvÆö&ÅF†—2æÖ5vV$wRå÷FW'&–äG&u6×ÆR’°¢÷FW'&–åfW'G4GV×VBÒG'VS°¢&öÖ—6Rç&W6öÇfR†vÆö&ÅF†—2æÖ5vV$wRç&VEFW'&–åfW'F–6W2‚’’çF†Vâ‚‡&W7VÇB’Óâ°¢–b‚&W7VÇBÇÂ&W7VÇBæW'&÷"’°¢6öç6öÆRæÆör‚%¶G&rÖ6Vç7W5ÒFW'&–âfW'G3¢"²‡&W7VÇBbb&W7VÇBæW'&÷"’“°¢&WGW&ã°¢Ð¢6öç6öÆRæÆör‚%¶G&rÖ6Vç7W5ÒFW'&–â&V2 ¢²¥4ôâç7G&–æv–g’‡&W7VÇBç&V2’ç6Æ–6RƒÂ“’“°¢f÷"†6öç7BfW'FW‚öb&W7VÇBçfW'F–6W2ç6Æ–6RƒÂB’’°¢6öç6öÆRæÆör‚%¶G&rÖ6Vç7W5ÒfW'B÷3Ò"²¥4ôâç7G&–æv–g’‡fW'FW‚ç÷6—F–öâ¢²"6öÃÒ"²¥4ôâç7G&–æv–g’‡fW'FW‚æ6öÆ÷"¢²"WcÒ"²¥4ôâç7G&–æv–g’‡fW'FW‚çWc’“°¢Ð¢Ò’æ6F6‚‚†W'&÷"’Óâ°¢6öç6öÆRæÆör‚%¶G&rÖ6Vç7W5ÒFW'&–âfW'G2f–ÆVB"²7G&–ær†W'&÷"’ç6Æ–6RƒÂ#’“°¢Ò“°¢Ð¢òò6÷–W2&R–çf—6–&ÆRFòG&r6Vç7W3¢6÷•FW‡GW&UFõFW‡GW&R–çFòF†P¢òò6ö×÷6—FVBF&vWBgFW"F†RFW'&–â72v÷VÆBW&6RFW'&–âv—F†÷W@¢òòV&–ær272÷"G&rç—v†W&R&÷fRà¢–b†6ö×÷6—FU6÷W&6R’°¢6öç6öÆRæÆör‚%¶G&rÖ6Vç7W5ÒF&vWBF–CÒ"²6ö×÷6—FU6÷W&6Rå÷F–@¢²"6÷–W4–ãÒ"²†6ö×÷6—FU6÷W&6Råö6÷–W4–âÇÂ¢²"6÷–W4÷WCÒ"²†6ö×÷6—FU6÷W&6Råö6÷–W4÷WBÇÂ¢²"WÆöG3Ò"²†6ö×÷6—FU6÷W&6Rå÷WÆöG2ÇÂ’“°¢Ð¢6öç6öÆRæÆör‚%¶G&rÖ6Vç7W5ÒFWF„6ÆV'3Ò ¢²¥4ôâç7G&–æv–g’†vÆö&ÅF†—2æÖ5vV$wRåöFWF„6ÆV'2ÇÂ·Ò’“°¢–b‡FW'&–äBãÒ’°¢6öç6öÆRæÆör‚%¶G&rÖ6Vç7W5ÒFW'&–å73Ò"²Ö–å·FW'&–äEÒ“°¢Ð¢6öç6öÆRæÆör‚%¶G&rÖ6Vç7W5Ò76W3Ò"²Ö–âæÆVæwF‚²"Æ7EFW'&–å73Ò"²FW'&–ä@¢²"gFW#Ò"²‡FW'&–äBÂò&âö"¢Ö–âç6Æ–6R‡FW'&–äB²’æ¦ö–â‚"Óâ"’ç6Æ–6RƒÂC’’“°¢òòW"×F&vWBG&w2f÷"F†Rg&ÖR&V–ær&W6VçFVB&–v‡Bæ÷râF†P¢òòvw&VvFR6Vç7W26÷fW'2FVâ6V6öæG3²–bFW'&–âöæÇ’G&w2–âg&ÖW0¢òòF†B&RæWfW"&W6VçFVBÂF†W6RGvòF—6w&VRæBF†B—2F†Rç7vW"à¢6öç7BW%F&vWBÒµÓ°¢f÷"†6öç7B·F–BÂåÒöbÆ7Dg&ÖTG&w2’°¢6öç7BRÒFW„–çfVçF÷'’æf–æB‚‡B’ÓâBå÷F–BÓÓÒF–B“°¢W%F&vWBçW6‚‚†Rò†RåöÆ&VÂÇÂ#ò"’²""²Rçv–GF‚²'‚"²Ræ†V–v‡B¢'F–B"²F–B¢²#Ò"²â“°¢Ð¢6öç6öÆRæÆör‚%¶G&rÖ6Vç7W5Ò&W6VçFVBg&ÖRG&w3¢"²‡W%F&vWBæ¦ö–â‚"Â"’ÇÂ&æöæR"’“°¢Ð¢–b…öG&t6Vç7W2’ög&ÖU75G&6RæÆVæwF‚Ò°¢–b…÷&W6VçD6÷VçBÓÓÒ’Ö&µ†6R‚&f—'7BÖg&ÖR×&W6VçFVB"“°¢ö&¦V7G2æFVÆWFR††æFÆR“°¢ÒÀ ¢&W÷'E7V66W72†&v"Â&6¶VæBÂF‚’°¢6öç7B†W‚Ò†&v"ããâ’çFõ7G&–ærƒb’çE7F'Bƒ‚Â#"’çFõWW$66R‚“°¢6WEFW‡B‚&¦"×7FGW2"Â&W†V7WFVBg&öÒÖ–æV7&gBÓ#bã"Ö6Æ–VçBæ¦""“°¢6WEFW‡B‚&¦"ÖÖWF†öB"ÂF‚“°¢6WEFW‡B‚&¦"×&W7VÇB"Â‚G¶†W‡Ö“°¢6WEFW‡B‚&wR×7FGW2"ÂG¶&6¶VæGÒ6çf2&W6VçFVF“°¢Fö7VÖVçBæFö7VÖVçDVÆVÖVçBç7G–ÆRç6WE&÷W'G’€¢"ÒÖ¦"Ö6öÆ÷""À¢&v"‚G²†&v"ããâb’b#SWÒG²†&v"ããâ‚’b#SWÒG¶&v"b#SWÒ– ¢“°¢Fö7VÖVçBæ&öG’æFF6WBç&VG’Ò'G'VR#°¢ÒÀ ¢&W÷'E&VÆöE&ö&R†WfVçBÂ6÷W&6RÒ&Ö–â"’°¢6öç7BFW‡BÒ7G&–ær†WfVçB“°¢6öç7BVçG&–W2ÒF–væ÷7F–72ç&VÆöE&ö&S°¢VçG&–W2çW6‚‡°¢C¢ÖF‚ç&÷VæB‡W&f÷&Öæ6Rææ÷r‚’’À¢6÷W&6S¢7G&–ær‡6÷W&6R’À¢WfVçC¢FW‡BÀ¢Ò“°¢–b†VçG&–W2æÆVæwF‚âƒ’VçG&–W2ç7Æ–6RƒÂVçG&–W2æÆVæwF‚Òƒ“°¢òòF†R&VÆöB&ö&R—2Ö÷7BW6VgVÂ&V6—6VÇ’v†VâF†RÖ–âF‡&VB—27GV6°¢òò–ç6–FRF†R7–æ6‡&öæ÷W27&VFRv÷&ÆB&'&–W"â¶VWF†RÆ7BfWrWfVçG2–à¢òòF†R÷WBÖöb×F‡&VBvF6†För&–ær2vVÆÃ²F†RvR×6–FR'&’&÷fR6ææ÷@¢òò&R&VBv†–ÆRF†B&VæFW&W"—2g&÷¦VââFòæ÷B&÷WFRF‡&÷Vv‚&W÷'E&öw&W73 ¢òòF†—2F‚6â&R†÷BGW&–ærF†R&VÆöBæB×W7B&VÖ–â6†&VBÖÖVÖ÷'’ÖöæÇ’à¢vÆö&ÅF†—2æÖ5vV%F‡&VE'VçF–ÖSòæF–sòâ‚'&VÆöB"²FW‡B“°¢òò¶VW6ö×7B6÷’–â4Ef÷"F†R†VÇF‡’÷'F–öâöb'VââF†RgVÆÀ¢òò&VÆöB7G&VÒ—2–çFVçF–öæÆÇ’æ÷BÆövvVB†W&R†—B—2F†÷W6æG2öbF6°¢òòWfVçG2æBv÷VÆB÷fW&fÆ÷rF†R6öç6öÆR—R“²F†W6RG&ç6—F–öâ&V6÷&G2&P¢òòF†RöæW2F†B–FVçF–g’&'&–W"F†BæWfW"6ö×ÆWFW2à¢–b‚öWfVçCÒ†&Vv–çÇ6æ6†÷GÆÆÂÖFöæWÆÆ—7FVæW"Ò†6ö×ÆWFWÆ7&VFRÖf–ÆVB—Æ&'&–W"Ò‡v—GÇ7V&Ö—BÖÖ–çÆÖ–â×&çÆÖ–âÖf–ÆVGÇ&VG’Öf÷"ÖÇ’—ÇF6²Öf–ÆVB’òçFW7B‡FW‡B’’°¢6öç6öÆRæÆör‚%´Ô2Õ$TÄôEÒ"ÂFW‡B“°¢Ð¢ÒÀ ¢&W÷'E&öw&W72‡7FvR’°¢ò ¢¢FVÆVÖWG'’Ö&¶W'2F¶RF†R6†VFƒ¢F†R&–æröæÇ’à¢ ¢¢F†—2ÖWF†öBW6VBFòFòF†R6ÖR6WfVâF†–æw2f÷"WfW'’Ö&¶W"(	B¢¢6öç6öÆRÆ–æRÂ&V6öâw&—FRÂâö&¦V7BÆÆö6F–öâÂÖ&´6ÆÂÂæBEtð¢¢DôÒw&—FW2(	BæBvÖWÆ’VÖ—G2ã#3Ö&¶W'26V6öæBÂFöÖ–æFVB'¢¢W"×6¶WBWgC¦öæW2âÖV7W&VBB3RãsbW2V6‚ÂF†B—2ãS×2ö`¢¢WfW'’Ö–çWFR7VçBFW67&–&–ærF†Rg&ÖR&F†W"F†âG&v–ær—BÂæB—@¢¢vWG2f"v÷'6Rv—F‚FWeFööÇ2÷VâÂv†–6‚—2W†7FÇ’v†Vâ6öÖVöæR—0¢¢Æöö¶–ærâF†RÆFCâVÆVÖVçG2F†÷6RDôÒw&—FW2fVVB6—B&V†–æBF†R6çf0¢¢æBæö&öG’&VG2F†VÒÖ–BÖvÖRà¢ ¢¢F†R&–ær—2v†BF†RFW7G2æB&ö&W27GVÆÇ’&VBÂ6ò—B—2¶W@¢¢W†7BâöÖ7vV%öÆöuöÆÃÓ&W7F÷&W2F†RgVÆÂG&VFÖVçBf÷"FV'Vvv–ærà¢¢ð¢–b‚öÆötÆÅ7FvW2bbG—Vöb7FvRÓÓÒ'7G&–ær"bbô4„EE•õ5DtRçFW7B‡7FvR’’°¢vÆö&ÅF†—2åõöÖ5vV$Æ7E7FvRÒ7FvS°¢&V6÷&E7FvR‡7FvR“°¢&WGW&ã°¢Ð¢6öç6öÆRæÆör‚%´Ô2Ô”ä•EÒ"Â7FvR“°¢ò ¢¢Ö—'&÷"–çFò6†&VBÆ–æV"ÖVÖ÷'’Âv†W&Rv÷&¶W"6â7F–ÆÂ&VB—BgFW"F†—0¢¢F‡&VB7F÷2&WGW&æ–ærâWfW'—F†–ærVÇ6R–âF†—2ÖWF†öB(	BF†R6öç6öÆRÆ–æRÂF†P¢¢7FvR&–ærÂõöÖ5vV$Æ7E7FvV(	BÆ—fW2öâF†RÖ–âF‡&VBæBF—6V'2v—F€¢¢—BÂv†–6‚—2v‡’v÷&ÆBÖÆöB†ær†2æWfW"†BÆ7B¶æ÷vâ÷6—F–öâà¢¢ð¢vÆö&ÅF†—2æÖ5vV%F‡&VE'VçF–ÖSòæ&V6öãòâƒÂ7FvR“°¢òòvV"–ÖvR7G&—2¤¦f¢7F6²G&6W2†vWE7F6µG&6R‚’—2Çv—2V×G’’À¢òò'WBWfW'’¥2'&–FvR6ÆÂ7&÷76W2–çFò¦f67&—BÂ6òF†R¥2÷v6Ò7F6°¢òòBF†R&÷VæF'’—27F–ÆÂf–Æ&ÆRÒÒæBVæFW"v6Ôt2—B6'&–W2v6Ð¢òòg&ÖW2â'&÷w6W$æF—fTÖVÖ÷'’Ç&VG’&W÷'G2V6‚Æ&vRÆÆö6F–öà¢òòF‡&÷Vv‚†W&RÂ6ò6GW&–ær7F6²BF†BÖöÖVçBGG&–'WFW2F†R&Æö6°¢òòFòv†FWfW"6¶VBf÷"—BÂv—F‚æò–ÖvR&V'V–ÆBà¢–b‡G—Vöb7FvRÓÓÒ'7G&–ær"bb7FvRç7F'G5v—F‚‚&æF—fS¦Æ&vRÖÆÆö2"’’°¢6öç7B6–æ²Ò†vÆö&ÅF†—2æÖ5vV$wRåöÆÆö57F6·2ÇÃÒµÒ“°¢–b‡6–æ²æÆVæwF‚Â"’°¢6–æ²çW6‚‡·7FvRÂ7F6³¢7G&–ær†æWrW'&÷"‚&ÆÆö2"’ç7F6²ÇÂ""’ç7Æ—B‚%Æâ"’ç6Æ–6RƒÂC—Ò“°¢Ð¢Ð¢òò&VB'’FW7G2÷v÷&ÆBÖ7&VFRç7V2çG2ÂFööÇ2öÖVçRÖ6Æ–6·F‡&÷Vv‚æÖ§2À¢òòFööÇ2÷C×&ö&RæÖ§2æBFööÇ2ö'&÷w6W"Ö6†V6²æÖ§2â—Bv2æWfW"76–væVBÀ¢òò6òWfW'’67&VVâv—B–âF†÷6RFööÇ26–ÆVçFÇ’6r""æBfVÆÂF‡&÷Vv‚Fð¢òò—G2F–ÖV÷WBà¢vÆö&ÅF†—2åõöÖ5vV$Æ7E7FvRÒ7FvS°¢&V6÷&E7FvR‡7FvR“°¢Ö&´6ÆÂ‚'&W÷'E&öw&W72"Â·7FvWÒ“°¢6WEFW‡B‚&¦"×7FGW2"Â''Vææ–ærÖ–æV7&gBÓ#bã"Ö6Æ–VçBæ¦""“°¢6WEFW‡B‚&¦"ÖÖWF†öB"Â7FvR“°¢ÒÀ ¢ò¢ ¢¢†–v‚Ög&WVVæ7’&ö&R6†ææVÃ¢6†&VBÖVÖ÷'’öæÇ’Âæò6öç6öÆRæBæò7FvR&–ærà¢ ¢¢6ÆÆW'2&R7–âÆö÷2F†B'Vâv†–ÆRF†—2F‡&VB—2¦æ÷B¢&WGW&æ–ærFòF†P¢¢'&÷w6W"Â6òWfW'—F†–ær&W÷'E&öw&W76Ç6òFöW2(	BF†R6öç6öÆRÆ–æRÂF†R7FvP¢¢&–ærÂF†RDôÒFW‡B(	B—2&÷F‚Vç&V6†&ÆRæBÂBF†—2&FRÂ'V–æ÷W2âF†R&V6öà¢¢w&—FR—2GvòFöÖ–72æB&÷VæFVB'—FR6÷’Âv†–6‚—2ff÷&F&ÆR–ç6–FRv—Bà¢¢ð¢&W÷'DF–r‡FW‡B’°¢vÆö&ÅF†—2æÖ5vV%F‡&VE'VçF–ÖSòæF–sòâ‡FW‡B“°¢–b…7G&–ær‡FW‡Bóò""’ç7F'G5v—F‚‚'v÷&ÆFvVã§7FWÖf–ÇW&RãÒ"’’°¢vÆö&ÅF†—2æÖ5vV%F‡&VE'VçF–ÖSòç7F–6·”F–sòâ‡FW‡B“°¢Ð¢ÒÀ ¢òòD”s¢fÆöB6öçFVçG2öbF†R6ÖÆÂVæ–f÷&Ò'VffW'2F†BG&—fRföræBF†P¢òòvÆö&Â&VæFW"6WGF–æw2âg&ÖRF†B—2Væ–f÷&ÖÇ’förÖ6öÆ÷W&VBÒÒæð¢òò6·’öw&÷VæB7Æ—BÒÒv†–ÆRFW'&–â—77VW2F†÷W6æG2öbfÆ–BG&w2ö–çG0¢òòBF†RförFW&Ò6GW&F–ærÂæ÷BBÖ—76–ærvVöÖWG'’à¢GV×Væ–f÷&×2‚’°¢6öç7B÷WBÒ·Ó°¢f÷"†6öç7B¶†æFÆRÂVçG'•Òöbö&¦V7G2’°¢–b†VçG'“òæ¶–æBÓÒ&'VffW""ÇÂVçG'’å÷6†F÷r’6öçF–çVS°¢6öç7BÆ&VÂÒVçG'’åöÆ&VÂÇÂ7G&–ær††æFÆR“°¢òòÆÂ6ÖÆÂ'VffW'2Âæ÷B§W7Bfös¢F†RFW'&–âG&ç6f÷&Ò‡&ö¦V7F–öâÀ¢òòÖöFVÂ×f–WrÂW"×6V7F–öâöfg6WB’Æ—fW2–âöæRöbF†W6RÂæB6V7F–öà¢òòöfg6WBF†BæWfW"&V6†W2F†R6†FW"v÷VÆBG&rWfW'’6‡Væ²BF†P¢òòv÷&ÆB÷&–v–âÒÒ‡VæG&VG2öb&Æö6·2g&öÒF†RÆ–W"Â6òöfb×67&VVâÀ¢òòv—F‚VçF—&VÇ’fÆ–BG&r6ÆÇ2à¢–b†VçG'’ç6—¦RâC“b’6öçF–çVS°¢6öç7BâÒÖF‚æÖ–â†VçG'’å÷6†F÷ræ'—FTÆVæwF‚ãâ"Â#B“°¢÷WE¶Æ&VÅÒÒ°¢6—¦S¢VçG'’ç6—¦RÀ¢fÆöG3¢'&’æg&öÒ†æWrfÆöC3$'&’†VçG'’å÷6†F÷ræ'VffW"ÂVçG'’å÷6†F÷ræ'—FTöfg6WBÇÂÂâ’¢Ó°¢Ð¢&WGW&â÷WC°¢ÒÀ ¢òòD”s¢WfW'’FW‡GW&Rv—F‚—G2WÆöB6÷VçBââFÆ2BWÆöG2æWfW ¢òò&V6V—fVB—†VÇ3²æöâ×¦W&ò6÷VçBÖVç2F†R'—FW2'&—fVBæBç¢òò&Ææ¶æW72—2F÷vç7G&VÒ†&Æ—BÂ6×ÆW"Â÷"F†R7&—FRUbÆöö·W’à¢ò¢ ¢¢WfW'’FW‡GW&Rö&¦V7BÖF6†–ærGFW&æÂv—F‚—G2†æFÆRæBæòF÷Ôà¢¢6Æ–6–ærâGV×FW‡GW&W2‚’FVGW2æBG'Væ6FW2Âv†–6‚†–FW2F†R66Rv†W&P¢¢6WfW&Âö&¦V7G26†&RÆ&VÂ†f÷W"&RÆ&VÆÆVB&Æö6·2çær’æBF†RöæP¢¢&V–ærWÆöFVB–çFò—2æ÷BF†RöæRG&r&–æG2à¢¢ð¢ò¢ ¢¢7–æ2&VF&6²öb6ÖÆÂFW‡GW&RÂf÷"F†RGvò×VÇF—Æ–W'2F†B6à¢¢6GW&FRFW'&–âFòv†—FRâ&WGW&ç2&öÖ—6Röb$t$&÷w2âöæÇ’6æRf÷ ¢¢F–ç’FW‡GW&W2ÒÒF†RÆ–v‡FÖ—2gƒbà¢¢ð¢7–æ2&VE6ÖÆÅFW‡GW&R‡GFW&â’°¢6öç7B&RÒæWr&VtW‡‡GFW&âÂ&’"“°¢ÆWBf÷VæBÒçVÆÃ°¢f÷"†6öç7B²ÂVçG'•Òöbö&¦V7G2’°¢–b†VçG'“òæ¶–æBÓÓÒ'FW‡GW&R"bb&RçFW7B…7G&–ær†VçG'’åöÆ&VÂóò""’’’²f÷VæBÒVçG'“²'&V³²Ð¢Ð¢–b‚f÷VæB’&WGW&â¶W'&÷#¢&æòFW‡GW&RÖF6†W2"²GFW&çÓ°¢6öç7BrÒf÷VæBçv–GF‚Â‚Òf÷VæBæ†V–v‡C°¢6öç7B'—FW5W%&÷rÒÖF‚æ6V–Â‡r¢Bò#Sb’¢#Sc°¢6öç7B&VF&6²ÒFWf–6Ræ7&VFT'VffW"‡°¢6—¦S¢'—FW5W%&÷r¢‚À¢W6vS¢uT'VffW%W6vRä4õ•ôE5BÂuT'VffW%W6vRäÔõ$T@¢Ò“°¢6öç7BVæ6öFW"ÒFWf–6Ræ7&VFT6öÖÖæDVæ6öFW"‚“°¢Væ6öFW"æ6÷•FW‡GW&UFô'VffW"€¢·FW‡GW&S¢f÷VæBçFW‡GW&WÒÀ¢¶'VffW#¢&VF&6²Â'—FW5W%&÷rÂ&÷w5W$–ÖvS¢‡ÒÀ¢·v–GFƒ¢rÂ†V–v‡C¢‚ÂFWF„÷$'&”Æ–W'3¢Ð¢“°¢FWf–6RçVWVRç7V&Ö—B…¶Væ6öFW"æf–æ—6‚‚•Ò“°¢v—B&VF&6²æÖ7–æ2„uTÖÖöFRå$TB“°¢6öç7B'—FW2ÒæWrV–çC„'&’‡&VF&6²ævWDÖVE&ævR‚’ç6Æ–6Rƒ’“°¢&VF&6²çVæÖ‚“°¢&VF&6²æFW7G&÷’‚“°¢òò6×ÆR6ö'6Rw&–B7&÷72F†Rv†öÆRFW‡GW&RÂ6òF†—2v÷&·2f÷"¢òò#C‡ƒ#C‚FÆ22vVÆÂ2gƒbÆ–v‡FÖà¢6öç7B7FW‚ÒÖF‚æÖ‚ƒÂÖF‚æfÆö÷"‡ròb’“°¢6öç7B7FW’ÒÖF‚æÖ‚ƒÂÖF‚æfÆö÷"†‚òb’“°¢6öç7B&÷w2ÒµÓ°¢6öç7B†—7Föw&ÒÒæWrÖ‚“°¢f÷"†ÆWB’Ò²’Âƒ²’³Ò7FW’’°¢6öç7B&÷rÒµÓ°¢f÷"†ÆWB‚Ò²‚Âs²‚³Ò7FW‚’°¢6öç7BòÒ’¢'—FW5W%&÷r²‚¢C°¢&÷rçW6‚…¶'—FW5¶õÒÂ'—FW5¶ò²ÒÂ'—FW5¶ò²%ÒÂ'—FW5¶ò²5ÕÒ“°¢Ð¢&÷w2çW6‚‡&÷r“°¢Ð¢f÷"†ÆWB’Ò²’Âƒ²’³ÒB’°¢f÷"†ÆWB‚Ò²‚Âs²‚³ÒB’°¢6öç7BòÒ’¢'—FW5W%&÷r²‚¢C°¢6öç7B¶W’ÒG¶'—FW5¶õ×ÒÂG¶'—FW5¶ò²×ÒÂG¶'—FW5¶ò²%×ÒÂG¶'—FW5¶ò²5×Ö°¢†—7Föw&Òç6WB†¶W’Â††—7Föw&ÒævWB†¶W’’óò’²“°¢Ð¢Ð¢&WGW&â°¢Æ&VÃ¢f÷VæBåöÆ&VÂÀ¢vƒ¢G·w×‚G¶‡ÖÀ¢&÷w2À¢F÷¢²ââæ†—7Föw&ÒæVçG&–W2‚•Òç6÷'B‚†Â"’Óâ%³ÒÒ³Ò’ç6Æ–6RƒÂb¢Ó°¢ÒÀ ¢ò¢ ¢¢FV6öFRF†RfW'F–6W2FW'&–âG&r7GVÆÇ’6öç7VÖVBâF†R6V7F–öâV&W ¢¢'VffW'2&Rf"&÷fRF†R5R×6†F÷rÆ–Ö—BÂ6òF†—2&VG2F†R&VÂuP¢¢'VffW"&6²&F†W"F†âÖ—'&÷"ÒÒF†RÖ—'&÷"FöW2æ÷BW†—7Bf÷"F†VÒÀ¢¢æBF†R÷'Bw2÷vâ&VF&6²F‚&WGW&ç2¦W&÷2f÷"uR×w&—GFVâ'VffW'2à¢¢ð¢ò¢¢&VB&6²ç’&V6÷&FVBVæ–f÷&Ò&ævR2fÆöG2æB–çG2â¢ð¢7–æ2&VEVæ–f÷&Õ&ævR‡v†–6‚’°¢6öç7B&V2ÒvÆö&ÅF†—2æÖ5vV$wRå÷FW'&–äG&u6×ÆSòå·v†–6…Ó°¢–b‚&V2’&WGW&â¶W'&÷#¢&æò&ævRf÷""²v†–6‡Ó°¢6öç7BVçG'’Òö&¦V7G2ævWB‡&V2æ'VffW$†æFÆR“°¢–b‚VçG'’’&WGW&â¶W'&÷#¢&'VffW"vöæR'Ó°¢6öç7B6—¦RÒÖF‚æ6V–Â„ÖF‚æÖ–â‡&V2ç6—¦RÇÂ#SbÂVçG'’ç6—¦RÒ&V2æöfg6WB’òB’¢C°¢–b‡6—¦RÃÒ’&WGW&â¶W'&÷#¢&V×G’&ævR"Â&V7Ó°¢6öç7B&VF&6²ÒFWf–6Ræ7&VFT'VffW"‡°¢6—¦RÂW6vS¢uT'VffW%W6vRä4õ•ôE5BÂuT'VffW%W6vRäÔõ$T@¢Ò“°¢6öç7BVæ6öFW"ÒFWf–6Ræ7&VFT6öÖÖæDVæ6öFW"‚“°¢Væ6öFW"æ6÷”'VffW%Fô'VffW"†VçG'’æ'VffW"Â&V2æöfg6WBÂ&VF&6²ÂÂ6—¦R“°¢FWf–6RçVWVRç7V&Ö—B…¶Væ6öFW"æf–æ—6‚‚•Ò“°¢v—B&VF&6²æÖ7–æ2„uTÖÖöFRå$TB“°¢6öç7B&rÒ&VF&6²ævWDÖVE&ævR‚’ç6Æ–6Rƒ“°¢&VF&6²çVæÖ‚“°¢&VF&6²æFW7G&÷’‚“°¢&WGW&â°¢&V2À¢fÆöG3¢'&’æg&öÒ†æWrfÆöC3$'&’‡&r’’æÖ‚‡‚’ÓâÖF‚ç&÷VæB‡‚¢’ò’À¢–çG3¢'&’æg&öÒ†æWr–çC3$'&’‡&r’¢Ó°¢ÒÀ ¢ò¢ ¢¢F†R6†&VB6WVVçF–ÂVBÖ–æFW‚'VffW"FW'&–âG&rW6VBâÆÂ×¦W&ð¢¢–æF–6W2Ö¶RWfW'’G&–ævÆRFVvVæW&FS¢æòg&vÖVçG2Âg&öÒG&r6ÆÇ0¢¢F†BfÆ–FFR6ÆVæÇ’æB6''’6÷'&V7BfW'F–6W2æBVæ–f÷&×2à¢¢ð¢ò¢ ¢¢FWF‚†—7Föw&Òâ6öÆ÷W"Ö–æFWVæFVçBç7vW"Fò&F–BFW'&–â&7FW&—6Sò# ¢¢F†R726ÆV'2FWF‚FòæBFW'&–âw&—FW2FWF‚Â6òç’FW†VÂF†B—0¢¢æ÷B—2vVöÖWG'’F†B76VBF†RFWF‚FW7BæBw&÷FRâÆÂ×¦W&òÖVç0¢¢æ÷F†–ærWfW"&7FW&—6VBÂv†FWfW"F†R6öÆ÷W"'VffW"6†÷w2à¢¢ð¢ò¢¢F†RFWF‚6æ6†÷BF¶VâF†R–ç7FçBFW'&–â72VæFVBâ¢ð¢7–æ2&VEFW'&–å74FWF‚‚’°¢–b‚öFWF…6æ6†÷B’&WGW&â¶W'&÷#¢&æòFW'&–â72FWF‚6GW&VB'Ó°¢–b…öFWF…6æ6†÷BæW'&÷"’&WGW&âöFWF…6æ6†÷C°¢v—BöFWF…6æ6†÷Bæ'VffW"æÖ7–æ2„uTÖÖöFRå$TB“°¢6öç7B&rÒöFWF…6æ6†÷Bæ'VffW"ævWDÖVE&ævR‚’ç6Æ–6Rƒ“°¢öFWF…6æ6†÷Bæ'VffW"çVæÖ‚“°¢6öç7BfÆöG2ÒæWrfÆöC3$'&’‡&r“°¢6öç7BW%&÷rÒöFWF…6æ6†÷Bæ'—FW5W%&÷ròC°¢ÆWB¦W&òÒÂæöå¦W&òÒÂÖ–âÒ–æf–æ—G’ÂÖ‚ÒÔ–æf–æ—G“°¢f÷"†ÆWB’Ò²’ÂöFWF…6æ6†÷Bæ†V–v‡C²’³Ò"’°¢f÷"†ÆWB‚Ò²‚ÂöFWF…6æ6†÷Bçv–GFƒ²‚³Ò"’°¢6öç7BBÒfÆöG5·’¢W%&÷r²…Ó°¢–b†BÓÓÒ’¦W&ò²³²VÇ6R²æöå¦W&ò²³²–b†BÂÖ–â’Ö–âÒC²–b†BâÖ‚’Ö‚ÒC²Ð¢Ð¢Ð¢&WGW&â¶Æ&VÃ¢öFWF…6æ6†÷BæÆ&VÂÂG&vã¢öFWF…6æ6†÷BæG&vâÀ¢F–6³¢öFWF…6æ6†÷BçF–6²Â¦W&òÂæöå¦W&òÀ¢Ö–ã¢æöå¦W&òòÖ–â¢çVÆÂÂÖƒ¢æöå¦W&òòÖ‚¢çVÆÇÓ°¢ÒÀ ¢7–æ2&VDFWF„†—7Föw&Ò‚’°¢ÆWBf÷VæBÒçVÆÃ°¢f÷"†6öç7B²ÂVçG'•Òöbö&¦V7G2’°¢–b†VçG'“òæ¶–æBÓÓÒ'FW‡GW&R"bböFWF‚ö’çFW7B…7G&–ær†VçG'’åöÆ&VÂóò""’’’°¢–b‚f÷VæBÇÂVçG'’çv–GF‚âf÷VæBçv–GF‚’f÷VæBÒVçG'“°¢Ð¢Ð¢–b‚f÷VæB’&WGW&â¶W'&÷#¢&æòFWF‚FW‡GW&R'Ó°¢6öç7BrÒf÷VæBçv–GF‚Â‚Òf÷VæBæ†V–v‡C°¢6öç7B'—FW5W%&÷rÒÖF‚æ6V–Â‡r¢Bò#Sb’¢#Sc°¢6öç7B&VF&6²ÒFWf–6Ræ7&VFT'VffW"‡°¢6—¦S¢'—FW5W%&÷r¢‚À¢W6vS¢uT'VffW%W6vRä4õ•ôE5BÂuT'VffW%W6vRäÔõ$T@¢Ò“°¢6öç7BVæ6öFW"ÒFWf–6Ræ7&VFT6öÖÖæDVæ6öFW"‚“°¢Væ6öFW"æ6÷•FW‡GW&UFô'VffW"€¢·FW‡GW&S¢f÷VæBçFW‡GW&RÂ7V7C¢&FWF‚ÖöæÇ’'ÒÀ¢¶'VffW#¢&VF&6²Â'—FW5W%&÷rÂ&÷w5W$–ÖvS¢‡ÒÀ¢·v–GFƒ¢rÂ†V–v‡C¢‚ÂFWF„÷$'&”Æ–W'3¢Ð¢“°¢FWf–6RçVWVRç7V&Ö—B…¶Væ6öFW"æf–æ—6‚‚•Ò“°¢v—B&VF&6²æÖ7–æ2„uTÖÖöFRå$TB“°¢6öç7B&rÒ&VF&6²ævWDÖVE&ævR‚’ç6Æ–6Rƒ“°¢&VF&6²çVæÖ‚“°¢&VF&6²æFW7G&÷’‚“°¢6öç7BfÆöG2ÒæWrfÆöC3$'&’‡&r“°¢ÆWB¦W&òÒÂæöå¦W&òÒÂÖ–âÒ–æf–æ—G’ÂÖ‚ÒÔ–æf–æ—G“°¢6öç7BW%&÷rÒ'—FW5W%&÷ròC°¢f÷"†ÆWB’Ò²’Âƒ²’³Ò"’°¢f÷"†ÆWB‚Ò²‚Âs²‚³Ò"’°¢6öç7BBÒfÆöG5·’¢W%&÷r²…Ó°¢–b†BÓÓÒ’¦W&ò²³²VÇ6R²æöå¦W&ò²³²–b†BÂÖ–â’Ö–âÒC²–b†BâÖ‚’Ö‚ÒC²Ð¢Ð¢Ð¢&WGW&â°¢Æ&VÃ¢f÷VæBåöÆ&VÂÂvƒ¢G·w×‚G¶‡ÖÂf÷&ÖC¢f÷VæBæf÷&ÖBÀ¢¦W&òÂæöå¦W&òÀ¢Ö–ã¢æöå¦W&òòÖ–â¢çVÆÂÂÖƒ¢æöå¦W&òòÖ‚¢çVÆÀ¢Ó°¢ÒÀ ¢7–æ2&VEFW'&–ä–æF–6W2‚’°¢6öç7B&V2ÒvÆö&ÅF†—2æÖ5vV$wRå÷FW'&–äG&u6×ÆS°¢–b‚&V3òæ–æFW„'VffW$†æFÆR’&WGW&â¶W'&÷#¢&æò–æFW‚'VffW"6GW&VB"Â&V7Ó°¢6öç7BVçG'’Òö&¦V7G2ævWB‡&V2æ–æFW„'VffW$†æFÆR“°¢–b‚VçG'’’&WGW&â¶W'&÷#¢&–æFW‚'VffW"vöæR'Ó°¢6öç7Bv–FRÒ&V2æ–æFW„f÷&ÖBÓÒ'V–çCb#°¢6öç7B7G&–FRÒv–FRòB¢#°¢6öç7Bf—'7BÒ&V2æf—'7D–æFW‚¢7G&–FS°¢6öç7B6—¦RÒÖF‚æÖ–âƒC‚¢7G&–FRÂVçG'’ç6—¦RÒf—'7B“°¢–b‡6—¦RÃÒ’&WGW&â¶W'&÷#¢'&ævR7BVæB"Â&V7Ó°¢6öç7B&VF&6²ÒFWf–6Ræ7&VFT'VffW"‡°¢6—¦S¢ÖF‚æ6V–Â‡6—¦RòB’¢BÀ¢W6vS¢uT'VffW%W6vRä4õ•ôE5BÂuT'VffW%W6vRäÔõ$T@¢Ò“°¢6öç7BVæ6öFW"ÒFWf–6Ræ7&VFT6öÖÖæDVæ6öFW"‚“°¢Væ6öFW"æ6÷”'VffW%Fô'VffW"†VçG'’æ'VffW"Âf—'7BÂ&VF&6²ÂÂÖF‚æ6V–Â‡6—¦RòB’¢B“°¢FWf–6RçVWVRç7V&Ö—B…¶Væ6öFW"æf–æ—6‚‚•Ò“°¢v—B&VF&6²æÖ7–æ2„uTÖÖöFRå$TB“°¢6öç7B&rÒ&VF&6²ævWDÖVE&ævR‚’ç6Æ–6Rƒ“°¢&VF&6²çVæÖ‚“°¢&VF&6²æFW7G&÷’‚“°¢6öç7BfÇVW2Ò'&’æg&öÒ‡v–FRòæWrV–çC3$'&’‡&r’¢æWrV–çCd'&’‡&r’“°¢&WGW&â°¢Æ&VÃ¢VçG'’åöÆ&VÂÀ¢'VffW%6—¦S¢VçG'’ç6—¦RÀ¢f÷&ÖC¢&V2æ–æFW„f÷&ÖBÀ¢–æFW„6÷VçC¢&V2æ–æFW„6÷VçBÀ¢f—'7D–æFWƒ¢&V2æf—'7D–æFW‚À¢&6UfW'FWƒ¢&V2æ&6UfW'FW‚À¢f—'7CCƒ¢fÇVW2ç6Æ–6RƒÂC‚¢Ó°¢ÒÀ ¢ò¢ ¢¢F†RG&ç6f÷&ÒF†RuR7GVÆÇ’6rÂ&VB&6²g&öÒF†RVæ–f÷&Ò'VffW ¢¢&F†W"F†âg&öÒ†÷7B×6–FR6†F÷r6÷’â6†F÷r6â&R7FÆR÷ ¢¢Ö—2Ööfg6WC²F†—26ææ÷Bà¢¢ð¢7–æ2&VEFW'&–åVæ–f÷&Ò†æÖRÂg&öÒ’°¢6öç7B&V2Òg&öÒÓÓÒ'f—6–&ÆR ¢òvÆö&ÅF†—2æÖ5vV$wRå÷f—6–&ÆTG&u6×ÆP¢¢vÆö&ÅF†—2æÖ5vV$wRå÷FW'&–äG&u6×ÆS°¢6öç7B&ævRÒ&V2bb&V5¶æÖUÓ°¢–b‚&ævR’&WGW&â¶W'&÷#¢&æò"²æÖR²"&ævR6GW&VB'Ó°¢6öç7BVçG'’Òö&¦V7G2ævWB‡&ævRæ'VffW$†æFÆR“°¢–b‚VçG'’’&WGW&â¶W'&÷#¢æÖR²"'VffW"vöæR'Ó°¢6öç7B6—¦RÒÖF‚æÖ–âƒcBÂ&ævRç6—¦RÇÂcB“°¢6öç7B&VF&6²ÒFWf–6Ræ7&VFT'VffW"‡°¢6—¦S¢ÖF‚æ6V–Â‡6—¦RòB’¢BÀ¢W6vS¢uT'VffW%W6vRä4õ•ôE5BÂuT'VffW%W6vRäÔõ$T@¢Ò“°¢G'’°¢6öç7BVæ6öFW"ÒFWf–6Ræ7&VFT6öÖÖæDVæ6öFW"‚“°¢Væ6öFW"æ6÷”'VffW%Fô'VffW"†VçG'’æ'VffW"Â&ævRæöfg6WBÂ&VF&6²ÂÀ¢ÖF‚æ6V–Â‡6—¦RòB’¢B“°¢FWf–6RçVWVRç7V&Ö—B…¶Væ6öFW"æf–æ—6‚‚•Ò“°¢v—B&VF&6²æÖ7–æ2„uTÖÖöFRå$TB“°¢6öç7BfÆöG2ÒæWrfÆöC3$'&’‡&VF&6²ævWDÖVE&ævR‚’ç6Æ–6Rƒ’“°¢&VF&6²çVæÖ‚“°¢&VF&6²æFW7G&÷’‚“°¢&WGW&â¶æÖRÂfÆöG3¢'&’æg&öÒ†fÆöG2’æÖ‚‡b’ÓâçVÖ&W"‡bçFôf—†VBƒB’’—Ó°¢Ò6F6‚†W'&÷"’°¢G'’²&VF&6²æFW7G&÷’‚“²Ò6F6‚†–væ÷&VB’²ò¢&W7BVff÷'B¢òÐ¢&WGW&â¶W'&÷#¢7G&–ær†W'&÷"’ç6Æ–6RƒÂc—Ó°¢Ð¢ÒÀ ¢7–æ2&VEFW'&–åfW'F–6W2‚’°¢6öç7B&V2ÒvÆö&ÅF†—2æÖ5vV$wRå÷FW'&–äG&u6×ÆS°¢–b‚&V2’&WGW&â¶W'&÷#¢&æòFW'&–âG&r6GW&VB'Ó°¢6öç7BVçG'’Òö&¦V7G2ævWB‡&V2æ'VffW$†æFÆR“°¢–b‚VçG'’’&WGW&â¶W'&÷#¢'fW'FW‚'VffW"vöæR'Ó°¢6öç7B6÷VçBÒƒ°¢òòFV6öFRF†RfW'F–6W2F†RG&r7GVÆÇ’W6VBââ–æFW†VBG&r7F'G2@¢òò&6UfW'FW‚Â6ò&VF–ærg&öÒF†R&–æF–æröfg6WBÆöæRFV6öFW2v†FWfW ¢òò†Vç2Fò6—BBF†R7F'BöbbÔ"6†&VB'VffW"Òv†–6‚Æöö·0¢òòÆ–¶Rv&&vRæB6—2æ÷F†–ær&÷WBF†RvVöÖWG'’F†Bv2G&vâà¢6öç7B7F'BÒ‡&V2æöfg6WBÇÂ’²‡&V2æ&6UfW'FW‚ÇÂ’¢&V2ç7G&–FS°¢6öç7B6—¦RÒÖF‚æÖ–â‡&V2ç7G&–FR¢6÷VçBÂVçG'’ç6—¦RÒ7F'B“°¢–b‡6—¦RÃÒ’&WGW&â¶W'&÷#¢&öfg6WB7BVæB"Â&V2Â7F'GÓ°¢6öç7B&VF&6²ÒFWf–6Ræ7&VFT'VffW"‡°¢6—¦S¢ÖF‚æ6V–Â‡6—¦RòB’¢BÀ¢W6vS¢uT'VffW%W6vRä4õ•ôE5BÂuT'VffW%W6vRäÔõ$T@¢Ò“°¢6öç7BVæ6öFW"ÒFWf–6Ræ7&VFT6öÖÖæDVæ6öFW"‚“°¢Væ6öFW"æ6÷”'VffW%Fô'VffW"†VçG'’æ'VffW"Â7F'BÂ&VF&6²ÂÂÖF‚æ6V–Â‡6—¦RòB’¢B“°¢FWf–6RçVWVRç7V&Ö—B…¶Væ6öFW"æf–æ—6‚‚•Ò“°¢v—B&VF&6²æÖ7–æ2„uTÖÖöFRå$TB“°¢6öç7B&rÒ&VF&6²ævWDÖVE&ævR‚’ç6Æ–6Rƒ“°¢&VF&6²çVæÖ‚“°¢&VF&6²æFW7G&÷’‚“°¢6öç7Bf–WrÒæWrFFf–Wr‡&r“°¢6öç7B'—FW2ÒæWrV–çC„'&’‡&r“°¢6öç7B÷WBÒµÓ°¢f÷"†ÆWBbÒ²b¢&V2ç7G&–FR²#‚ÃÒ&ræ'—FTÆVæwFƒ²b²²’°¢6öç7B&6RÒb¢&V2ç7G&–FS°¢÷WBçW6‚‡°¢÷6—F–öã¢·f–WrævWDfÆöC3"†&6RÂG'VR’Âf–WrævWDfÆöC3"†&6R²BÂG'VR’Âf–WrævWDfÆöC3"†&6R²‚ÂG'VR•ÒÀ¢6öÆ÷#¢¶'—FW5¶&6R²%ÒÂ'—FW5¶&6R²5ÒÂ'—FW5¶&6R²EÒÂ'—FW5¶&6R²UÕÒÀ¢Wc¢·f–WrævWDfÆöC3"†&6R²bÂG'VR’Âf–WrævWDfÆöC3"†&6R²#ÂG'VR•ÒÀ¢Wc#¢·f–WrævWD–çCb†&6R²#BÂG'VR’Âf–WrævWD–çCb†&6R²#bÂG'VR•Ð¢Ò“°¢Ð¢&WGW&â·&V2Â7F'BÂfW'F–6W3¢÷WGÓ°¢ÒÀ ¢GV×FW‡GW&W4ÖF6†–ær‡GFW&â’°¢6öç7B&RÒæWr&VtW‡‡GFW&âÂ&’"“°¢6öç7B÷WBÒµÓ°¢f÷"†6öç7B¶†æFÆRÂVçG'•Òöbö&¦V7G2’°¢–b†VçG'“òæ¶–æBÓÒ'FW‡GW&R"’6öçF–çVS°¢6öç7BÆ&VÂÒ7G&–ær†VçG'’åöÆ&VÂóò#ò"“°¢–b‚&RçFW7B†Æ&VÂ’’6öçF–çVS°¢÷WBçW6‚‡°¢†æFÆRÀ¢Æ&VÃ¢Æ&VÂç6Æ–6RƒÂCb’À¢vƒ¢G¶VçG'’çv–GF‡×‚G¶VçG'’æ†V–v‡GÖÀ¢Ö—ÆWfVÇ3¢VçG'’çFW‡GW&SòæÖ—ÆWfVÄ6÷VçBóòçVÆÂÀ¢WÆöG3¢VçG'’å÷WÆöG2ÇÂÀ¢6÷–W4–ã¢VçG'’åö6÷–W4–âÇÂÀ¢6÷–W4÷WC¢VçG'’åö6÷–W4÷WBÇÂ ¢Ò“°¢Ð¢&WGW&â÷WC°¢ÒÀ ¢GV×FW‡GW&W2‚’°¢6öç7B÷WBÒµÓ°¢f÷"†6öç7B²ÂVçG'•Òöbö&¦V7G2’°¢–b†VçG'“òæ¶–æBÓÒ'FW‡GW&R"’6öçF–çVS°¢÷WBçW6‚‡°¢Æ&VÃ¢†VçG'’åöÆ&VÂÇÂ#ò"’ç6Æ–6RƒÂCb’À¢vƒ¢G¶VçG'’çv–GF‡×‚G¶VçG'’æ†V–v‡GÖÀ¢WÆöG3¢VçG'’å÷WÆöG2ÇÂÀ¢òòâFÆ2—27F—F6†VB'’&Æ—GF–ærV6‚7&—FR–âÂ6òw&—FUFW‡GW&Sc@¢òòWÆöG26âÆVv—F–ÖFVÇ’&Rv†–ÆRF†RFW‡GW&R—27F–ÆÂgVÆÇ¢òò÷VÆFVBâ6÷–W4–â—2v†BF—7F–æwV—6†W2&76VÖ&ÆVB'’&Æ—B"g&öÐ¢òò&æWfW"f–ÆÆVBBÆÂ"à¢6÷–W4–ã¢VçG'’åö6÷–W4–âÇÂ ¢Ò“°¢Ð¢&WGW&â÷WBæf–ÇFW"‚‡B’ÓâöFÆ7ÆÆ–v‡FÖÆföçGÆwV’ö’çFW7B‡BæÆ&VÂ’¢ç6÷'B‚†Â"’Óâ†"æ6÷–W4–â²"çWÆöG2’Ò†æ6÷–W4–â²çWÆöG2’¢ç6Æ–6RƒÂ#R“°¢ÒÀ ¢ò¢¢&rg&ÖR÷7GWGFW"6Vç7W2W6VB'’F†Röâ×67&VVâw&‚Âv—F†÷WBF†P¢¢ÖWF†öB×w&–ær÷fW&†VBöbF†RgVÆÂW&f÷&Öæ6R&öf–ÆW"â¢ð¢ò¢¢&–æBÖw&÷W66†RVffV7F—fVæW73¢†—BöÖ—726–æ6R&ö÷BÂæBÆ—fR6—¦Râ¢ð¢&–æDw&÷W7FG2‚’°¢&WGW&â²ââåö&–æDw&÷W7FG2Â6—¦S¢ö&–æDw&÷W66†Rç6—¦WÓ°¢ÒÀ ¢g&ÖTw&…&W÷'B‚’°¢&WGW&âög&ÖTw&‚ç&W÷'B‚“°¢ÒÀ ¢ò¢¢7F'B6ÆVâ&rÖV7W&VÖVçBv–æF÷rgFW"&ö÷Bö¦ö–â†26WGFÆVBâ¢ð¢g&ÖTw&…&W6WB‚’°¢ög&ÖTw&‚ç&W6WB‚“°¢&WGW&âG'VS°¢ÒÀ ¢ò¢ ¢¢&VÂ6Æ÷VB×F‚Wf–FVæ6RW6VB'’F†RÆö6Æ†÷7Bf—7VÂvFRâ7W&W76–öà¢¢—2÷BÖ–âæBF–væ÷7F–2ÖöæÇ“¢æ÷&ÖÂÖ–æV7&gB&VæFW&–æræWfW"6ÆÇ0¢¢F†—2ÖWF†öBâFövvÆ–ærF†RW†—7F–ær—VÆ–æRf–ÇFW"–âF†R6ÖRÆ—fRv÷&Æ@¢¢v—fW2F†R—†VÂFW7B6W6Â6Æ÷VG2Ööâò6Æ÷VG2Ööfb6ö×&—6öâv—F†÷W@¢¢6†æv–ærF†R6ÖW&ÂvVF†W"Âv÷&ÆBÂ÷"Ö–æV7&gBw26Æ÷VB6WGF–æw2à¢¢ð¢6WDF–væ÷7F–5—VÆ–æU7W&W76–öâ‡GFW&â’°¢6öç7B&rÒ7G&–ær‡GFW&âóò""’çG&–Ò‚“°¢–b‡&ræÆVæwF‚â#‚’F‡&÷ræWrW'&÷"‚&F–væ÷7F–2—VÆ–æRGFW&â—2FöòÆöær"“°¢öF–væ÷7F–57W&W76–öâÒ&ròæWr&VtW‡‡&rÂ&’"’¢çVÆÃ°¢&WGW&âöF–væ÷7F–57W&W76–öâò7G&–ær…öF–væ÷7F–57W&W76–öâ’¢çVÆÃ°¢ÒÀ ¢6Æ÷VDG&u&W6WB‚’°¢FVÆWFRvÆö&ÅF†—2æÖ5vV$wRåö6Æ÷VDG&w3°¢&WGW&âG'VS°¢ÒÀ ¢6Æ÷VDG&u&W÷'B‚’°¢&WGW&â°¢G&w3¢vÆö&ÅF†—2æÖ5vV$wRåö6Æ÷VDG&w2óòçVÆÂÀ¢fÆ–FF–öäW'&÷'3¢†vÆö&ÅF†—2æÖ5vV$wRå÷fÄW'&÷'2óòµÒ’ç6Æ–6R‚Ó’À¢f—'7DwTW'&÷#¢vÆö&ÅF†—2æÖ5vV$wRåöf—'7DwTW'&÷"óòçVÆÀ¢Ó°¢ÒÀ ¢ò¢ ¢¢g&ÖR×F–ÖRæB'&–FvRÖ6÷7B6Vç7W2â6–æ6Tg&ÖVG&÷2F†R&ö÷Bæ@¢¢v÷&ÆBÖÆöBg&ÖW2Âv†–6‚&RVæ÷&Ö÷W2æBv÷VÆB÷F†W'v—6RFöÖ–æFRWfW'¢¢fW&vS²72F†RF–6²Bv†–6‚F†Rv÷&ÆB&V6ÖR7FVG’à¢¢ð¢W&e&W÷'B‡6–æ6Tg&ÖRÒ’°¢–b‚÷W&bæöâ’&WGW&â¶W'&÷#¢'&öf–ÆW"öfc²ÆöBv—F‚öÖ7vV%÷W&cÓ'Ó°¢6öç7Bg&ÖW2Ò÷W&bæg&ÖW2ç6Æ–6R‡6–æ6Tg&ÖR“°¢6öç7B†÷7Dg&ÖW2Ò÷W&bæ†÷7Dg&ÖW2ç6Æ–6R‡6–æ6Tg&ÖR“°¢6öç7B6ÆÄg&ÖW2Ò÷W&bæ6ÆÄg&ÖW2ç6Æ–6R‡6–æ6Tg&ÖR“°¢6öç7B&dv2Ò÷W&bç&dv2ç6Æ–6R‡6–æ6Tg&ÖR“°¢–b‚g&ÖW2æÆVæwF‚’&WGW&â¶W'&÷#¢&æòg&ÖW2&V6÷&FVB'Ó°¢6öç7B6÷'FVBÒ²ââæg&ÖW5Òç6÷'B‚†Â"’ÓâÒ"“°¢6öç7B6÷'FVDv2Ò²ââç&dv5Òç6÷'B‚†Â"’ÓâÒ"“°¢6öç7BwUVWVT×2Ò÷W&bæwUVWVT×2ç6Æ–6R‚“°¢6öç7B6÷'FVDwRÒ²ââæwUVWVT×5Òç6÷'B‚†Â"’ÓâÒ"“°¢6öç7B7VÒÒ‡‡2’Óâ‡2ç&VGV6R‚†Â"’Óâ²"Â“°¢6öç7BF÷FÄ×2Ò7VÒ†g&ÖW2“°¢6öç7B†÷7D×2Ò7VÒ††÷7Dg&ÖW2“°¢6öç7B&÷VæBÒ‡‚’ÓâÖF‚ç&÷VæB‡‚¢’ò°¢&WGW&â°¢g&ÖW3¢g&ÖW2æÆVæwF‚À¢g3¢&÷VæBƒò‡F÷FÄ×2òg&ÖW2æÆVæwF‚’’À¢g&ÖT×3¢°¢ÖVã¢&÷VæB‡F÷FÄ×2òg&ÖW2æÆVæwF‚’À¢S¢&÷VæB…÷W&6VçF–ÆR‡6÷'FVBÂãR’’À¢“S¢&÷VæB…÷W&6VçF–ÆR‡6÷'FVBÂã“R’’À¢““¢&÷VæB…÷W&6VçF–ÆR‡6÷'FVBÂã“’’’À¢Öƒ¢&÷VæB‡6÷'FVE·6÷'FVBæÆVæwF‚ÒÒ¢ÒÀ¢&dv×3¢°¢ÖVã¢&÷VæB‡7VÒ‡&dv2’òÖF‚æÖ‚ƒÂ&dv2æÆVæwF‚’’À¢S¢&÷VæB…÷W&6VçF–ÆR‡6÷'FVDv2ÂãR’’À¢“S¢&÷VæB…÷W&6VçF–ÆR‡6÷'FVDv2Âã“R’’À¢““¢&÷VæB…÷W&6VçF–ÆR‡6÷'FVDv2Âã“’’’À¢Öƒ¢&÷VæB‡6÷'FVDv2æÆVæwF‚ò6÷'FVDv5·6÷'FVDv2æÆVæwF‚ÒÒ¢’À¢÷fW#S¢&dv2æf–ÇFW"‚‡‚’Óâ‚âS’æÆVæwF‚À¢÷fW#¢&dv2æf–ÇFW"‚‡‚’Óâ‚â’æÆVæwF‚À¢÷fW##S¢&dv2æf–ÇFW"‚‡‚’Óâ‚â#S’æÆVæwF€¢ÒÀ¢wUVWVS¢°¢F–Ö–æs¢&6ö'6RVWVRç7V&Ö—BÓâöå7V&Ö—GFVEv÷&´FöæR†7–æ6‡&öæ÷W2’"À¢7V&Ö—G3¢÷W&bæwU7V&Ö—G2À¢6×ÆW3¢wUVWVT×2æÆVæwF‚À¢ÖVã¢&÷VæB‡7VÒ†wUVWVT×2’òÖF‚æÖ‚ƒÂwUVWVT×2æÆVæwF‚’’À¢S¢&÷VæB…÷W&6VçF–ÆR‡6÷'FVDwRÂãR’’À¢“S¢&÷VæB…÷W&6VçF–ÆR‡6÷'FVDwRÂã“R’’À¢Öƒ¢&÷VæB‡6÷'FVDwRæÆVæwF‚ò6÷'FVDwU·6÷'FVDwRæÆVæwF‚ÒÒ¢’À¢F–ÖW7F×VW'•7W÷'FVC¢&ööÆVâ†vÆö&ÅF†—2æÖ5vV$wSòåöwUF–Ö–æsòçF–ÖW7F×VW'’¢ÒÀ¢òòF†R7Æ—BF†BFV6–FW2v†W&R÷F–Ö—6F–öâVff÷'B&VÆöæw2à¢†÷7D×5W$g&ÖS¢&÷VæB††÷7D×2òg&ÖW2æÆVæwF‚’À¢¦f×5W$g&ÖS¢&÷VæB‚‡F÷FÄ×2Ò†÷7D×2’òg&ÖW2æÆVæwF‚’À¢†÷7E6†&U7C¢&÷VæB‚††÷7D×2òF÷FÄ×2’¢’À¢'&–FvT6ÆÇ5W$g&ÖS¢ÖF‚ç&÷VæB‡7VÒ†6ÆÄg&ÖW2’òg&ÖW2æÆVæwF‚’À¢òòv†öÆR×'VâF÷FÇ2Â&æ¶VB'’6÷7B&F†W"F†â'’6÷VçBÒÒF†RGvð¢òò÷&FW'2F—6w&VRÂæBF†R6†VÖ'WBÖçVÖW&÷W26ÆÇ2&RF†RG&à¢F÷6ÆÇ4'”×3¢²ââå÷W&bæ6ÆÇ2æVçG&–W2‚•Ð¢ç6÷'B‚†Â"’Óâ%³Òæ×2Ò³Òæ×2¢ç6Æ–6RƒÂ‚¢æÖ‚…¶æÖRÂUÒ’Óâ‡°¢æÖRÀ¢×3¢ÖF‚ç&÷VæB†Ræ×2’À¢ã¢RæâÀ¢W5W$6ÆÃ¢&÷VæB‚†Ræ×2òRæâ’¢¢Ò’¢Ó°¢ÒÀ ¢ò¢ ¢¢&rW"Ög&ÖRF÷FÂö†÷7BÖ–ÆÆ—6V6öæB'&—2f÷"F†R&ö&R†&æW76W2F†@¢¢æVVBF†RF—7G&–'WF–öâ&F†W"F†âW&e&W÷'Bw27VÖÖ'’†ÆöærÖg&ÖP¢¢†÷7B×g2Ô¦f7Æ—B’â&VBÖöæÇ“²&WGW&ç26÷–W2à¢¢ð¢W&dg&ÖW2‡6–æ6Tg&ÖRÒ’°¢–b‚÷W&bæöâ’&WGW&â¶W'&÷#¢'&öf–ÆW"öfc²ÆöBv—F‚öÖ7vV%÷W&cÓ'Ó°¢&WGW&â°¢g&ÖW3¢÷W&bæg&ÖW2ç6Æ–6R‡6–æ6Tg&ÖR’À¢†÷7Dg&ÖW3¢÷W&bæ†÷7Dg&ÖW2ç6Æ–6R‡6–æ6Tg&ÖR’À¢WÆöD'—FW3¢÷W&bçWÆöD'—FW4g&ÖW2ç6Æ–6R‡6–æ6Tg&ÖR’À¢6Æ÷tg&ÖW3¢÷W&bç6Æ÷tg&ÖUWÆöG2À¢Ó°¢ÒÀ ¢&W÷'D¦ff–ÇW&R‡7FvRÂG—RÂÖW76vR’°¢6öç7B7F—fU7FvRÒvÆö&ÅF†—2åõöÖ5vV$Æ7E7FvRÇÂ7FvS°¢6öç7Bf–ÇW&TçVÖ&W"Ò†vÆö&ÅF†—2æÖ5vV$wRåö¦ff–ÇW&T6÷VçBÇÂ’²°¢vÆö&ÅF†—2æÖ5vV$wRåö¦ff–ÇW&T6÷VçBÒf–ÇW&TçVÖ&W#°¢òò6ÖRG&–6²BF†Rf–ÇW&R&÷VæF'’âF†—2—2F†R6F6‚6—FR&F†W"F†à¢òòF†RF‡&÷r6—FRÂ'WBF†Rv6Òg&ÖW2&VÆ÷r—B7F–ÆÂæÖRF†R6ÆÂF€¢òòF†Rg&ÖRV×v2–âv†VâF†R†VvfR÷WBà¢vÆö&ÅF†—2æÖ5vV$wRåöf–Å7F6²Ð¢7G&–ær†æWrW'&÷"‚&f–Â"’ç7F6²ÇÂ""’ç7Æ—B‚%Æâ"’ç6Æ–6RƒÂC“°¢òòF†R'&–FvR6ÆÇ2–ÖÖVF–FVÇ’&V6VF–ærF†Rf–ÇW&RâvV"–ÖvRv—fW2æð¢òò¦f7F6²Â'WBWfW'’uR÷W&F–öâ7&÷76W2F†—2&÷VæF'’Â6òF†RF–À¢òòöbF†—2Æ—7B'&6¶WG2v†FWfW"F†Rg&ÖRV×v2Fö–ærv†Vâ—BF‡&Wrà¢òòf—'7Bf–ÇW&RöæÇ“¢F†Rg&ÖRV×æ÷r7W'f—fW2&Bg&ÖRÂ6òÆFW ¢òòf–ÇW&W2v÷VÆB÷F†W'v—6R÷fW'w&—FRF†RöæRF†B7F'FVBF†R666FRà¢vÆö&ÅF†—2æÖ5vV$wRå÷&V6VçDDf–ÂÇÃÒ÷&V6VçD6ÆÇ2ç6Æ–6R‚Óc“°¢vÆö&ÅF†—2æÖ5vV$wRå÷&V6VçDDÆ7Df–ÂÒ÷&V6VçD6ÆÇ2ç6Æ–6R‚Óc“°¢òò7FvV—2F†R6ÆÆW"w2÷vâÆ&VÂ‚&–çFVw&FVB×6W'fW""Â&g&ÖR×V×"À¢òò(
+b’æBæÖW2F†R7V'7—7FVÒF†B6Vv‡BF†RF‡&÷s²7F—fU7FvV—2öæÇ¢òòF†RÆ7B&öw&W72Ö&¶W"ç–öæR&V6÷&FVBâ¶VW&÷Fƒ¢v—F‚æò¦f7F6°¢òòG&6W2VæFW"vV"–ÖvRÂF†R6ÆÆW"Æ&VÂ—2F†R6–ævÆRÖ÷7BF—&V7B6ÇVP¢òò&÷WBv†W&Rf–ÇW&R6ÖRg&öÒÂæB—BW6VBFò&RG&÷VB†W&Rà¢&V6÷&E7FvR†d”Â6÷W&6SÒG·7FvWÒG¶7F—fU7FvWÒG·G—WÖ“°¢6öç6öÆRæW'&÷"‚%´Ô2Ôd”ÅÒ"Â6÷W&6SÒG·7FvWÖÂ7F—fU7FvRÂG—RÂÖW76vR“°¢–b†f–ÇW&TçVÖ&W"ÓÓÒ’°¢6öç6öÆRæW'&÷"‚%´Ô2Ôd”ÂÕ$T4TåEÒ"ÂvÆö&ÅF†—2æÖ5vV$wRå÷&V6VçDDf–Âæ¦ö–â‚"Â"’“°¢Ð¢Ö&´6ÆÂ‚'&W÷'D¦ff–ÇW&R"Â·6÷W&6S¢7FvRÂ7FvS¢7F—fU7FvRÂG—RÂÖW76vWÒ“°¢6öç7BFWF–ÂÒG·G—WÒG¶ÖW76vRò¢G¶ÖW76vWÖ¢"'Ö°¢6WEFW‡B‚&¦"×7FGW2"Â''VçF–ÖRW'&÷""“°¢6WEFW‡B‚&¦"ÖÖWF†öB"Â7F—fU7FvR“°¢f–ÇW&Ræ†–FFVâÒfÇ6S°¢f–ÇW&RçFW‡D6öçFVçBÒG¶7F—fU7FvWÕÆâG¶FWF–ÇÖ°¢vÆö&ÅF†—2æÖ5vV$wRæÆ7D¦ff–ÇW&RÒ·6÷W&6S¢7FvRÂ7FvS¢7F—fU7FvRÂG—RÂÖW76vWÓ°¢Ð¢Ó° ¢òò6GW&RF†RVçw&VB&VæFW"÷W&F–öç2&Vf÷&RöÖ7vV%÷W&b&WÆ6W2WfW'¢òòV&Æ–2'&–FvRgVæ7F–öâv—F‚F–Ö–ærw&W"â7G&VÒ&WÆ’—2öæR'&–FvP¢òò6ÆÃ²6÷VçF–ær—G2–çFW&æÂ¥2F—7F6†W22FF—F–öæÂ7&÷76–æw2v÷VÆ@¢òò&÷F‚W'GW&"F†R&Væ6†Ö&²æBÆ–R&÷WBF†R&÷VæF'’&VGV7F–öâà¢6öç7B÷&VæFW%75&WÆ’Òö&¦V7Bæg&VW¦R‡°¢VæC¢vÆö&ÅF†—2æÖ5vV$wRç'VæBÀ¢6WE—VÆ–æS¢vÆö&ÅF†—2æÖ5vV$wRç'6WE—VÆ–æRÀ¢&–æEFW‡GW&S¢vÆö&ÅF†—2æÖ5vV$wRç'&–æEFW‡GW&RÀ¢6WEVæ–f÷&Ó¢vÆö&ÅF†—2æÖ5vV$wRç'6WEVæ–f÷&ÒÀ¢6WEfW'FW„'VffW#¢vÆö&ÅF†—2æÖ5vV$wRç'6WEfW'FW„'VffW"À¢6WD–æFW„'VffW#¢vÆö&ÅF†—2æÖ5vV$wRç'6WD–æFW„'VffW"À¢66—76÷#¢vÆö&ÅF†—2æÖ5vV$wRç'66—76÷"À¢F—6&ÆU66—76÷#¢vÆö&ÅF†—2æÖ5vV$wRç'F—6&ÆU66—76÷"À¢G&s¢vÆö&ÅF†—2æÖ5vV$wRç'G&rÀ¢G&t–æFW†VC¢vÆö&ÅF†—2æÖ5vV$wRç'G&t–æFW†VBÀ¢G&t–æF—&V7C¢vÆö&ÅF†—2æÖ5vV$wRç'G&t–æF—&V7BÀ¢G&t–æFW†VD–æF—&V7C¢vÆö&ÅF†—2æÖ5vV$wRç'G&t–æFW†VD–æF—&V7BÀ¢W6„FV'Vtw&÷W¢vÆö&ÅF†—2æÖ5vV$wRç'W6„FV'Vtw&÷WÀ¢÷FV'Vtw&÷W¢vÆö&ÅF†—2æÖ5vV$wRç'÷FV'Vtw&÷W ¢Ò“° ¢6öç7B÷&VæFW$6öÖÖæD†æFÆW'2Òö&¦V7Bæg&VW¦R‡°¢6WE—VÆ–æR††÷7BÂ72Â—VÆ–æR’°¢÷&VæFW%75&WÆ’ç6WE—VÆ–æRæ6ÆÂ††÷7BÂ72Â—VÆ–æR“°¢ÒÀ¢&–æEFW‡GW&R††÷7BÂ72ÂæÖT–BÂf–WrÂ6×ÆW"’°¢6öç7BæÖRÒ&W6öÇfT&–æF–ætæÖR†æÖT–BÂ'&VæFW"FW‡GW&R"“°¢÷&VæFW%75&WÆ’æ&–æEFW‡GW&Ræ6ÆÂ††÷7BÂ72ÂæÖRÂf–WrÂ6×ÆW"“°¢ÒÀ¢6WEVæ–f÷&Ò††÷7BÂ72ÂæÖT–BÂ'VffW"Âöfg6WBÂ6—¦R’°¢6öç7BæÖRÒ&W6öÇfT&–æF–ætæÖR†æÖT–BÂ'&VæFW"Væ–f÷&Ò"“°¢÷&VæFW%75&WÆ’ç6WEVæ–f÷&Òæ6ÆÂ††÷7BÂ72ÂæÖRÂ'VffW"Âöfg6WBÂ6—¦R“°¢ÒÀ¢6WEfW'FW„'VffW"††÷7BÂ72Â6Æ÷BÂ'VffW"Âöfg6WBÂ6—¦R’°¢÷&VæFW%75&WÆ’ç6WEfW'FW„'VffW"æ6ÆÂ††÷7BÂ72Â6Æ÷BÂ'VffW"Âöfg6WBÂ6—¦R“°¢ÒÀ¢6WD–æFW„'VffW"††÷7BÂ72Â'VffW"Âf÷&ÖD6öFR’°¢6öç7Bf÷&ÖBÒf÷&ÖD6öFRÓÓÒò'V–çCb"¢f÷&ÖD6öFRÓÓÒò'V–çC3""¢çVÆÃ°¢–b‚f÷&ÖB’F‡&÷ræWrW'&÷"†Væ¶æ÷vâ&VæFW"–æFW‚f÷&ÖBG¶f÷&ÖD6öFWÖ“°¢÷&VæFW%75&WÆ’ç6WD–æFW„'VffW"æ6ÆÂ††÷7BÂ72Â'VffW"Âf÷&ÖB“°¢ÒÀ¢66—76÷"††÷7BÂ72Â‚Â’Âv–GF‚Â†V–v‡B’°¢÷&VæFW%75&WÆ’ç66—76÷"æ6ÆÂ††÷7BÂ72Â‚Â’Âv–GF‚Â†V–v‡B“°¢ÒÀ¢F—6&ÆU66—76÷"††÷7BÂ72’°¢÷&VæFW%75&WÆ’æF—6&ÆU66—76÷"æ6ÆÂ††÷7BÂ72“°¢ÒÀ¢G&r††÷7BÂ72Âf—'7EfW'FW‚ÂfW'FW„6÷VçBÂ–ç7Fæ6T6÷VçBÂf—'7D–ç7Fæ6R’°¢÷&VæFW%75&WÆ’æG&ræ6ÆÂ€¢†÷7BÂ72Âf—'7EfW'FW‚ÂfW'FW„6÷VçBÂ–ç7Fæ6T6÷VçBÂf—'7D–ç7Fæ6P¢“°¢ÒÀ¢G&t–æFW†VB††÷7BÂ72Â–æFW„6÷VçBÂ–ç7Fæ6T6÷VçBÂf—'7D–æFW‚Â&6UfW'FW‚Âf—'7D–ç7Fæ6R’°¢÷&VæFW%75&WÆ’æG&t–æFW†VBæ6ÆÂ€¢†÷7BÂ72Â–æFW„6÷VçBÂ–ç7Fæ6T6÷VçBÂf—'7D–æFW‚Â&6UfW'FW‚Âf—'7D–ç7Fæ6P¢“°¢ÒÀ¢G&t–æF—&V7B††÷7BÂ72Â'VffW"Âöfg6WBÂG&t6÷VçB’°¢÷&VæFW%75&WÆ’æG&t–æF—&V7Bæ6ÆÂ††÷7BÂ72Â'VffW"Âöfg6WBÂG&t6÷VçB“°¢ÒÀ¢G&t–æFW†VD–æF—&V7B††÷7BÂ72Â'VffW"Âöfg6WBÂG&t6÷VçB’°¢÷&VæFW%75&WÆ’æG&t–æFW†VD–æF—&V7Bæ6ÆÂ††÷7BÂ72Â'VffW"Âöfg6WBÂG&t6÷VçB“°¢ÒÀ¢W6„FV'Vtw&÷W††÷7BÂ72ÂÆ&VÄ–B’°¢6öç7BÆ&VÂÒ†÷7Båö&–æF–ætæÖW3òå¶Æ&VÄ–EÓ°¢–b‡G—VöbÆ&VÂÓÒ'7G&–ær"’F‡&÷ræWrW'&÷"†Væ¶æ÷vâ&VæFW"FV'VrÆ&VÂG¶Æ&VÄ–GÖ“°¢÷&VæFW%75&WÆ’çW6„FV'Vtw&÷Wæ6ÆÂ††÷7BÂ72ÂÆ&VÂ“°¢ÒÀ¢÷FV'Vtw&÷W††÷7BÂ72’°¢÷&VæFW%75&WÆ’ç÷FV'Vtw&÷Wæ6ÆÂ††÷7BÂ72“°¢Ð¢Ò“° ¢gVæ7F–öâ&WÆ•&VæFW%746öÖÖæG2€¢†÷7BÂ74†æFÆRÂ–ÆöBÂ'—FTÆVæwF‚ÂVæBÂG&ç7÷'BÂ&uv÷&E&VFW ¢’°¢ÆWB&WÆ––ærÒfÇ6S°¢G'’°¢–b‚çVÖ&W"æ—4–çFVvW"†'—FTÆVæwF‚’ÇÂ'—FTÆVæwF‚ÂÇÂ†'—FTÆVæwF‚b2’ÓÒ’°¢F‡&÷ræWr&ævTW'&÷"†–çfÆ–B&VæFW"6öÖÖæB'—FRÆVæwF‚G¶'—FTÆVæwF‡Ö“°¢Ð¢6öç7B&÷Fö6öÂÒvÆö&ÅF†—2æÖ5vV%&VæFW$6öÖÖæG3°¢–b‚&÷Fö6öÂ’F‡&÷ræWrW'&÷"‚'&VæFW"6öÖÖæB7G&VÒFV6öFW"—2Væf–Æ&ÆR"“°¢6öç7B7FG2Ò†F–væ÷7F–72ç&VæFW$6öÖÖæG2ÇÃÒ°¢7G&V×3¢Â'—FW3¢ÂÖ„'—FW3¢ÂV×G“¢À¢ÆScC¢ÂÆS#Sc¢ÂÆS#C¢Â÷fW##C¢ ¢Ò“°¢7FG2ç7G&V×2²³°¢7FG2æ'—FW2³Ò'—FTÆVæwFƒ°¢7FG2æÖ„'—FW2ÒÖF‚æÖ‚‡7FG2æÖ„'—FW2Â'—FTÆVæwF‚“°¢–b†'—FTÆVæwF‚ÓÓÒ’7FG2æV×G’²³°¢VÇ6R–b†'—FTÆVæwF‚ÃÒcB’7FG2æÆScB²³°¢VÇ6R–b†'—FTÆVæwF‚ÃÒ#Sb’7FG2æÆS#Sb²³°¢VÇ6R–b†'—FTÆVæwF‚ÃÒ#B’7FG2æÆS#B²³°¢VÇ6R7FG2æ÷fW##B²³°¢Ö&´6ÆÂ‚''6öÖÖæE7G&VÒ"Â·74†æFÆRÂ'—FTÆVæwF‚ÂVæC¢&ööÆVâ†VæB—Ò“°¢÷&VæFW$6öÖÖæE&WÆ”FWF‚²³°¢&WÆ––ærÒG'VS°¢ÆWB6÷VçC°¢–b‡G&ç7÷'BÓÓÒ'v6Öv2×&VFW""’°¢–b‡G—Vöb&÷Fö6öÂç&WÆ•&VFW"ÓÒ&gVæ7F–öâ"’°¢F‡&÷ræWrW'&÷"‚'&rv6Ôt2&VæFW"6öÖÖæBFV6öFW"—2Væf–Æ&ÆR"“°¢Ð¢6÷VçBÒ&÷Fö6öÂç&WÆ•&VFW"€¢–ÆöBÂ'—FTÆVæwF‚ããâ"Â&uv÷&E&VFW"À¢÷&VæFW$6öÖÖæD†æFÆW'2Â†÷7BÂ74†æFÆP¢“°¢ÒVÇ6R–b‡G&ç7÷'BÓÓÒ'6¶VB×FW‡B"’°¢–b‡G—Vöb&÷Fö6öÂç&WÆ•FW‡BÓÒ&gVæ7F–öâ"’°¢F‡&÷ræWrW'&÷"‚'6¶VB&VæFW"6öÖÖæBFV6öFW"—2Væf–Æ&ÆR"“°¢Ð¢6÷VçBÒ&÷Fö6öÂç&WÆ•FW‡B€¢–ÆöBÂ'—FTÆVæwF‚ããâ"Â÷&VæFW$6öÖÖæD†æFÆW'2Â†÷7BÂ74†æFÆP¢“°¢ÒVÇ6R°¢6öç7B'—FW2ÒG&ç7÷'BÓÓÒ&&6ScB"ò&6ScEFô'—FW2‡–ÆöB’¢–ÆöC°¢–b‡G&ç7÷'BÓÓÒ&&6ScB"bb'—FW2æ'—FTÆVæwF‚ÓÒ'—FTÆVæwF‚’°¢F‡&÷ræWrW'&÷"€¢&VæFW"6öÖÖæB&6ScBÆVæwF‚Ö—6ÖF6ƒ¢G¶'—FW2æ'—FTÆVæwF‡ÒÒG¶'—FTÆVæwF‡Ö ¢“°¢Ð¢6÷VçBÒ&÷Fö6öÂç&WÆ’€¢'—FW2Â'—FTÆVæwF‚Â÷&VæFW$6öÖÖæD†æFÆW'2Â†÷7BÂ74†æFÆP¢“°¢Ð¢–b†VæB’÷&VæFW%75&WÆ’æVæBæ6ÆÂ††÷7BÂ74†æFÆR“°¢&WGW&â6÷VçC°¢Ò6F6‚†W'&÷"’°¢òòf–ÆVB6VvÖVçB—2æ÷B&V6÷fW&&ÆRÂWfVâv†Vâ—Bv2fÇW6†VBf÷"¢òòF–ÖW7F×&F†W"F†â72VæBâæWfW"7G&æBâ÷Vâ72Væ6öFW"à¢–b†ö&¦V7G2æ†2‡74†æFÆR’’°¢G'’°¢÷&VæFW%75&WÆ’æVæBæ6ÆÂ††÷7BÂ74†æFÆR“°¢Ò6F6‚…ö6ÆVçWW'&÷"’°¢ö&¦V7G2æFVÆWFR‡74†æFÆR“°¢Ð¢Ð¢F‡&÷rW'&÷#°¢Òf–æÆÇ’°¢–b‡&WÆ––ær’÷&VæFW$6öÖÖæE&WÆ”FWF‚ÒÓ°¢Ð¢Ð ¢FDWfVçDÆ—7FVæW"‚&W'&÷""Â†WfVçB’Óâf–Â†WfVçBæW'&÷"ÇÂWfVçBæÖW76vR’“°¢FDWfVçDÆ—7FVæW"‚'Væ†æFÆVG&V¦V7F–öâ"Â†WfVçB’Óâf–Â†WfVçBç&V6öâ’“° ¢vÆö&ÅF†—2æÖ5vV%6W'fW"ÒvÆö&ÅF†—2æÖ5vV%6W'fW"ÇÂ‚‚’Óâ°¢ÆWBv÷&¶W"ÒçVÆÃ°¢ÆWBG&ç7÷'BÒçVÆÃ°¢ÆWB7FFRÒ&–FÆR#°¢ÆWB7FGW4ÆörÒµÓ°¢ò¢¢–æ&÷VæBg&ÖW2v—F–ærG&–å6¶WG3cB‚“²6VRF†R6öÖÖVçB–âöå6¶WBâ¢ð¢6öç7B–æ&÷VæEVWVRÒµÓ°¢ÆWB–æ&÷VæEVWVT'—FW2Ò°¢ò¢¢V²VWVRFWF‚6–æ6RF†RÆ7B–æfò‚’&VB(	BF†R'W'7BWf–FVæ6R¢¢ö–çB6×ÆRÖ—76W3¢2Óä26¶WG2'&—f–ærf7FW"F†âF†R6Æ–Vç@¢¢G&–ç2F†VÒ†÷"–â'W'7G2gFW"6W'fW"7FÆÂ’â¢ð¢ÆWB–æ&÷VæEVWVUV²Ò°¢ÆWB6¶WD†æFÆW"ÒçVÆÃ°¢ÆWB6¶WD†æFÆW#cBÒçVÆÃ°¢ÆWBF–6´6÷VçBÒ°¢ÆWBÆ7DW'&÷"ÒçVÆÃ°¢ÆWB6W'fW%7FvW2ÒµÓ°¢ò¢ ¢¢6fVBv÷&ÆG26†—VB&6²'’F†Rv÷&¶W"ÂöÆFW7Bf—'7BâVWVR&F†W"F†à¢¢6Æ÷B&V6W6RGvò'&—fRW"v÷&ÆB(	BF†R6ÖÆÂ÷Væ&ÆR6WB26ööâ2F†P¢¢v÷&ÆB—2&VG’ÂF†VâF†RgVÆÂF—&V7F÷'’öâW†—B(	BæBG&÷–ærF†Rf—'7@¢¢v÷VÆBWB&6²W†7FÇ’F†Rf–ÇW&RF†RV&Ç’öæRW†—7G2Fò&WfVçBà¢¢ð¢6öç7Bv÷&ÆE6æ6†÷G2ÒµÓ°¢ÆWB6W'fW$ÆöE&öw&W72ÒµÓ°¢ÆWB6W'fW$ÆöE&öw&W746÷VçBÒ°¢ò¢¢w&–Bg&ÖW27G&VÒv†–ÆRF†RÆöF–ær67&VVâ—2W²F†R6Æ–VçBG&–ç2F†P¢¢VWVRWfW'’g&ÖRÂ6òF†—26÷VçFW"—2F†RGW&&ÆRWf–FVæ6Röb7G&VÖ–ærâ¢ð¢ÆWB6W'fW$w&–Dg&ÖW2Ò°¢ò¢¢6W'fW"V×F–Ö–ærg&öÒF†Rv÷&¶W"‡V××7FG2’ÂÇv—2&V6÷&FVC ¢¢W"×V×Ö6ÆÂ¶GW&F–öä×2Âv6–æ6U&Wf–÷W57F'D×5ÒâF†RFVÆ’&ö&P¢¢&VG2F†—2F‡&÷Vv‚–æfò‚“²F†Rg&ÖRw&‚&VæFW'2—Bv†VâVæ&ÆVBâ¢ð¢6öç7BV×7FG2ÒµÓ°¢ò¢¢6Æ÷r×F–6²GG&–'WF–öâÖ&¶W'2ÂæWfW"Wf–7FVB‡F†R6W'fW%7FvW2&–æp¢¢—2#VçG&–W2æBfÆööG2GW&–ærv÷&ÆFvVâ’â¢ð¢ò¢¢GW&&ÆR6W'fW"×&VÆÒWgC¢ÆörâF†R6Æ–VçB&VÆÒw2Ö5vV$WgD6÷VçG0¢¢6ææ÷B6VRv†BF†R6W'fW"&V6V—fVB÷"6VçC²6öÖ&BGG&–'WF–öà¢¢æVVG2&÷F‚6–FW2öbF†Rv—&RâæWfW"Wf–7FVBâ¢ð¢6öç7B6W'fW$WgDÆörÒµÓ°¢6öç7B6Æ÷uF–6´ÆörÒµÓ° ¢6öç7B7FGW2Ò‡2’Óâ°¢7FFRÒ3°¢7FGW4ÆörçW6‚‡²C¢W&f÷&Öæ6Rææ÷r‚’Â2Ò“°¢Ö&µ†6R†6W'fW"ÒGµ7G&–ær‡2’çFôÆ÷vW$66R‚’ç&WÆ6R‚õµæ×£Ó’åó¢ÕÒörÂ"Ò"’ç6Æ–6RƒÂcB—Ö“°¢6öç6öÆRæÆör‚%¶Ö7vV"×6W'fW%Ò"Â2“°¢Ó° ¢7–æ2gVæ7F–öâÆVæ6‚†–ÖvTæÖR’°¢òò&WÆ6Rç’&Wf–÷W2v÷&¶W"†W&R&F†W"F†âÖ¶–ærF†R6ÆÆW"7F÷‚¢òòf—'7Bâ6W&FR7F÷‚’ÆVfW2F†R7FFRB'7F÷VB"VçF–ÂF†—0¢òògVæ7F–öâw2f—'7Bv—B&W6öÇfW2ÂæBF†R6Æ–VçB&VG2F†B2¢òòFW&Ö–æÂ6W'fW"f–ÇW&RæB&æFöç2F†Rv÷&ÆB—B—27F'F–ærà¢–b‡v÷&¶W"’°¢G'’²v÷&¶W"çFW&Ö–æFR‚“²Ò6F6‚²ò¢Ç&VG’vöæR¢òÐ¢v÷&¶W"ÒçVÆÃ°¢Ð¢–b‡G&ç7÷'B’°¢G'’²G&ç7÷'Bæ6Æ÷6R‚“²Ò6F6‚²ò¢Ç&VG’6Æ÷6VB¢òÐ¢G&ç7÷'BÒçVÆÃ°¢Ð¢–æ&÷VæEVWVRæÆVæwF‚Ò°¢–æ&÷VæEVWVT'—FW2Ò°¢v÷&ÆE6æ6†÷G2æÆVæwF‚Ò°¢7FGW2‚&ÆVæ6†–ær"“° ¢òòF†RV&Æ–2ÆVæ6†W"†2öæRvVæW&FVB'VçF–ÖR—"â¶VWF†R6W'fW ¢òòv÷&¶W"–ææVBFòF†B6ÖR6æöæ–6Â–ÖvS²W‡W&–ÖVçFÂ–ÖvRVW'¢òò&÷WFW2&R–çFVçF–öæÆÇ’æ÷B'BöbF†—2F—7G&–'WF–öâà¢6öç7B6W'fW$–ÖvRÒ&Ö–æV7&gBÖ6Æ–VçB#°¢6öç6öÆRæÆör†¶Ö7vV"×6W'fW%Òv÷&¶W"–ÖvRG·6W'fW$–ÖvWÖ“° ¢6öç7B'VçF–ÖU&Vf—‚ÒvÆö&ÅF†—2æÖ5vV%'VçF–ÖU&Vf—‚ÇÂ"ò#°¢6öç7B²6¶WEG&ç7÷'BÒÒv—B–×÷'B†G·'VçF–ÖU&Vf—‡×6¶WB×G&ç7÷'Bæ§3÷cÓ##cƒrÖ&F6ƒ“°¢6öç7B6†ææVÂÒæWrÖW76vT6†ææVÂ‚“°¢6öç7B÷'BÒ6†ææVÂç÷'C°¢6öç7Bv÷&¶W%÷'BÒ6†ææVÂç÷'C#°¢6W'fW$ÆöE&öw&W72ÒµÓ°¢6W'fW$ÆöE&öw&W746÷VçBÒ° ¢G&ç7÷'BÒæWr6¶WEG&ç7÷'B‡÷'BÂ†×6r’Óâ°¢–b†×6rçG—RÓÓÒ'7FGW2"’°¢7FGW2†×6rç7FGW2“°¢ÒVÇ6R–b†×6rçG—RÓÓÒ'&VG’"’°¢7FGW2‚'&VG’"“°¢ÒVÇ6R–b†×6rçG—RÓÓÒ&W'&÷""’°¢Æ7DW'&÷"Ò×6ræÖW76vS°¢7FGW2‚&W'&÷""“°¢6öç6öÆRæW'&÷"‚%¶Ö7vV"×6W'fW%Òv÷&¶W"W'&÷#¢"Â×6ræÖW76vR“°¢ÒVÇ6R–b†×6rçG—RÓÓÒ'F–6²"’°¢F–6´6÷VçBÒ×6ræ6÷VçC°¢ÒVÇ6R–b†×6rçG—RÓÓÒ'6W'fW"×7FvR"’°¢6W'fW%7FvW2çW6‚†×6rç7FvR“°¢–b‡G—Vöb×6rç7FvRÓÓÒ'7G&–ær"bb×6rç7FvRç7F'G5v—F‚‚'V×6Æ÷s¢"’’°¢6Æ÷uF–6´ÆörçW6‚†×6rç7FvR“°¢–b‡6Æ÷uF–6´ÆöræÆVæwF‚âC’6Æ÷uF–6´Æörç6†–gB‚“°¢Ð¢–b‡G—Vöb×6rç7FvRÓÓÒ'7G&–ær"bb×6rç7FvRç7F'G5v—F‚‚&WgC¢"¢bb×6rç7FvRæ–æ6ÇVFW2‚$2Óå2"’’°¢òòöæÇ’6Æ–VçB×Fò×6W'fW"6¶WG3¢F†W6R&RF†R&&RÆ–W"Ö–çW@¢òò6¶WG2†GF6·2Â7F–öç2Â6öÖÖæG2’â6W'fW"×FòÖ6Æ–VçBÖ&¶W'0¢òòfÆööBBVçF—G’ÖÖ÷F–öâ&FW2æBv÷VÆBWf–7BF†R–çWBWfVçG0¢òòF†B6öÖ&BGG&–'WF–öâæVVG2à¢6W'fW$WgDÆörçW6‚†×6rç7FvR²""²ÖF‚ç&÷VæB‡W&f÷&Öæ6Rææ÷r‚’’“°¢–b‡6W'fW$WgDÆöræÆVæwF‚âS’6W'fW$WgDÆörç6†–gB‚“°¢Ð¢–b‡6W'fW%7FvW2æÆVæwF‚â#’6W'fW%7FvW2ç6†–gB‚“°¢ÒVÇ6R–b†×6rçG—RÓÓÒ'6W'fW"ÖÆöB×&öw&W72"’°¢6öç7BÖW76vRÒ7G&–ær†×6ræÖW76vRÇÂ""“°¢6W'fW$ÆöE&öw&W72çW6‚†ÖW76vR“°¢6W'fW$ÆöE&öw&W746÷VçB²³°¢–b†ÖW76vRç7F'G5v—F‚‚&w&–B"’’6W'fW$w&–Dg&ÖW2²³°¢–b‡6W'fW$ÆöE&öw&W746÷VçBÃÒBÇÂ‡6W'fW$ÆöE&öw&W746÷VçBbƒ4b’ÓÓÒ’°¢6öç6öÆRæÆör‚%¶Ö7vV"×6W'fW%ÒÆöB×&öw&W72"ÂãÒG·6W'fW$ÆöE&öw&W746÷VçGÖÂÖW76vR“°¢Ð¢–b‡6W'fW$ÆöE&öw&W72æÆVæwF‚â#Sb’6W'fW$ÆöE&öw&W72ç6†–gB‚“°¢ÒVÇ6R–b†×6rçG—RÓÓÒ'V××7FG2"’°¢f÷"†6öç7B—"öb†×6rç6×ÆW2ÇÂµÒ’’V×7FG2çW6‚‡—"“°¢–b‡V×7FG2æÆVæwF‚â#’V×7FG2ç7Æ–6RƒÂV×7FG2æÆVæwF‚Ò#“°¢ög&ÖTw&‚çW6…6W'fW"†×6rç6×ÆW2ÇÂµÒ“°¢ÒVÇ6R–b†×6rçG—RÓÓÒ'v÷&ÆB×6æ6†÷B"’°¢òòF†R6fVBv÷&ÆB6öÖ–ær†öÖRâVWVVBVçF–ÂF†R6Æ–VçBw2¦f6–FP¢òòG&–ç2—B–â6öç7VÖUv÷&ÆE6æ6†÷B‚“²""ÖVç2F†Rv÷&¶W"†@¢òòæ÷F†–ærFò6VæBà¢6öç7B6æ6†÷BÒ7G&–ær†×6ræ§6öâóò""“°¢v÷&ÆE6æ6†÷G2çW6‚‡6æ6†÷B“°¢òòF†R¦f6Æ–VçB7F–ÆÂ6öç7VÖW2æBÆ–W2F†—2W†7B6æ6†÷BFð¢òò—G2–âÖÖVÖ÷'’6fW2F—&V7F÷'’âW'6—7BF†RÇ&VG’×6W&–Æ—6VB6÷¢òòBF†RvR&÷VæF'’2vVÆÂ6ò&VÆöB6â&V'V–ÆBF†BF—&V7F÷'’à¢–b‡6æ6†÷B’vÆö&ÅF†—2æÖ5vV%7F÷&vSòç7F÷&Uv÷&ÆE6æ6†÷Còâ‡6æ6†÷B“°¢6öç6öÆRæÆör†¶Ö7vV"×6W'fW%Òv÷&ÆB6æ6†÷BG·6æ6†÷BæÆVæwF‡Ò6†'6“°¢Ð¢Ò“°¢G&ç7÷'Bæöå6¶WB‚†'—FW2’Óâ°¢–b‡6¶WD†æFÆW"’6¶WD†æFÆW"†'—FW2“°¢–b‡6¶WD†æFÆW#cB’²6¶WD†æFÆW#cB†'—FW5Fô&6ScB†'—FW2’“²&WGW&ã²Ð¢–æ&÷VæEVWVRçW6‚†'—FW2“°¢–æ&÷VæEVWVT'—FW2³Ò'—FW2æÆVæwF‚²C°¢–b†–æ&÷VæEVWVRæÆVæwF‚â–æ&÷VæEVWVUV²’–æ&÷VæEVWVUV²Ò–æ&÷VæEVWVRæÆVæwFƒ°¢Ò“° ¢v÷&¶W"ÒæWrv÷&¶W"†G·'VçF–ÖU&Vf—‡×6W'fW"×v÷&¶W"æ§3÷cÓ##cƒÖ7GVÇF–6·3“°¢v÷&¶W"æöæW'&÷"Ò†R’Óâ°¢Æ7DW'&÷"ÒRæÖW76vS°¢7FGW2‚'v÷&¶W"ÖW'&÷""“°¢6öç6öÆRæW'&÷"‚%¶Ö7vV"×6W'fW%Òv÷&¶W"öæW'&÷#¢"ÂRæÖW76vR“°¢Ó° ¢6öç7Bv6ÕF‚ÒG·'VçF–ÖU&Vf—‡Öw&ÂòG·6W'fW$–ÖvRÇÂ&Ö–æV7&gBÖ6Æ–VçB'Òæ§2çv6Ö°¢6öç7B'VçF–ÖTÖæ–fW7BÒvÆö&ÅF†—2æÖ5vV$FWe'VçF–ÖTÖæ–fW7C°¢6öç7BÆöFW$VçG'’Ò'VçF–ÖTÖæ–fW7Còæf–ÆW3òæf–æB‚†VçG'’’ÓâVçG'“òææÖRÓÓÒ&Ö–æV7&gBÖ6Æ–VçBæ§2"“°¢v÷&¶W"ç÷7DÖW76vR‡°¢G—S¢&–æ—B"À¢÷'C¢v÷&¶W%÷'BÀ¢v6ÕF‚À¢ÆöFW%6†#Sc¢ÆöFW$VçG'“òç6†#SbÀ¢ÆöFW$'—FW3¢ÆöFW$VçG'“òæ'—FW2À¢ÒÂ·v÷&¶W%÷'EÒ“° ¢&WGW&â²ö³¢G'VRÓ°¢Ð ¢gVæ7F–öâ7F÷‚’°¢–b‡v÷&¶W"’°¢v÷&¶W"çFW&Ö–æFR‚“°¢v÷&¶W"ÒçVÆÃ°¢Ð¢–b‡G&ç7÷'B’°¢G&ç7÷'Bæ6Æ÷6R‚“°¢G&ç7÷'BÒçVÆÃ°¢Ð¢6W'fW$ÆöE&öw&W72ÒµÓ°¢6W'fW$ÆöE&öw&W746÷VçBÒ°¢6W'fW$w&–Dg&ÖW2Ò°¢7FGW2‚'7F÷VB"“°¢Ð ¢gVæ7F–öâ6öç7VÖTÆöE&öw&W72‚’°¢6öç7B&F6‚Ò6W'fW$ÆöE&öw&W73°¢6W'fW$ÆöE&öw&W72ÒµÓ°¢&WGW&â&F6‚æ¦ö–â‚%Æâ"“°¢Ð ¢ò¢ ¢¢†æG2F†RVæF–ær6fVBv÷&ÆBFòF†R6Æ–VçBw2¦f6–FRW†7FÇ’öæ6Rà¢¢&WGW&ç2çVÆÂv†–ÆRæ÷F†–ær†2'&—fVBÂ6òF†R6ÆÆW"6âF—7F–æwV—6€¢¢'7F–ÆÂv—F–ær"g&öÒF†Rv÷&¶W"w2V×G’&æ÷F†–ærFò6VæB"ç7vW"à¢¢ð¢gVæ7F–öâ6öç7VÖUv÷&ÆE6æ6†÷B‚’°¢&WGW&âv÷&ÆE6æ6†÷G2æÆVæwF‚òv÷&ÆE6æ6†÷G2ç6†–gB‚’¢çVÆÃ°¢Ð ¢gVæ7F–öâ7F'Ev÷&ÆB†6öÖÖæD§6öâ’°¢–b‚G&ç7÷'BÇÂ7FFRÓÒ'&VG’"’°¢&WGW&â²W'&÷#¢6W'fW"v÷&¶W"—2æ÷B&VG’‚G·7FFWÒ–Ó°¢Ð¢òò6æ6†÷Bg&öÒF†R&Wf–÷W2v÷&ÆB×W7BæWfW"&RÆ–VB÷fW"F†RöæP¢òò7F'F–æræ÷r(	BF†R6Æ–VçB†2Ç&VG’6†—VB—G2f–ÆW2à¢v÷&ÆE6æ6†÷G2æÆVæwF‚Ò°¢7FGW2‚'v÷&ÆB×7F'F–ær"“°¢G&ç7÷'Bç6VæD6öçG&öÂ‡²G—S¢&6öÖÖæB"Â§6öã¢6öÖÖæD§6öâÒ“°¢&WGW&â²ö³¢G'VRÓ°¢Ð ¢ò¢ ¢¢6Æ–VçBÓâ6W'fW"6öçG&öÂ×ÆæRW6‚â'v÷&ÆBÖVçFW&VB"fÆ—2F†Rv÷&¶W ¢¢6W'fW"g&öÒ66VÆW&FVBv÷&ÆBÖÆöB6–ær–çFòF†Ræ÷&ÖÂ#E2Æö÷à¢¢ð¢gVæ7F–öâ6VæE7FFR‡7FFR’°¢–b‡G&ç7÷'Bbbv÷&¶W"’G&ç7÷'Bç6VæD6öçG&öÂ‡²G—S¢'7FFR"Â7FFS¢7G&–ær‡7FFR’Ò“°¢Ð ¢gVæ7F–öâ6VæE6¶WB†'—FW2’°¢–b‡G&ç7÷'Bbbv÷&¶W"bb7FFRÓÒ&W'&÷""bb7FFRÓÒ'v÷&¶W"ÖW'&÷""’°¢G&ç7÷'Bç6VæB†'—FW2“°¢Ð¢Ð ¢gVæ7F–öâ6VæE6¶WCcB†&6ScB’°¢–b‡G&ç7÷'Bbbv÷&¶W"bb7FFRÓÒ&W'&÷""bb7FFRÓÒ'v÷&¶W"ÖW'&÷""’°¢G&ç7÷'Bç6VæB†&6ScEFô'—FW2†&6ScB’“°¢Ð¢Ð ¢gVæ7F–öâöå6¶WB††æFÆW"’°¢6¶WD†æFÆW"Ò†æFÆW#°¢Ð ¢gVæ7F–öâöå6¶WCcB††æFÆW"’°¢6¶WD†æFÆW#cBÒ†æFÆW#°¢Ð ¢gVæ7F–öâ'—FW5Fô&6ScB†'—FW2’°¢–b‡G—Vöb'—FW2çFô&6ScBÓÓÒ&gVæ7F–öâ"’&WGW&â'—FW2çFô&6ScB‚“°¢ÆWB&–æ'’Ò"#°¢f÷"†ÆWBöfg6WBÒ²öfg6WBÂ'—FW2æÆVæwFƒ²öfg6WB³Òƒƒ’°¢&–æ'’³Ò7G&–æræg&öÔ6†$6öFR‚ââæ'—FW2ç7V&'&’†öfg6WBÂöfg6WB²ƒƒ’“°¢Ð¢&WGW&â'Fö†&–æ'’“°¢Ð ¢ò¢ ¢¢†æG2F†R6Æ–VçBWfW'’6¶WBVWVVB6–æ6RF†RÆ7B6ÆÂÂ2öæR&6Sc@¢¢&Æö"öbBÖ'—FRÖ&–rÖVæF–âÖÆVæwF‚×&Vf—†VBg&ÖW2à¢ ¢¢öæR7&÷76–æræBöæR&6ScBFV6öFRW"g&ÖR–ç7FVBöbW"6¶WBâF†P¢¢g&Ö–ær—2W‡Æ–6—B&V6W6R6öæ6FVæF–ær&6ScB7G&–æw2v÷VÆBf÷&6RF†P¢¢6Æ–VçBFòFV6öFRV6‚öæR6W&FVÇ’Âv†–6‚—2F†R6÷7B&V–ær&VÖ÷fVBà¢¢ð¢gVæ7F–öâG&–å6¶WG3cB‚’°¢–b†–æ&÷VæEVWVRæÆVæwF‚ÓÓÒ’&WGW&â"#°¢6öç7B&Æö"ÒæWrV–çC„'&’†–æ&÷VæEVWVT'—FW2“°¢ÆWBöfg6WBÒ°¢f÷"†6öç7B'—FW2öb–æ&÷VæEVWVR’°¢6öç7BÆVæwF‚Ò'—FW2æÆVæwFƒ°¢&Æö%¶öfg6WB²µÒÒ†ÆVæwF‚ããâ#B’b†fc°¢&Æö%¶öfg6WB²µÒÒ†ÆVæwF‚ããâb’b†fc°¢&Æö%¶öfg6WB²µÒÒ†ÆVæwF‚ããâ‚’b†fc°¢&Æö%¶öfg6WB²µÒÒÆVæwF‚b†fc°¢&Æö"ç6WB†'—FW2Âöfg6WB“°¢öfg6WB³ÒÆVæwFƒ°¢Ð¢–æ&÷VæEVWVRæÆVæwF‚Ò°¢–æ&÷VæEVWVT'—FW2Ò°¢&WGW&â'—FW5Fô&6ScB†&Æö"“°¢Ð ¢gVæ7F–öâ–æfò‚’°¢6öç7BV²Ò–æ&÷VæEVWVUV³°¢–æ&÷VæEVWVUV²Ò°¢&WGW&â°¢7FFRÀ¢F–6´6÷VçBÀ¢–æ&÷VæEVWVVC¢–æ&÷VæEVWVRæÆVæwF‚À¢–æ&÷VæEVWVUV³¢V²À¢Æ7DW'&÷"À¢7FGW4Æös¢7FGW4Æörç6Æ–6R‚Ó#’À¢6W'fW%7FvW3¢6W'fW%7FvW2ç6Æ–6R‚Óƒ’À¢6W'fW$ÆöE&öw&W73¢6W'fW$ÆöE&öw&W72ç6Æ–6R‚Óƒ’À¢6W'fW$ÆöE&öw&W746÷VçBÀ¢6W'fW$w&–Dg&ÖW2À¢V×7FG3¢V×7FG2ç6Æ–6R‚Óc’À¢6W'fW$WgG3¢6W'fW$WgDÆörç6Æ–6R‚Ó#’À¢6Æ÷uF–6·3¢6Æ÷uF–6´Æörç6Æ–6R‚Ó’À¢Ó°¢Ð ¢&WGW&â°¢ÆVæ6‚Â7F'Ev÷&ÆBÂ7F÷Â6VæE6¶WBÂ6VæE6¶WCcBÂ6VæE7FFRÀ¢öå6¶WBÂöå6¶WCcBÂG&–å6¶WG3cBÂ6öç7VÖTÆöE&öw&W72À¢6öç7VÖUv÷&ÆE6æ6†÷BÂ–æfð¢Ó°¢Ò’‚“° ¢ò¢ ¢¢v—G2f÷"öæR–çFVBg&ÖRÂ÷"f÷"'VFvWD×6Âv†–6†WfW"6öÖW2f—'7Bà¢ ¢¢æ÷F†–æröâF†R&ö÷BF‚Ö’&Æö6²öââæ–ÖF–öâg&ÖRâæ–ÖF–öâg&ÖW0¢¢&R&VæFW&–ær6÷W'FW7’F†R'&÷w6W"6âv—F††öÆB(	B†–FFVâF"Âà¢¢ö66ÇVFVBv–æF÷rÂ&6¶w&÷VæFVB&ö6W72(	BæBWfW'’6V6öæBöbF†Bv—B—0¢¢6V6öæBF†RvÖR—2æ÷B7F'F–ærf÷"Æ–W"v†ò—26—GF–ærF†W&P¢¢vF6†–ær—Bà¢¢ð¢gVæ7F–öâ–çD÷$v—fUW†'VFvWD×2’°¢&WGW&âæWr&öÖ—6R‚‡&W6öÇfR’Óâ°¢ÆWB6WGFÆVBÒfÇ6S°¢6öç7Bf–æ—6‚Ò‚’Óâ°¢–b‡6WGFÆVB’&WGW&ã°¢6WGFÆVBÒG'VS°¢&W6öÇfR‚“°¢Ó°¢&WVW7Dæ–ÖF–öäg&ÖR‚‚’Óâ&WVW7Dæ–ÖF–öäg&ÖR†f–æ—6‚’“°¢6WEF–ÖV÷WB†f–æ—6‚Â'VFvWD×2“°¢Ò“°¢Ð ¢òò6öÖR6‡&öÖ—VÒôæG&ö–B6öçFW‡G2W‡÷6Ræf–vF÷"æwRv†–ÆRF†V— ¢òò†–v‚×W&f÷&Öæ6RFFW"&WVW7B—2f–ÇFW&VB÷WB'’F†R'&÷w6W"w2÷vW ¢òòöÆ–7’âçVÆÂ&W7VÇBf÷"F†B&VfW&Væ6RFöW2æ÷B&÷fRF†BvV$uR—0¢òòVæf–Æ&ÆS¢&WG'’F†RæWWG&Â&WVW7BÂF†VâÆ÷r×÷vW"ÂæBW6RF†Rf—'7@¢òòFFW"F†R'&÷w6W"7GVÆÇ’öffW'2âF†R6VÆV7FVBFFW"—2&WVW7FVBöæÇ¢òòöæ6RÂ6òF†RfÆÆ&6²6ææ÷B7&VFRGvò'VçF–ÖW2÷"FWf–6W2à¢7–æ2gVæ7F–öâ&WVW7D6ö×F–&ÆTFFW"†wR’°¢6öç7BGFV×G2Ò°¢²Æ&VÃ¢&†–v‚×W&f÷&Öæ6R"Â÷F–öç3¢·÷vW%&VfW&Væ6S¢&†–v‚×W&f÷&Öæ6R'ÒÒÀ¢²Æ&VÃ¢&FVfVÇB"Â÷F–öç3¢·ÒÒÀ¢²Æ&VÃ¢&Æ÷r×÷vW""Â÷F–öç3¢·÷vW%&VfW&Væ6S¢&Æ÷r×÷vW"'ÒÒÀ¢Ó°¢6öç7B&ö&RÒ°¢6V7W&T6öçFW‡C¢&ööÆVâ†vÆö&ÅF†—2æ—56V7W&T6öçFW‡B’À¢W6W$vVçC¢7G&–ær†vÆö&ÅF†—2ææf–vF÷#òçW6W$vVçBÇÂ'Væ¶æ÷vâ"’ç6Æ–6RƒÂ#C’À¢GFV×G3¢µÒÀ¢Ó°¢f÷"†6öç7BGFV×BöbGFV×G2’°¢6öç7B7F'FVBÒG—VöbW&f÷&Öæ6Sòææ÷rÓÓÒ&gVæ7F–öâ"òW&f÷&Öæ6Rææ÷r‚’¢°¢G'’°¢òò72â÷F–öç2F–7F–öæ'’WfVâf÷"F†RæWWG&Â&WVW7BâF†—2—0¢òò66WFVB'’7W'&VçB6f&’ô6‡&öÖ—VÒæBfö–G27G&–7BvV$”DÀ¢òò–×ÆVÖVçFF–öç2G&VF–ærâöÖ—GFVB&wVÖVçBF–ffW&VçFÇ’à¢6öç7B6æF–FFRÒv—BwRç&WVW7DFFW"†GFV×Bæ÷F–öç2“°¢6öç7B&W7VÇBÒ6æF–FFRò&f–Æ&ÆR"¢&çVÆÂ#°¢&ö&RæGFV×G2çW6‚‡°¢Æ&VÃ¢GFV×BæÆ&VÂÀ¢÷F–öç3¢²ââæGFV×Bæ÷F–öç7ÒÀ¢&W7VÇBÀ¢×3¢ÖF‚æÖ‚ƒÂÖF‚ç&÷VæB‚‡G—VöbW&f÷&Öæ6Sòææ÷rÓÓÒ&gVæ7F–öâ"òW&f÷&Öæ6Rææ÷r‚’¢7F'FVB’Ò7F'FVB’’À¢Ò“°¢–b‚6æF–FFR’6öçF–çVS°¢6öç7B–æfòÒ6æF–FFRæ–æfòÇÂ·Ó°¢&ö&Rç6VÆV7FVBÒGFV×BæÆ&VÃ°¢&ö&RæFFW"Ò°¢fVæF÷#¢7G&–ær†–æfòçfVæF÷"ÇÂ""’À¢&6†—FV7GW&S¢7G&–ær†–æfòæ&6†—FV7GW&RÇÂ""’À¢FWf–6S¢7G&–ær†–æfòæFWf–6RÇÂ""’À¢FW67&—F–öã¢7G&–ær†–æfòæFW67&—F–öâÇÂ""’À¢fVGW&W3¢6æF–FFRæfVGW&W2ò'&’æg&öÒ†6æF–FFRæfVGW&W2Â7G&–ær’ç6÷'B‚’¢µÒÀ¢Æ–Ö—G3¢°¢Ö„&–æDw&÷W3¢6æF–FFRæÆ–Ö—G3òæÖ„&–æDw&÷W2À¢Ö„&–æF–æw5W$&–æDw&÷W¢6æF–FFRæÆ–Ö—G3òæÖ„&–æF–æw5W$&–æDw&÷WÀ¢ÒÀ¢Ó°¢vÆö&ÅF†—2æÖ5vV$wRåöFFW%&ö&RÒ&ö&S°¢&WGW&â6æF–FFS°¢Ò6F6‚†W'&÷"’°¢òò'&÷w6W"Ö’&V¦V7BöæR&VfW&Væ6R&F†W"F†â&WGW&æ–ærçVÆÂâ¶VW ¢òò—G2&÷VæFVBF–væ÷7F–2ÂF†Vâ6öçF–çVRv—F‚F†RæW‡B&VfW&Væ6Rà¢&ö&RæGFV×G2çW6‚‡°¢Æ&VÃ¢GFV×BæÆ&VÂÀ¢÷F–öç3¢²ââæGFV×Bæ÷F–öç7ÒÀ¢&W7VÇC¢&W'&÷""À¢W'&÷#¢7G&–ær†W'&÷#òææÖRÇÂ$W'&÷""’À¢ÖW76vS¢7G&–ær†W'&÷#òæÖW76vRÇÂW'&÷"’ç6Æ–6RƒÂ#C’À¢×3¢ÖF‚æÖ‚ƒÂÖF‚ç&÷VæB‚‡G—VöbW&f÷&Öæ6Sòææ÷rÓÓÒ&gVæ7F–öâ"òW&f÷&Öæ6Rææ÷r‚’¢7F'FVB’Ò7F'FVB’’À¢Ò“°¢Ð¢Ð¢òòF†W&R—2æò7FæF&BvV$uR&Æö6¶Æ—7B×&V6öâ’â–b'&÷w6W"W‡÷6W0¢òòöæR–ââFFW"×&WVW7BW'&÷"Â—B—2&WF–æVB&÷fS²÷F†W'v—6RF†P¢òòGFV×BF&ÆRÖ¶W2F†RçVÆÂöW'&÷"F—7F–æ7F–öâW‡Æ–6—Bf÷"7W÷'Bà¢vÆö&ÅF†—2æÖ5vV$wRåöFFW%&ö&RÒ&ö&S°¢6öç7BW'&÷"ÒæWrW'&÷"€¢%vV$uR—2&W6VçBÂ'WBF†—2'&÷w6W"6öçFW‡B†2æò6ö×F–&ÆRFFW"â ¢“°¢W'&÷"æ6öFRÒ$4$”Ä•E•õTäd”Ä$ÄR#°¢W'&÷"æ6&–Æ—G’Ò'vV&wRÖFFW"#°¢W'&÷"æFFW%&ö&RÒ&ö&S°¢F‡&÷rW'&÷#°¢Ð ¢†7–æ2‚’Óâ°¢–b‚æf–vF÷"æwR’F‡&÷ræWrW'&÷"‚%vV$uR—2Væf–Æ&ÆR–âF†—2'&÷w6W""“°¢òòWfW'—F†–ærg&öÒ†W&RFòF†Rf—'7B´Ô2Ô”ä•EÒÆ–æRW6VBFò&W÷'Bæ÷F†–ærÀ¢òò6ò6Æ÷rFFW"÷"6öÆBv6Ò6ö×–ÆRv2–æF—7F–æwV—6†&ÆRg&öÒ¢òò†ærâV6‚7FWæÖW2—G6VÆb&Vf÷&R—B6â&Æö6²à¢Ö&µ†6R‚'vV&wRÖFFW"×&WVW7FVB"“°¢vÆö&ÅF†—2æÖ5vV$&ö÷D÷fW&Æ’ç7FvR‚&6¶–ærF†R'&÷w6W"f÷"vV$uRFFW.(
+b"“°¢FFW"Òv—B&WVW7D6ö×F–&ÆTFFW"†æf–vF÷"æwR“°¢Ö&µ†6R‚'vV&wRÖFFW"×&VG’"“°¢vÆö&ÅF†—2æÖ5vV$&ö÷D÷fW&Æ’ç7FvR‚&÷Væ–ærF†RuRFWf–6^(
+b"“°¢FWf–6RÒv—BFFW"ç&WVW7DFWf–6R‚“°¢vÆö&ÅF†—2æÖ5vV$wRåöwUF–Ö–ærÒ°¢F–ÖW7F×VW'“¢&ööÆVâ†FFW"æfVGW&W3òæ†3òâ‚'F–ÖW7F××VW'’"’’À¢ÖWF†öC¢FFW"æfVGW&W3òæ†3òâ‚'F–ÖW7F××VW'’"¢ò'F–ÖW7F××VW'’6&–Æ—G’FWFV7FVC²W"×72VW'’v—&–ær&VÖ–ç2÷BÖ–â ¢¢&6ö'6RVWVR6ö×ÆWF–öâ ¢Ó°¢FWf–6RæÆ÷7BçF†Vâ‚†–æfò’Óâf–Â†æWrW'&÷"†vV$uRFWf–6RÆ÷7C¢G¶–æfòæÖW76vWÖ’’“°¢òòG&r×F–ÖRfÆ–FF–öâW'&÷'2vW&RæWfW"6GW&VC¢F†RW†—7F–ærW'&÷ ¢òò66÷W2öæÇ’w&—VÆ–æRæB'VffW"7&VF–öââG&rv†÷6R&÷VæBfW'FW€¢òò&ævRFöW2æ÷B6÷fW"&6UfW'FW‚¶–æFW„6÷VçB—2&V¦V7FVB'’F†R'&÷w6W"æ@¢òò&öGV6W2æòg&vÖVçG2ÒÒ6–ÆVçFÇ’Âv—F‚6ÆVâÆöræB6÷'&V7BÖÆöö¶–æp¢òòG&r6ÆÂâFW'&–â—77VW2fÆ–BG&w2æB&VæFW'2æ÷F†–ærÂ6òF†—2—2F†P¢òòvF†B†2Fò&R6Æ÷6VB&Vf÷&R&ÆÖ–ærç—F†–ærVÇ6Rà¢FWf–6RæFDWfVçDÆ—7FVæW#òâ‚'Væ6GW&VFW'&÷""Â†WfVçB’Óâ°¢6öç7B6–æ²Ò†vÆö&ÅF†—2æÖ5vV$wRåöwTW'&÷'2ÇÃÒ¶6÷VçC¢Â'”ÖW76vS¢·×Ò“°¢6–æ²æ6÷VçB²³°¢6öç7BÖW76vRÒ7G&–ær†WfVçBæW'&÷#òæÖW76vRóòWfVçBæW'&÷"’ç6Æ–6RƒÂ##“°¢æ÷FUFW‡GW&UfÆ–FF–öâ†ÖW76vRÂöÆ7E7V&Ö—EFW‡GW&T6æF–FFR“°¢6–æ²æ'”ÖW76vU¶ÖW76vUÒÒ‡6–æ²æ'”ÖW76vU¶ÖW76vUÒÇÂ’²°¢–b‡6–æ²æ6÷VçBÃÒR’6öç6öÆRæW'&÷"‚%´uRÔU%$õ%Ò"ÂÖW76vR“°¢Ò“°¢vÆö&ÅF†—2æÖ5vV$wRÒvÆö&ÅF†—2æÖ5vV$wRÇÂ·Ó°¢vÆö&ÅF†—2æÖ5vV$wRåöÆ–Ö—G2Ò°¢Ö„&–æDw&÷W3¢FWf–6RæÆ–Ö—G3òæÖ„&–æDw&÷W2À¢Ö„&–æF–æw5W$&–æDw&÷W¢FWf–6RæÆ–Ö—G3òæÖ„&–æF–æw5W$&–æDw&÷W ¢Ó°¢6öçFW‡BÒ6çf2ævWD6öçFW‡B‚'vV&wR"“° ¢vÆö&ÅF†—2æÖ5vV$6çf2ç&W6—¦T&6¶–æu7F÷&R‚“°¢6WEFW‡B‚&wR×7FGW2"ÂFFW"&VG“¢G¶vÆö&ÅF†—2æÖ5vV$wRæFFW$æÖR‚—Ö“° ¢òòÖ–â×F‡&VB†V'F&VBÂ–æFWVæFVçBöb&WVW7Dæ–ÖF–öäg&ÖRâ6WD–çFW'fÀ¢òòöæÇ’f—&W2v†VâF†RÖ–âF‡&VB—2–FÆR&WGvVVâF6·3²–b7–æ6‡&öæ÷W0¢òò¦f6ÆÂ‡F†R6öç7G'V7F÷"w2G&–Æ–ær&ö÷BÂ÷"'VåF–6²’&Æö6·2F†RF‡&VBÀ¢òòF†R&VG27F÷â6ò&&VG2¶VW6Æ–Ö&–ær'WBæò·V×ÒVçFW"òæògW'F†W ¢òò´Ô2Ô”ä•EÒ"(y"&ö÷BÄôt”2—27FÆÆVB‡F‡&VBg&VR“²&&VG27F÷"(y"F†P¢òòF‡&VB—2$Äô4´TB–â7–æ6‡&öæ÷W26ÆÂâvÆö&ÅF†—2æÖ5vV$wRåö&VG2—0¢òò&VF&ÆRg&öÒF†R&ö&RBç’F–ÖRà¢vÆö&ÅF†—2æÖ5vV$wRåö&VG2Ò°¢6WD–çFW'fÂ‚‚’Óâ²vÆö&ÅF†—2æÖ5vV$wRåö&VG2Ò†vÆö&ÅF†—2æÖ5vV$wRåö&VG2ÇÂ’²²ÒÂ#“° ¢òòöÖ7vV%÷W&cÓÒÒg&ÖR×F–ÖRF—7G&–'WF–öâÇW2W"Ö'&–FvRÖ6ÆÂ6÷7Bæ@¢òò6÷VçB6Vç7W2âGvòW&f÷&Öæ6Rææ÷r‚’6ÆÇ2W"'&–FvR7&÷76–ær—2f"Föð¢òòW‡Vç6—fRFòÆVfRöâ†'W7’g&ÖRÖ¶W2FVç2öbF†÷W6æG2öbF†VÒ’Â6ð¢òòF†—27F—2÷BÖ–âæBF†RVæfÆvvVBF‚¶VW2F†R÷&–v–æÂgVæ7F–öç2à¢–b†æWrU$Å6V&6…&×2†Æö6F–öâç6V&6‚’æ†2‚&Ö7vV%÷W&b"’’°¢–ç7FÆÅW&e&öf–ÆW"‚“°¢Ð ¢6öç7BÆVæ6…&×2ÒæWrU$Å6V&6…&×2†Æö6F–öâç6V&6‚“°¢–b†ÆVæ6…&×2æ†2‚&Ö7vV%öFV'Vr"’’°¢òò¶VWF†RÆÆö6F÷"6÷VçFW'2æW‡BFòF†Rg&ÖRôt2Ö&¶W'2v†–ÆRF–væ÷6–æp¢òòv6ÔÄÒ&W77W&RâF†R6ÆÂ—2÷BÖ–ã¢—B&RÖVçFW'2F†R–ÖvRæB×W7Bæ÷B&P¢òò'BöbF†Ræ÷&ÖÂ&VæFW"Æö÷à¢6WD–çFW'fÂ‚‚’Óâ°¢G'’°¢6öç7B6÷VçFW'2ÒvÆö&ÅF†—2æÖ5vV%F‡&VE'VçF–ÖSòæ–ÖvT6÷VçFW'3òâ‚“°¢–b†6÷VçFW'2’6öç6öÆRæÆör‚%µD…$TBÔ4õTåDU%5Ò"²¥4ôâç7G&–æv–g’†6÷VçFW'2’“°¢Ò6F6‚†W'&÷"’°¢6öç6öÆRçv&â‚%µD…$TBÔ4õTåDU%5Òf–ÆVB"ÂW'&÷"“°¢Ð¢ÒÂS“°¢Ð¢òòF†R&R×'VçF–ÖRWF‚&÷VæF'’W‡÷6W2öæÇ’F†R&öf–ÆRæÖRõUT”BâF†—0¢òò&÷VæFVB&öÖ—6Ræ÷&ÖÆÇ’f–æ—6†VBv†–ÆRvV$uR–æ—F–Æ—6VC²v—F–ær—@¢òò†W&RwV&çFVW2Ö–æV7&gBw2vÖT6öæf–r6VW2F†RWF†VçF–6FVB–FVçF—G’À¢òòv—F‚&÷VæFVBÆö6ÂÖ–FVçF—G’fÆÆ&6²öæÇ’f÷"F–væ÷7F–72à¢v—BvÆö&ÅF†—2æÖ5vV$æWCòæ–FVçF—G•&VG“òâ‚“° ¢6öç7BFVfVÇD–ÖvRÒvÆö&ÅF†—2æÖ5vV$6öæf–sòç'VçF–ÖSòæ–ÖvRÇÂ&Ö–æV7&gBÖ6Æ–VçB#°¢6öç7B–ÖvTæÖRÒFVfVÇD–ÖvS°¢òòÖ5vV%6W'fW"æÆVæ6‚‚’FW&—fW2F†R6W'fW"Õv÷&¶W"–ÖvRg&öÒF†—2æÖR6ð¢òòF†Rv÷&¶W"Çv—2'Vç2F†R–ÖvRF†Bv2§W7B'V–ÇBg&öÒF†—2G&VRà¢vÆö&ÅF†—2æÖ5vV$–ÖvTæÖRÒ–ÖvTæÖS°¢vÆö&ÅF†—2æÖ5vV%'VçF–ÖTÖöFRÒ%t4Ôt5ô4ôõU$D•dR#°¢6öç6öÆRæÆör†¶Ö7vV"Ö†÷7EÒ'VçF–ÖRÖöFRG¶vÆö&ÅF†—2æÖ5vV%'VçF–ÖTÖöFWÖ“°¢6öç7B67&—BÒFö7VÖVçBæ7&VFTVÆVÖVçB‚'67&—B"“°¢–b†–ÖvTæÖRÓÓÒFVfVÇD–ÖvR’°¢òòw&ÅvV$–ÖvRF6†W26öæf–rçv6Õ÷F‚Fò6öç7VÖRF†—2W‡Æ–6—BU$Âà¢òòfW'6–öâ&÷F‚&WVW7G2v—F‚öæRFs¢F†RvR×W7BæWfW"–ç7FçF–FR¢òòæWrv6Ò&–æ'’v–ç7BâöÆFW"66†VBvVæW&FVBÆöFW"†÷"f–6RfW'6’à¢6öç7B'VçF–ÖU&Vf—‚ÒvÆö&ÅF†—2æÖ5vV%'VçF–ÖU&Vf—‚ÇÂ"ò#°¢vÆö&ÅF†—2æÖ5vV$w&Åv6ÕF‚ÒæWrU$Â€¢G·'VçF–ÖU&Vf—‡Öw&ÂòG¶–ÖvTæÖWÒæ§2çv6Ó÷cÒG´Ô5tT%ô44„UõDwÖÀ¢Æö6F–öâæ÷&–v–âÀ¢’æ‡&Vc°¢67&—Bç7&2ÒG·'VçF–ÖU&Vf—‡Öw&ÂòG¶–ÖvTæÖWÒæ§3÷cÒG´Ô5tT%ô44„UõDwÖ°¢ÒVÇ6R°¢òò†—7F÷&–6ÂF–væ÷7F–2–ÖvW2vW&R'V–ÇB&Vf÷&RF†RW‡Æ–6—B×F€¢òòÆöFW"F6‚æB&WF–âvV"–ÖvRw2÷&–v–æÂ6–&Æ–ærFW&—fF–öâà¢FVÆWFRvÆö&ÅF†—2æÖ5vV$w&Åv6ÕFƒ°¢67&—Bç7&2ÒG¶vÆö&ÅF†—2æÖ5vV%'VçF–ÖU&Vf—‚ÇÂ"ò'Öw&ÂòG¶–ÖvTæÖWÒæ§6°¢Ð¢67&—BæöæÆöBÒ‚’Óâ°¢Ö&µ†6R‚&vVæW&FVBÖÆöFW"ÖÆöFVB"“°¢6WEFW‡B‚&¦"×7FGW2"Â%vV$76VÖ&Ç’'VçF–ÖRÆöFVC²7F'F–ær¤.(
+b"“°¢Ó°¢67&—BæöæW'&÷"Ò‚’Óâf–Â†æWrW'&÷"‚$6÷VÆBæ÷BÆöBF†Rw&ÅdÒvV"–ÖvR'VçF–ÖR"’“°¢vÆö&ÅF†—2æÖ5vV$&ö÷D÷fW&Æ’ç7FGW2‚%7F'F–ærÖ–æV7&gN(
+b"“°¢vÆö&ÅF†—2æÖ5vV$&ö÷D÷fW&Æ’ç7FvR€¢&ÆöF–æræB6ö×–Æ–ærF†RÖ–æV7&gBvV$76VÖ&Ç’–Öv^(
+b"“°¢òòv—fRF†RvR6†æ6RFò–çBF†BÖW76vR&Vf÷&RF†RÆöFW"—0¢òòGF6†VBÂ&V6W6R6ö×–Æ–æræB'Vææ–ærF†R–ÖvRö67W–W2F†—2F‡&VB–à¢òòÆöær7G&WF6†W2âæWfW"§v—B¢öâ—C¢6‡&öÖR7F÷2FVÆ—fW&–æræ–ÖF–öà¢òòg&ÖW2Fòâö66ÇVFVBv–æF÷rv†–ÆR7F–ÆÂ&W÷'F–ærf—6–&–Æ—G•7FFP¢òò'f—6–&ÆR"Â6ò&&R$bv—B†W&R&¶VBF†RVçF—&R&ö÷BVçF–ÂF†P¢òòv–æF÷rv2&—6VBv–ââF†B—2v†B'v—FVBsW2Â7v—F6†VBF'2Â—@¢òòÆöFVB"Æöö·2Æ–¶Rg&öÒF†R÷WG6–FRà¢v—B–çD÷$v—fUWƒ#S“°¢Ö&µ†6R‚&vVæW&FVBÖÆöFW"×&WVW7FVB"“°¢Fö7VÖVçBæ&öG’æVæB‡67&—B“°¢Ò’‚’æ6F6‚†f–Â“°§Ò’‚“°

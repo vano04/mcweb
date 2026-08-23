@@ -1043,6 +1043,10 @@ const gradleEnv = {
   ...process.env,
   GRAALVM_HOME: graalVm.home,
   JAVA_HOME: graalVm.home,
+  // Gradle's Exec tasks cannot assume the Node wrapper's directory is on the
+  // daemon PATH. Pass the exact Node process that is running this build so a
+  // portable Windows install works under both native and emulated hosts.
+  MCWEB_NODE: process.execPath,
 };
 const binaryenBin = await findBinaryenBin();
 if (binaryenBin) {
@@ -1052,6 +1056,7 @@ if (binaryenBin) {
 }
 
 say(`\nbuilding image (this takes ~9 minutes)\n  ${GRADLEW} ${gradleArgs.join(" ")}\n`);
+say(`node:           ${process.execPath}`);
 await run(GRADLEW,gradleArgs,{ env: gradleEnv });
 if (!noAudio && haveAssets) {
   say("\nstaging audio");

@@ -113,3 +113,27 @@ test("root install and run entrypoints remain source-only and repository-pinned"
   assert.doesNotMatch(text, /minecraft-26\.2-client\.jar|\.wasm|\.ogg/);
   assert.doesNotMatch(text, /minecraft\.wasm\.click|tcp\.wasm\.click|cloudflare/i);
 });
+
+test("the public launcher exposes only the canonical WasmGC runtime lane", async () => {
+  const [host, gradle, toolsReadme] = await Promise.all([
+    readFile(join(ROOT, "web/dev/webgpu-host.js"), "utf8"),
+    readFile(join(ROOT, "build.gradle"), "utf8"),
+    readFile(join(ROOT, "tools/README.md"), "utf8"),
+  ]);
+  for (const path of [
+    "tools/wasm-share-memory.mjs",
+    "tools/stage-wasmlm-browser.mjs",
+    "src/graal/java/dev/mcweb/graal/WasmLMBootstrapProbeMain.java",
+    "src/graal/java/dev/mcweb/graal/WasmLMUtilProbeMain.java",
+    "src/graal/java/dev/mcweb/graal/ThreadConformanceMain.java",
+    "src/graal/java/dev/mcweb/graal/WorkerPoolProbeMain.java",
+  ]) assert.equal(await exists(join(ROOT, path)), false, `${path} must not be shipped`);
+  assert.doesNotMatch(host, /mcweb_server_image|mcweb_threads|mcWebWasmLMThreads|WASMLM_(?:INLINE|THREADED)/);
+  assert.match(host, /const serverImage = "minecraft-client"/);
+  assert.match(host, /mcWebRuntimeMode = "WASMGC_COOPERATIVE"/);
+  assert.doesNotMatch(gradle, /wasmLMThreadArtifacts|stage-wasmlm-browser|wasm-share-memory/);
+  // Keep the builder patch source: Windows invokes webImagePatch even for the
+  // standard WASMGC image to apply its points-to compatibility fix.
+  assert.match(gradle, /src\/webimage-patch\/java/);
+  assert.match(toolsReadme, /canonical `minecraft-client`\s+WasmGC pair/);
+});

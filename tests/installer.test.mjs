@@ -142,6 +142,27 @@ test("build preflight requires public Web Image but labels the old toolchain leg
   assert.match(gradle, /native-image\.cmd/);
 });
 
+test("portable Node is propagated to every Gradle Node Exec on Windows", async () => {
+  const [build, gradle] = await Promise.all([
+    readFile(`${ROOT}/tools/build.mjs`, "utf8"),
+    readFile(`${ROOT}/build.gradle`, "utf8"),
+  ]);
+  // Simulate the Windows ARM bootstrap's absolute portable executable. The
+  // build helper must pass process.execPath; Gradle must select that path before
+  // falling back to a normal system `node` lookup.
+  const portableWindowsNode = String.raw`C:\Users\vano\.mcweb\node\node.exe`;
+  assert.match(portableWindowsNode, /\\node\.exe$/);
+  assert.match(build, /MCWEB_NODE:\s*process\.execPath/);
+  assert.match(gradle, /environmentVariable\("MCWEB_NODE"\)/);
+  assert.match(gradle, /gradleProperty\("mcwebNode"\)/);
+  assert.match(gradle, /\.orElse\("node"\)/);
+  assert.match(gradle, /def nodeCommand\s*=\s*\{/);
+  assert.match(gradle, /new File\(configured\)\.isAbsolute\(\)/);
+  assert.match(gradle, /Configured MC-Web Node executable was not found or is not executable/);
+  assert.match(gradle, /commandLine\(\s*nodeCommand\(\)/);
+  assert.doesNotMatch(gradle, /commandLine\(\s*"node"/);
+});
+
 test("root entrypoints route through one standard build-and-run flow", async () => {
   const [unixRun, windowsRun, unixInstall, windowsInstall] = await Promise.all([
     readFile(`${ROOT}/run.sh`, "utf8"),

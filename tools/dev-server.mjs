@@ -185,7 +185,7 @@ function reportWatchdogState(body) {
       const key = `started:${sample.label || ""}`;
       if (key !== lastWatchdogConsoleKey) {
         lastWatchdogConsoleKey = key;
-        process.stdout.write(`[watchdog] started ${sample.label || "WasmLM"}\n`);
+        process.stdout.write(`[watchdog] started ${sample.label || "MC-Web runtime"}\n`);
       }
       return;
     }

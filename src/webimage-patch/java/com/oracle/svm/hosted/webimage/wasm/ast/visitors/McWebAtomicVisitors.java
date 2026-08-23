@@ -17,11 +17,10 @@ import com.oracle.svm.hosted.webimage.wasm.ast.Memory;
 public final class McWebAtomicVisitors {
 
     /**
-     * Pages the shared memory may grow to. A wasm {@code shared} memory must declare a
-     * maximum, and every agent instance must agree on it because they all import the
-     * same memory. 65536 pages = 4 GiB, matching the maximum the browser thread host
-     * creates ({@code web/thread-host.js}) and the one
-     * {@code tools/stage-wasmlm-browser.mjs} rewrites the shared pair with.
+     * Pages the shared memory may grow to for the experimental WasmLM builder lane.
+     * A wasm {@code shared} memory must declare a maximum, and every agent instance
+     * must agree on it because they all import the same memory. The public launcher
+     * does not stage that lane, but the value remains part of the builder patch input.
      *
      * <p>This ceiling is load-bearing, not a safety margin: the allocator reserves its
      * arena up front, and a ceiling below that reserve makes the reservation fail and

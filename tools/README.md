@@ -20,8 +20,10 @@ are source-only GitHub bootstraps for machines that do not already have this
 directory; they install into `~/.mcweb/project` (or `MCWEB_INSTALL_DIR`) and
 refuse to overwrite an unmarked user directory.
 
-The remaining WasmGC/WasmLM helper files are build inputs referenced by
-`build.gradle`; they do not fetch or contain generated runtime bytes.
+The remaining `src/webimage-patch` and `tools/webimage-patch` files are build
+inputs referenced by `build.gradle`; they do not fetch or contain generated
+runtime bytes. The public launcher stages only the canonical `minecraft-client`
+WasmGC pair; experimental shared-memory staging helpers are not included.
 
 Run the server from this directory with:
 
