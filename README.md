@@ -8,15 +8,13 @@ cd "$HOME/.mcweb/project"
 ./run.sh
 ```
 
-Windows PowerShell, with a process-only policy bypass (this does not change
-the machine or user execution policy):
+Windows PowerShell, as one copy-paste command. It downloads the installer to a
+fresh temporary file, uses a process-only policy bypass, installs to
+`%USERPROFILE%\.mcweb\project`, and starts the standard local flow. It does not
+change the machine or user execution policy:
 
 ```powershell
-$p = Join-Path $env:TEMP 'mcweb-install.ps1'
-curl.exe -fsSL 'https://raw.githubusercontent.com/vano04/mcweb/main/install.ps1' -o $p
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $p
-Set-Location (Join-Path $env:USERPROFILE '.mcweb\project')
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run.ps1
+& { $ErrorActionPreference = 'Stop'; $p = (New-TemporaryFile).FullName; try { curl.exe -fsSL --proto '=https' --tlsv1.2 --max-redirs 3 --connect-timeout 15 --max-time 300 'https://raw.githubusercontent.com/vano04/mcweb/main/install.ps1' -o $p; if ($LASTEXITCODE -ne 0) { throw 'mcweb: installer download failed' }; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $p -Run; if ($LASTEXITCODE -ne 0) { throw "mcweb: install/run failed with exit code $LASTEXITCODE" } } finally { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue } }
 ```
 
 The two `run` scripts are the standard local flow: they validate or install

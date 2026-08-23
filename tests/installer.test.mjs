@@ -97,6 +97,11 @@ test("README states the public GraalVM baseline and unsupported hosts", async ()
   assert.match(readme, /^# How to run/);
   assert.match(readme, /raw\.githubusercontent\.com\/vano04\/mcweb\/main\/install \| sh/);
   assert.match(readme, /curl\.exe -fsSL [^\n]+install\.ps1[^\n]+-o \$p/);
+  assert.match(readme, /New-TemporaryFile/);
+  assert.match(readme, /-ExecutionPolicy Bypass -File \$p -Run/);
+  assert.match(readme, /installer download failed/);
+  assert.match(readme, /install\/run failed with exit code/);
+  assert.doesNotMatch(readme, /irm\s*\|\s*iex/i);
   assert.doesNotMatch(readme, /raw\.githubusercontent\.com\/vano04\/mcweb\/main\/install\.sh/);
   assert.doesNotMatch(readme, /Invoke-WebRequest/);
   assert.match(readme, /ExecutionPolicy Bypass/);
@@ -142,6 +147,11 @@ test("root entrypoints route through one standard build-and-run flow", async () 
   assert.match(unixRun, /tools\/install\.sh.*--run/);
   assert.match(windowsRun, /tools\\install\.ps1/);
   assert.match(windowsRun, /--run/);
+  assert.match(windowsInstall, /\[switch\]\$Run/);
+  assert.match(windowsInstall, /Usage: \.\\install\.ps1 \[-DryRun\] \[-Run\]/);
+  assert.match(windowsInstall, /ExecutionPolicy Bypass/);
+  assert.match(windowsInstall, /RunScript/);
+  assert.match(windowsInstall, /\$RunExitCode = \$LASTEXITCODE/);
   for (const source of [unixInstall, windowsInstall]) {
     assert.match(source, /vano04\/mcweb/);
     assert.match(source, /refs\/heads/);

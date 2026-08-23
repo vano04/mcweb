@@ -5,6 +5,7 @@
 param(
   [switch]$DryRun,
   [switch]$Help,
+  [switch]$Run,
   [string]$InstallDir = ""
 )
 
@@ -22,8 +23,9 @@ function Say([string]$Message) { Write-Host "mcweb: $Message" }
 function Die([string]$Message) { throw "mcweb: $Message" }
 
 if ($Help) {
-  Write-Host 'Usage: .\install.ps1 [-DryRun] [-InstallDir path]'
+  Write-Host 'Usage: .\install.ps1 [-DryRun] [-Run] [-InstallDir path]'
   Write-Host 'Set MCWEB_INSTALL_DIR to choose a different destination.'
+  Write-Host 'Use -Run to start the installed standard local build-and-run flow.'
   exit 0
 }
 
@@ -132,7 +134,18 @@ try {
   }
   Say "installed source checkout at $InstallDir"
   if ($Backup) { Say "previous managed checkout kept at $Backup" }
-  Say "next: Set-Location '$InstallDir'; .\run.ps1"
+  if ($Run) {
+    $RunScript = Join-Path $InstallDir 'run.ps1'
+    if (-not (Test-Path -LiteralPath $RunScript -PathType Leaf)) {
+      Die "installed checkout is missing run.ps1: $RunScript"
+    }
+    Say 'starting the standard local build-and-run flow'
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $RunScript
+    $RunExitCode = $LASTEXITCODE
+    if ($RunExitCode -ne 0) { exit $RunExitCode }
+  } else {
+    Say "next: Set-Location '$InstallDir'; .\run.ps1"
+  }
 } finally {
   if (-not $Moved -and (Test-Path -LiteralPath $WorkDir)) {
     Remove-Item -LiteralPath $WorkDir -Recurse -Force -ErrorAction SilentlyContinue
