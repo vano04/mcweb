@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import { download, platformConfigFor, sidecarChecksum, toolUrl } from "../tools/mcweb-install.mjs";
+import { EXPECTED_BUILD_GRADLE_SHA256, inspectBuildGradle } from "../tools/source-integrity.mjs";
 
 const execFileAsync = promisify(execFile);
 const ROOT = new URL("..", import.meta.url).pathname;
@@ -140,6 +141,22 @@ test("build preflight requires public Web Image but labels the old toolchain leg
   assert.match(build, /OS_ARCH/);
   assert.match(gradle, /native-image\.exe/);
   assert.match(gradle, /native-image\.cmd/);
+});
+
+test("source integrity rejects binary and truncated build.gradle payloads before Gradle", async () => {
+  const source = await readFile(`${ROOT}/build.gradle`);
+  const healthy = inspectBuildGradle(source);
+  assert.equal(healthy.ok, true);
+  assert.equal(healthy.actualSha256, EXPECTED_BUILD_GRADLE_SHA256);
+
+  const binaryPrefix = Buffer.concat([Buffer.from([0x59, 0xaa, 0xe7, 0x8a]), source]);
+  const binary = inspectBuildGradle(binaryPrefix);
+  assert.equal(binary.ok, false);
+  assert.match(binary.reason, /invalid UTF-8|binary/i);
+
+  const truncated = inspectBuildGradle(source.subarray(0, 300060));
+  assert.equal(truncated.ok, false);
+  assert.match(truncated.reason, /unexpected|truncated|digest/i);
 });
 
 test("portable Node is propagated to every Gradle Node Exec on Windows", async () => {
