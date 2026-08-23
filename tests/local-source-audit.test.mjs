@@ -82,6 +82,17 @@ test("the shared launcher documents the original local Node command and wildcard
   assert.match(readme, /PrismLauncher/);
 });
 
+test("How to run starts from inspectable source and invokes local wrappers", async () => {
+  const readme = await readFile(join(ROOT, "README.md"), "utf8");
+  assert.match(readme, /git clone https:\/\/github\.com\/vano04\/mcweb\.git/);
+  assert.match(readme, /https:\/\/github\.com\/vano04\/mcweb\/archive\/refs\/heads\/main\.zip/);
+  assert.match(readme, /sh \.\/run\.sh/);
+  assert.match(readme, /powershell\.exe -NoProfile -ExecutionPolicy Bypass -File \.\\run\.ps1/);
+  assert.doesNotMatch(readme, /raw\.githubusercontent\.com/i);
+  assert.doesNotMatch(readme, /curl[^\n]*(?:\|\s*(?:sh|bash)|install\.ps1)/i);
+  assert.doesNotMatch(readme, /(?:Invoke-WebRequest|irm\s*\|\s*iex)/i);
+});
+
 test("generated or proprietary payloads are absent from the copy", async () => {
   const paths = await filesUnder(ROOT);
   for (const path of paths) {

@@ -95,17 +95,19 @@ test("installer pins official archives and verifies vendor checksums", async () 
 test("README states the public GraalVM baseline and unsupported hosts", async () => {
   const readme = await readFile(`${ROOT}/README.md`, "utf8");
   assert.match(readme, /^# How to run/);
-  assert.match(readme, /raw\.githubusercontent\.com\/vano04\/mcweb\/main\/install \| sh/);
-  assert.match(readme, /curl\.exe -fsSL [^\n]+install\.ps1[^\n]+-o \$p/);
-  assert.match(readme, /New-TemporaryFile/);
-  assert.match(readme, /-ExecutionPolicy Bypass -File \$p -Run/);
-  assert.match(readme, /installer download failed/);
-  assert.match(readme, /install\/run failed with exit code/);
+  assert.match(readme, /git clone https:\/\/github\.com\/vano04\/mcweb\.git/);
+  assert.match(readme, /https:\/\/github\.com\/vano04\/mcweb\/archive\/refs\/heads\/main\.zip/);
+  assert.match(readme, /sh \.\/run\.sh/);
+  assert.match(readme, /powershell\.exe -NoProfile -ExecutionPolicy Bypass -File \.\\run\.ps1/);
+  assert.doesNotMatch(readme, /raw\.githubusercontent\.com/i);
+  assert.doesNotMatch(readme, /curl[^\n]*(?:\|\s*(?:sh|bash)|install\.ps1)/i);
+  assert.doesNotMatch(readme, /New-TemporaryFile/);
   assert.doesNotMatch(readme, /irm\s*\|\s*iex/i);
   const windowsCodeBlock = readme.match(/```powershell\r?\n([\s\S]*?)\r?\n```/);
   assert.ok(windowsCodeBlock, "README must contain the Windows bootstrap code block");
   assert.equal(windowsCodeBlock[1].split(/\r?\n/).length, 1, "Windows bootstrap must be one line");
-  assert.doesNotMatch(readme, /raw\.githubusercontent\.com\/vano04\/mcweb\/main\/install\.sh/);
+  assert.match(windowsCodeBlock[1], /run\.ps1/);
+  assert.doesNotMatch(windowsCodeBlock[1], /curl/i);
   assert.doesNotMatch(readme, /Invoke-WebRequest/);
   assert.match(readme, /ExecutionPolicy Bypass/);
   assert.match(readme, /GraalVM Web Image 25\.1 or newer/);

@@ -1,21 +1,28 @@
 # How to run
 
-Unix/macOS/Linux, from any directory with `curl` and `tar`:
+Start with an inspectable copy of this repository. Choose one:
+
+- Clone it with `git clone https://github.com/vano04/mcweb.git`, then enter the
+  new `mcweb` directory.
+- Or [download the repository ZIP](https://github.com/vano04/mcweb/archive/refs/heads/main.zip),
+  extract it, and open a terminal in the extracted `mcweb-main` directory.
+
+On macOS or Linux, run the local wrapper from that directory:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/vano04/mcweb/main/install | sh
-cd "$HOME/.mcweb/project"
-./run.sh
+sh ./run.sh
 ```
 
-Windows PowerShell, as one copy-paste command. It downloads the installer to a
-fresh temporary file, uses a process-only policy bypass, installs to
-`%USERPROFILE%\.mcweb\project`, and starts the standard local flow. It does not
-change the machine or user execution policy:
+On Windows PowerShell, run the local wrapper with a process-only policy bypass:
 
 ```powershell
-& { $ErrorActionPreference = 'Stop'; $p = (New-TemporaryFile).FullName; try { curl.exe -fsSL --proto '=https' --tlsv1.2 --max-redirs 3 --connect-timeout 15 --max-time 300 'https://raw.githubusercontent.com/vano04/mcweb/main/install.ps1' -o $p; if ($LASTEXITCODE -ne 0) { throw 'mcweb: installer download failed' }; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $p -Run; if ($LASTEXITCODE -ne 0) { throw "mcweb: install/run failed with exit code $LASTEXITCODE" } } finally { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue } }
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run.ps1
 ```
+
+These wrappers call the inspectable local `tools/install.sh` or
+`tools\install.ps1`, install the pinned developer tools, build the local Web
+Image, and start the loopback server. The policy bypass applies only to this
+PowerShell process; it does not change the machine or user execution policy.
 
 The two `run` scripts are the standard local flow: they validate or install
 the pinned developer tools, download or validate the official 26.2 inputs,
