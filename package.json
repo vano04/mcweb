@@ -1,0 +1,11 @@
+{
+  "name": "mc-web",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "serve": "node tools/dev-server.mjs",
+    "stage-assets": "node tools/stage-mojang-assets.mjs",
+    "test": "npm run test:local",
+    "test:local": "node --test tests/*.test.mjs"
+  }
+}

@@ -1,0 +1,63 @@
+[
+  {
+    "name": "com.mojang.authlib.yggdrasil.response.MinecraftTexturesPayload",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true,
+    "allRecordComponents": true
+  },
+  {
+    "name": "com.mojang.authlib.minecraft.MinecraftProfileTexture",
+    "allDeclaredConstructors": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "com.mojang.authlib.minecraft.MinecraftProfileTexture$Type",
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "net.minecraft.world.entity.boss.enderdragon.phases.DragonHoldingPatternPhase",
+    "allDeclaredConstructors": true
+  },
+  {
+    "name": "net.minecraft.world.entity.boss.enderdragon.phases.DragonStrafePlayerPhase",
+    "allDeclaredConstructors": true
+  },
+  {
+    "name": "net.minecraft.world.entity.boss.enderdragon.phases.DragonLandingApproachPhase",
+    "allDeclaredConstructors": true
+  },
+  {
+    "name": "net.minecraft.world.entity.boss.enderdragon.phases.DragonLandingPhase",
+    "allDeclaredConstructors": true
+  },
+  {
+    "name": "net.minecraft.world.entity.boss.enderdragon.phases.DragonTakeoffPhase",
+    "allDeclaredConstructors": true
+  },
+  {
+    "name": "net.minecraft.world.entity.boss.enderdragon.phases.DragonSittingFlamingPhase",
+    "allDeclaredConstructors": true
+  },
+  {
+    "name": "net.minecraft.world.entity.boss.enderdragon.phases.DragonSittingScanningPhase",
+    "allDeclaredConstructors": true
+  },
+  {
+    "name": "net.minecraft.world.entity.boss.enderdragon.phases.DragonSittingAttackingPhase",
+    "allDeclaredConstructors": true
+  },
+  {
+    "name": "net.minecraft.world.entity.boss.enderdragon.phases.DragonChargePlayerPhase",
+    "allDeclaredConstructors": true
+  },
+  {
+    "name": "net.minecraft.world.entity.boss.enderdragon.phases.DragonDeathPhase",
+    "allDeclaredConstructors": true
+  },
+  {
+    "name": "net.minecraft.world.entity.boss.enderdragon.phases.DragonHoverPhase",
+    "allDeclaredConstructors": true
+  }
+]

@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="robots" content="noindex, nofollow, noarchive">
+  <link rel="stylesheet" href="/site.css">
+  <link rel="icon" href="/mcweb-icon.svg" type="image/svg+xml">
+  <meta name="description" content="Self-hosted MC-Web launcher for a player-supplied local build.">
+  <title>MC-Web — self-hosted</title>
+</head>
+<body>
+  <canvas id="minecraft-canvas" hidden tabindex="0" aria-label="Minecraft WebGPU surface"
+          data-default-aspect="16/9" data-game-viewport="landscape"></canvas>
+  <pre id="failure" hidden></pre>
+  <main class="local-page dev-page">
+    <div id="dev-shell" class="local-shell dev-shell">
+      <p class="kicker">MC-WEB / SELF-HOSTED</p>
+      <h1>Play your<br>local build.</h1>
+      <p class="local-lede">This page is served by the self-hosted Node process that reads a supported local Minecraft launcher session, builds the player-supplied image, and serves it only on this machine. Credentials and generated game files stay local.</p>
+
+      <section class="local-card dev-card">
+        <h2>1. Launcher session</h2>
+        <p>Use either the <strong>official Minecraft Launcher</strong> or <strong>PrismLauncher</strong>. The self-hosted Node process reads the selected local account file, validates the active Microsoft account, token freshness, Minecraft ownership, and live profile with Minecraft Services, and never sends the token to this page or a public host.</p>
+        <div class="launcher-paths" aria-label="Supported Minecraft launcher account file locations">
+          <div class="launcher-path">
+            <h3>Windows</h3>
+            <p>Press <kbd>Win</kbd>+<kbd>R</kbd>, enter <code>%APPDATA%\.minecraft</code>, and press Enter. The expected file is:</p>
+            <code>%APPDATA%\.minecraft\launcher_accounts.json</code>
+          </div>
+          <div class="launcher-path">
+            <h3>macOS</h3>
+            <p>In Finder, choose <strong>Go → Go to Folder…</strong> and enter <code>~/Library/Application Support/minecraft</code>. The expected file is:</p>
+            <code>~/Library/Application Support/minecraft/launcher_accounts.json</code>
+            <p class="fine-print">PrismLauncher alternative:</p>
+            <code>~/Library/Application Support/PrismLauncher/accounts.json</code>
+          </div>
+          <div class="launcher-path">
+            <h3>Linux</h3>
+            <p>Open <code>~/.minecraft</code> in your file manager (or use <code>Ctrl</code>+<code>L</code> and enter that path). The expected file is:</p>
+            <code>~/.minecraft/launcher_accounts.json</code>
+          </div>
+        </div>
+        <p class="fine-print">The already-running Node process can read a detected file directly, or you can choose one below. A selected file is sent only to this loopback Node process for validation; it is not sent to a public host, written to disk, or retained by the page. Supported formats are the official Launcher's top-level <code>accounts</code> object map with <code>activeAccountLocalId</code>, a Microsoft account with an unexpired string <code>accessToken</code>, and <code>minecraftProfile</code>; or PrismLauncher's top-level numeric <code>formatVersion</code> with an <code>accounts</code> array, exactly one active <code>MSA</code> account, an unexpired <code>ygg.token</code>/<code>ygg.exp</code>, and <code>profile</code>. Some current official Launcher files omit a reusable <code>accessToken</code>; use the PrismLauncher file or sign in again when that happens. For a nonstandard install, the server operator can set <code>MCWEB_LAUNCHER_ACCOUNTS</code> to the local file path before launching this self-hosted server.</p>
+        <div class="launcher-upload">
+          <label for="launcher-accounts-file">Use a local Launcher JSON file</label>
+          <input id="launcher-accounts-file" type="file" accept=".json,application/json">
+          <p class="fine-print">Choose <code>launcher_accounts.json</code> from the official Launcher or <code>accounts.json</code> from PrismLauncher. The raw file is used once and then discarded from the page.</p>
+        </div>
+        <p id="dev-status" class="dev-status" role="status" aria-live="polite">Waiting for the self-hosted Node server and a supported launcher session.</p>
+        <p id="receiver-status" class="dev-status" role="status" aria-live="polite">Connecting to the self-hosted Node server…</p>
+        <p id="gateway-status" class="dev-status" role="status" aria-live="polite">Online test is disabled until the official Launcher session is validated.</p>
+        <div id="dev-result" class="dev-result" hidden>
+          <strong id="dev-result-title">Launcher account status.</strong>
+          <p id="dev-result-detail"></p>
+        </div>
+      </section>
+
+      <section class="local-card dev-card">
+        <h2>2. Build and install locally</h2>
+        <p>The self-hosted Node process can run the local build in this checkout. The build reads your own Minecraft installation, keeps proprietary inputs on this machine, and reports only a safe phase label to this page. When the build finishes, install the two hash-verified Wasm artifacts into this browser.</p>
+        <p id="build-status" class="dev-status" role="status" aria-live="polite">Checking for a local Wasm image…</p>
+        <div id="build-progress" class="dev-progress" hidden><span id="build-progress-bar"></span></div>
+        <p id="build-progress-label" class="fine-print" hidden></p>
+        <button id="build-locally" class="pixel-button pixel-button-red" type="button" disabled>BUILD WASM IMAGE</button>
+        <details id="build-help" class="build-help">
+          <summary>BUILD FROM TERMINAL</summary>
+          <p>From the <code>public/mcweb</code> checkout, use the command for your operating system if the server build action is unavailable:</p>
+          <div class="dev-command-group">
+            <p class="dev-command-label">macOS</p>
+            <div class="dev-command"><code>node tools/build.mjs --mc-dir "$HOME/Library/Application Support/minecraft" --out dist/build</code><button class="dev-copy" type="button" data-copy="node tools/build.mjs --mc-dir &quot;$HOME/Library/Application Support/minecraft&quot; --out dist/build">COPY</button></div>
+            <p class="dev-command-label">Linux</p>
+            <div class="dev-command"><code>node tools/build.mjs --mc-dir "$HOME/.minecraft" --out dist/build</code><button class="dev-copy" type="button" data-copy="node tools/build.mjs --mc-dir &quot;$HOME/.minecraft&quot; --out dist/build">COPY</button></div>
+            <p class="dev-command-label">Windows PowerShell</p>
+            <div class="dev-command"><code>node tools/build.mjs --mc-dir "$env:APPDATA\.minecraft" --out dist/build</code><button class="dev-copy" type="button" data-copy="node tools/build.mjs --mc-dir &quot;$env:APPDATA\.minecraft&quot; --out dist/build">COPY</button></div>
+          </div>
+          <p class="fine-print">After the command completes, return here. The running self-hosted Node process serves the newly generated <code>build/web-graal/graal/minecraft-client.js.wasm</code>; no upload is involved.</p>
+        </details>
+        <p>The browser verifies the two allowlisted build artifacts in private browser storage before Play; no generated runtime or audio files are part of this source copy.</p>
+        <p id="runtime-status" class="dev-status" role="status" aria-live="polite">Waiting for a locally built image and a validated official Launcher session.</p>
+        <div id="runtime-progress" class="dev-progress" hidden><span id="runtime-progress-bar"></span></div>
+        <p id="runtime-progress-label" class="fine-print" hidden></p>
+        <button id="install-locally" class="pixel-button pixel-button-red" type="button" disabled>INSTALL LOCALLY</button>
+        <button id="delete-local-install" class="pixel-button" type="button" hidden>DELETE LOCAL INSTALL</button>
+        <button id="dev-play-button" class="pixel-button pixel-button-red" type="button" disabled>PLAY</button>
+        <p id="dev-play-note" class="fine-print">Install streams only the two allowlisted build artifacts over the private local connection; the browser verifies their hashes and commits them atomically to this device’s Cache Storage before Play starts.</p>
+        <details id="runtime-diagnostics" class="runtime-diagnostics">
+          <summary>BOOT DIAGNOSTICS</summary>
+          <p id="runtime-diagnostics-summary" class="fine-print">No persisted boot phases yet.</p>
+          <ol id="runtime-diagnostics-log" aria-live="polite"></ol>
+          <button id="clear-runtime-diagnostics" class="pixel-button" type="button">CLEAR BOOT DIAGNOSTICS</button>
+        </details>
+      </section>
+
+      <p class="local-disclaimer">NOT AN OFFICIAL MINECRAFT PRODUCT OR SERVICE. NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR MICROSOFT.</p>
+      <div class="local-note" aria-label="MC-Web links">
+        <span>Official deployment: <a href="https://minecraft.wasm.click/">https://minecraft.wasm&#46;click</a></span>
+        <span>GitHub: <a href="https://github.com/vano04/mcweb">https://github.com/vano04/mcweb</a></span>
+      </div>
+    </div>
+  </main>
+  <script src="/dev/stream-compat.js"></script>
+  <script src="/dev/local-persistence.js"></script>
+  <script src="/dev/dev.js"></script>
+  <script src="/dev/runtime-bootstrap.js"></script>
+</body>
+</html>
