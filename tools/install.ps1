@@ -25,10 +25,24 @@ $MaxNodeBytes = 536870912
 $MaxTextBytes = 1048576
 $MaxRedirects = 3
 
-switch ($env:PROCESSOR_ARCHITECTURE) {
+$ProcessArchitecture = ([string]$env:PROCESSOR_ARCHITECTURE).ToUpperInvariant()
+$HostArchitecture = ([string]$env:PROCESSOR_ARCHITEW6432).ToUpperInvariant()
+if (-not $HostArchitecture) { $HostArchitecture = $ProcessArchitecture }
+switch ($ProcessArchitecture) {
   'AMD64' { $NodePlat = 'win-x64' }
   'ARM64' { $NodePlat = 'win-arm64' }
-  default { Write-Host "mcweb: unsupported architecture: $env:PROCESSOR_ARCHITECTURE" -ForegroundColor Red; exit 1 }
+  'X86' {
+    switch ($HostArchitecture) {
+      'AMD64' { $NodePlat = 'win-x64' }
+      'ARM64' { $NodePlat = 'win-arm64' }
+      default { Write-Host "mcweb: unsupported Windows host architecture: $HostArchitecture" -ForegroundColor Red; exit 1 }
+    }
+  }
+  'ARM' {
+    if ($HostArchitecture -eq 'ARM64') { $NodePlat = 'win-arm64' }
+    else { Write-Host "mcweb: unsupported Windows host architecture: $HostArchitecture" -ForegroundColor Red; exit 1 }
+  }
+  default { Write-Host "mcweb: unsupported process architecture: $ProcessArchitecture" -ForegroundColor Red; exit 1 }
 }
 
 if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) { Write-Host 'mcweb: curl.exe is required (included with supported Windows)' -ForegroundColor Red; exit 1 }

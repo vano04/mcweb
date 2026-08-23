@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
-import { download, sidecarChecksum, toolUrl } from "../tools/mcweb-install.mjs";
+import { download, platformConfigFor, sidecarChecksum, toolUrl } from "../tools/mcweb-install.mjs";
 
 const execFileAsync = promisify(execFile);
 const ROOT = new URL("..", import.meta.url).pathname;
@@ -14,7 +14,7 @@ const realFetch = globalThis.fetch;
 const NODE_ARCHIVE_URL = "https://nodejs.org/dist/v24.19.0/node-v24.19.0-darwin-arm64.tar.gz";
 const GRAAL_ARCHIVE_URL = "https://gds.oracle.com/download/graal/25i2/archive/graalvm-jdk-25i2-25.0.4_macos-aarch64_bin.tar.gz";
 const GRAAL_OBJECT_HOST = "https://objectstorage.uk-london-1.oraclecloud.com";
-const GRAAL_OBJECT_PATH = (token, file) => `${GRAAL_OBJECT_HOST}/p/${token}/n/lr0crfzcb4ml/b/gds-artifacts/o/D53FAE8052773FFAE0530F15000AA6C6/${file}`;
+const GRAAL_OBJECT_PATH = (redirectId, file) => `${GRAAL_OBJECT_HOST}/p/${redirectId}/n/lr0crfzcb4ml/b/gds-artifacts/o/object-id/${file}`;
 const GRAAL_ARM64_FILE = "graalvm-jdk-25i2-25.0.4_linux-aarch64_bin.tar.gz";
 const GRAAL_AMD64_FILE = "graalvm-jdk-25i2-25.0.4_linux-x64_bin.tar.gz";
 const BINARYEN_ARCHIVE_URL = "https://github.com/WebAssembly/binaryen/releases/download/version_131/binaryen-version_131-arm64-macos.tar.gz";
@@ -46,10 +46,30 @@ test("clean-machine installer publishes an explicit native/emulated matrix", asy
   assert.match(stdout, /linux-arm64/);
   assert.match(stdout, /win32-x64/);
   assert.match(stdout, /win32-arm64/);
-  assert.match(stdout, /best effort\/unsupported/);
+  assert.match(stdout, /Windows ARM64 uses the pinned Windows x64 GraalVM builder/);
   assert.match(stdout, /25\.2\.4 \(25i2\)/);
   assert.match(stdout, /SHA-256/);
   assert.match(stdout, /dry-run: no downloads or writes/);
+});
+
+test("Windows ARM64 selects x64 GraalVM under emulation without inventing an ARM archive", async () => {
+  const native = platformConfigFor("win32", "arm64", { PROCESSOR_ARCHITECTURE: "ARM64" });
+  assert.equal(native.key, "win32-arm64");
+  assert.equal(native.node, "win-arm64");
+  assert.equal(native.graal, "windows-x64");
+  assert.match(native.emulated, /Windows x64 GraalVM builder/);
+
+  const emulated = platformConfigFor("win32", "x64", {
+    PROCESSOR_ARCHITECTURE: "AMD64",
+    PROCESSOR_ARCHITEW6432: "ARM64",
+  });
+  assert.equal(emulated.key, "win32-arm64");
+  assert.equal(emulated.node, "win-x64");
+  assert.equal(emulated.graal, "windows-x64");
+
+  const source = await readFile(`${ROOT}/tools/mcweb-install.mjs`, "utf8");
+  assert.match(source, /windows-x64/);
+  assert.doesNotMatch(source, /windows-aarch64/);
 });
 
 test("installer pins official archives and verifies vendor checksums", async () => {
@@ -74,10 +94,12 @@ test("installer pins official archives and verifies vendor checksums", async () 
 
 test("README states the public GraalVM baseline and unsupported hosts", async () => {
   const readme = await readFile(`${ROOT}/README.md`, "utf8");
+  assert.match(readme, /^# How to run/);
+  assert.match(readme, /ExecutionPolicy Bypass/);
   assert.match(readme, /GraalVM Web Image 25\.1 or newer/);
   assert.match(readme, /25\.2\.4 \(25i2/);
   assert.match(readme, /receive-only/);
-  assert.match(readme, /best effort\/unsupported/);
+  assert.match(readme, /supported through Windows x64 emulation/);
   assert.match(readme, /10 GB of RAM/);
   assert.match(readme, /d209fadd8a894bdaf3bd3612a23c32a0af184d2f4a979b8c789e6e4f6a4de883/);
 });
@@ -89,7 +111,10 @@ test("README separates CDN download mode from the optional local launcher mode",
 });
 
 test("build preflight requires public Web Image but labels the old toolchain legacy", async () => {
-  const build = await readFile(`${ROOT}/tools/build.mjs`, "utf8");
+  const [build, gradle] = await Promise.all([
+    readFile(`${ROOT}/tools/build.mjs`, "utf8"),
+    readFile(`${ROOT}/build.gradle`, "utf8"),
+  ]);
   assert.match(build, /MIN_GRAAL_VERSION = \[25, 1, 0\]/);
   assert.match(build, /LEGACY_GRAAL_VERSION = \[25, 0, 4\]/);
   assert.match(build, /explicitly selected via GRAALVM_HOME or --graalvm-home/);
@@ -97,6 +122,45 @@ test("build preflight requires public Web Image but labels the old toolchain leg
   assert.match(build, /svm-wasm.*builder.*svm-wasm\.jar/);
   assert.match(build, /org\.graalvm\.webimage\.api\.jmod/);
   assert.match(build, /native-image/);
+  assert.match(build, /executableNames/);
+  assert.match(build, /OS_ARCH/);
+  assert.match(gradle, /native-image\.exe/);
+  assert.match(gradle, /native-image\.cmd/);
+});
+
+test("root entrypoints route through one standard build-and-run flow", async () => {
+  const [unixRun, windowsRun, unixInstall, windowsInstall] = await Promise.all([
+    readFile(`${ROOT}/run.sh`, "utf8"),
+    readFile(`${ROOT}/run.ps1`, "utf8"),
+    readFile(`${ROOT}/install.sh`, "utf8"),
+    readFile(`${ROOT}/install.ps1`, "utf8"),
+  ]);
+  assert.match(unixRun, /tools\/install\.sh.*--run/);
+  assert.match(windowsRun, /tools\\install\.ps1/);
+  assert.match(windowsRun, /--run/);
+  for (const source of [unixInstall, windowsInstall]) {
+    assert.match(source, /vano04\/mcweb/);
+    assert.match(source, /refs\/heads/);
+    assert.match(source, /(?:REF|Ref)\s*=?.*main/);
+    assert.match(source, /codeload\.github\.com/);
+    assert.match(source, /mcweb-install\.json/);
+    assert.match(source, /refus(?:e|ing).*overwrite/i);
+    assert.doesNotMatch(source, /minecraft-26\.2-client\.jar|\.wasm|\.ogg/);
+  }
+});
+
+test("Unix root bootstrap dry-run is write-free and pinned", async (t) => {
+  const install = `${ROOT}/install.sh`;
+  const destination = await tempDir(t);
+  const result = await execFileAsync("sh", [install, "--dry-run"], {
+    cwd: ROOT,
+    env: { ...process.env, MCWEB_INSTALL_DIR: join(destination, "project") },
+    timeout: 5000,
+    maxBuffer: 1024 * 1024,
+  });
+  assert.match(result.stdout, /https:\/\/github\.com\/vano04\/mcweb\/archive\/refs\/heads\/main\.tar\.gz/);
+  assert.match(result.stdout, /no downloads or writes/);
+  assert.equal(await exists(join(destination, "project")), false);
 });
 
 test("bootstrap wrappers stay local and do not fetch a hosted installer", async () => {
@@ -138,6 +202,7 @@ test("clean-machine Node bootstrap is bounded, pinned, atomic, and dry-run safe"
   assert.match(ps1, /Commit-Atomic/);
   assert.match(ps1, /Has-McDir/);
   assert.match(ps1, /Has-Arg '--dry-run'/);
+  assert.match(ps1, /PROCESSOR_ARCHITEW6432/);
   assert.match(ps1, /trap\s*\{/);
   assert.match(ps1, /Cleanup-Temps\s*\n& \$Node/);
   assert.match(ps1, /File\]::Replace/);
@@ -359,9 +424,8 @@ test("developer-tool URLs are exact HTTPS vendor paths and reject unsafe variant
 });
 
 test("Oracle Graal regional redirects are exact object paths for the selected archive", () => {
-  const token = "UeEmHQAGdmqBF5tQF69RUe_3s_sDy7ps9MWnRDfd66iPC6ZIAJLWq2PBv_KV68c8";
-  const arm64 = GRAAL_OBJECT_PATH(token, GRAAL_ARM64_FILE);
-  const amd64 = GRAAL_OBJECT_PATH(token, GRAAL_AMD64_FILE);
+  const arm64 = GRAAL_OBJECT_PATH("redirect-id", GRAAL_ARM64_FILE);
+  const amd64 = GRAAL_OBJECT_PATH("redirect-id", GRAAL_AMD64_FILE);
   assert.equal(toolUrl(arm64, "graal", { redirect: true, expectedFile: GRAAL_ARM64_FILE }), arm64);
   assert.equal(toolUrl(amd64, "graal", { redirect: true, expectedFile: GRAAL_AMD64_FILE }), amd64);
   assert.throws(() => toolUrl(arm64, "graal", { redirect: true }), /object-storage path/);
@@ -369,11 +433,11 @@ test("Oracle Graal regional redirects are exact object paths for the selected ar
     arm64.replace("objectstorage.uk-london-1.oraclecloud.com", "objectstorage.us-phoenix-1.oraclecloud.com"),
     arm64.replace("/n/lr0crfzcb4ml/", "/n/othernamespace/"),
     arm64.replace("/b/gds-artifacts/", "/b/otherbucket/"),
-    arm64.replace("/o/D53FAE8052773FFAE0530F15000AA6C6/", "/o/otherobject/"),
+    arm64.replace("/o/object-id/", "/o/object-id/extra/"),
     arm64.replace(GRAAL_ARM64_FILE, GRAAL_AMD64_FILE),
     `${arm64}?download=1`,
-    arm64.replace(`/p/${token}/`, `/p/${token}/extra/`),
-    arm64.replace(`/p/${token}/`, "/p/token%2Fwith-slash/"),
+    arm64.replace("/p/redirect-id/", "/p/redirect-id/extra/"),
+    arm64.replace("/p/redirect-id/", "/p/id%2Fwith-slash/"),
     arm64.replace("objectstorage.uk-london-1.oraclecloud.com", "user:pass@objectstorage.uk-london-1.oraclecloud.com"),
   ]) assert.throws(() => toolUrl(bad, "graal", { redirect: true, expectedFile: GRAAL_ARM64_FILE }));
 });

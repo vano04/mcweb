@@ -42,6 +42,20 @@ const GRADLEW = process.platform === "win32"
   ? join(PROJECT, "gradlew.bat")
   : join(PROJECT, "gradlew");
 
+// Windows JDK distributions expose java as `java.exe`, while GraalVM's
+// native-image entrypoint may be either the direct executable or its batch
+// launcher depending on the distribution.  Checking the extensionless POSIX
+// names made a valid Windows Web Image JDK look empty during preflight.
+const executableNames = (name) => process.platform === "win32"
+  ? [`${name}.exe`, `${name}.cmd`, `${name}.bat`]
+  : [name];
+const hasExecutable = async (directory, name) => {
+  for (const candidate of executableNames(name)) {
+    if (await exists(join(directory, candidate))) return true;
+  }
+  return false;
+};
+
 const argv = process.argv.slice(2);
 const flag = (name, fallback = null) => {
   const i = argv.indexOf(`--${name}`);
@@ -182,11 +196,9 @@ async function inspectGraalHome(raw, { allowLegacy = false } = {}) {
   const candidates = graalHomeCandidates(raw);
   for (const home of candidates) {
     const releasePath = join(home, "release");
-    const javaPath = join(home, "bin", "java");
     const svmJar = join(home, "lib", "svm", "builder", "svm.jar");
     const svmWasmJar = join(home, "lib", "svm", "tools", "svm-wasm", "builder", "svm-wasm.jar");
     const webImageModule = join(home, "jmods", "org.graalvm.webimage.api.jmod");
-    const nativeImage = join(home, "bin", "native-image");
     if (!(await exists(releasePath))) continue;
     const release = await readFile(releasePath, "utf8").catch(() => "");
     const javaVersion = versionTuple(releaseValue(release, "JAVA_VERSION"));
@@ -198,18 +210,32 @@ async function inspectGraalHome(raw, { allowLegacy = false } = {}) {
       return { error: `${home}: implementor is ${implementor || "unknown"}, not Oracle GraalVM` };
     }
     if (!graalVersion) return { error: `${home}: release file has no GRAALVM_VERSION` };
+    // Oracle does not publish a native ARM64 Windows Web Image builder.  On
+    // Windows, accept only an explicitly identifiable x64 JDK so an ARM64
+    // (or otherwise unknown) toolchain cannot be mistaken for the emulated
+    // x64 builder used by the supported ARM64 path.
+    if (process.platform === "win32") {
+      const osArch = releaseValue(release, "OS_ARCH") ?? releaseValue(release, "OS_ARCHITECTURE");
+      if (!osArch) return { error: `${home}: release file has no OS_ARCH; cannot verify Windows x64 Web Image builder` };
+      if (!/^(?:amd64|x86_64|x64)$/i.test(osArch)) {
+        return { error: `${home}: OS_ARCH=${osArch} is not the required Windows x64 Web Image builder` };
+      }
+    }
     const isLegacy = compareVersions(graalVersion, MIN_GRAAL_VERSION) < 0;
     if (isLegacy && (!allowLegacy || compareVersions(graalVersion, LEGACY_GRAAL_VERSION) < 0)) {
       return { error: `${home}: GraalVM ${graalVersionText} is older than Web Image 25.1 (public baseline)` };
     }
     const missing = [];
-    if (!(await exists(javaPath))) missing.push("bin/java");
+    if (!(await hasExecutable(join(home, "bin"), "java"))) missing.push("bin/java");
     if (!(await exists(svmJar))) missing.push("lib/svm/builder/svm.jar");
     if (!(await exists(svmWasmJar))) missing.push("lib/svm/tools/svm-wasm/builder/svm-wasm.jar");
     if (!(await exists(webImageModule))) missing.push("jmods/org.graalvm.webimage.api.jmod");
-    if (!(await exists(nativeImage)) && !(await exists(join(home, "lib", "svm", "bin", "native-image")))) {
-      missing.push("native-image");
-    }
+    // The direct native-image executable is preferred by the Gradle task on
+    // Windows, but the public distribution can expose only the batch
+    // launcher. Either location is valid; require one, not both.
+    const directNativeImage = await hasExecutable(join(home, "bin"), "native-image");
+    const svmNativeImage = await hasExecutable(join(home, "lib", "svm", "bin"), "native-image");
+    if (!directNativeImage && !svmNativeImage) missing.push("native-image");
     if (missing.length) return { error: `${home}: missing ${missing.join(", ")}` };
     return {
       home,

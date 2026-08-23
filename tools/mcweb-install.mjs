@@ -41,6 +41,15 @@ const say = (...args) => console.log("mcweb:", ...args);
 const die = (message) => { console.error(`mcweb: ${message}`); process.exit(1); };
 const exists = async (path) => !!(await stat(path).catch(() => null));
 const exe = (name) => process.platform === "win32" ? `${name}.exe` : name;
+const executableNames = (name) => process.platform === "win32"
+  ? [`${name}.exe`, `${name}.cmd`, `${name}.bat`]
+  : [name];
+const hasExecutable = async (directory, name) => {
+  for (const candidate of executableNames(name)) {
+    if (await exists(join(directory, candidate))) return true;
+  }
+  return false;
+};
 
 function validateInstallerArgs() {
   const mcDir = flag("mc-dir");
@@ -100,7 +109,11 @@ const BINARYEN_BASE = `https://github.com/WebAssembly/binaryen/releases/download
 const GRAAL_OBJECT_HOST = "objectstorage.uk-london-1.oraclecloud.com";
 const GRAAL_OBJECT_NAMESPACE = "lr0crfzcb4ml";
 const GRAAL_OBJECT_BUCKET = "gds-artifacts";
-const GRAAL_OBJECT_ID = "D53FAE8052773FFAE0530F15000AA6C6";
+// Oracle's GDS redirect includes an opaque object identifier.  Keep its
+// shape constrained, but do not check in the identifier or a signed redirect
+// token: either is vendor-controlled and can be rotated independently of the
+// pinned archive and checksum.
+const GRAAL_OBJECT_ID_PATTERN = "[A-Za-z0-9_-]{1,256}";
 
 // Developer-tool downloads are deliberately a separate lane from the Minecraft
 // CDN downloader.  These URLs are all fixed by this file; validation here also
@@ -149,10 +162,10 @@ function graalObjectRedirectPath(pathname, expectedFile) {
   const file = String(expectedFile || "");
   if (!Object.values(GRAALVM_ARTIFACTS).some((artifact) => artifact.file === file)) return false;
   const escapedFile = escapeRegExp(file);
-  return new RegExp(`^/p/[A-Za-z0-9_-]{1,256}/n/${GRAAL_OBJECT_NAMESPACE}/b/${GRAAL_OBJECT_BUCKET}/o/${GRAAL_OBJECT_ID}/${escapedFile}$`).test(pathname);
+  return new RegExp(`^/p/${GRAAL_OBJECT_ID_PATTERN}/n/${GRAAL_OBJECT_NAMESPACE}/b/${GRAAL_OBJECT_BUCKET}/o/${GRAAL_OBJECT_ID_PATTERN}/${escapedFile}$`).test(pathname);
 }
 
-const PLATFORM_MATRIX = {
+const PLATFORM_MATRIX = Object.freeze({
   "darwin-arm64": {
     node: "darwin-arm64", graal: "macos-aarch64", graalExt: "tar.gz", binaryen: "arm64-macos",
   },
@@ -171,20 +184,57 @@ const PLATFORM_MATRIX = {
   },
   "win32-arm64": {
     node: "win-arm64", graal: "windows-x64", graalExt: "zip", binaryen: "arm64-windows",
-    emulated: "best effort/unsupported: use the Windows x64 GraalVM builder under Windows x64 emulation; this is not native ARM64 support.",
+    emulated: "Windows ARM64 uses the pinned Windows x64 GraalVM builder under x64 emulation; Oracle does not publish a native ARM64 Web Image archive.",
   },
-};
+});
 
-function hostKey() {
-  return `${process.platform}-${process.arch}`;
+function normalizedWindowsArch(raw) {
+  const value = String(raw || "").trim().toLowerCase();
+  if (["amd64", "x64", "x86_64"].includes(value)) return "x64";
+  if (["arm64", "aarch64"].includes(value)) return "arm64";
+  return null;
 }
 
-function hostConfig() {
-  const key = hostKey();
+// PROCESSOR_ARCHITEW6432 exposes the host architecture when a Windows x64
+// process is running under emulation.  Prefer it over process.arch so an
+// emulated x64 Node process still reports the ARM64 host and the deliberate
+// Windows-x64 GraalVM mapping.  The Node archive itself remains selected by
+// the process architecture because it must be runnable by this process.
+function windowsHostArch(environment = process.env, executionArch = process.arch) {
+  return normalizedWindowsArch(environment.PROCESSOR_ARCHITEW6432)
+    || normalizedWindowsArch(environment.PROCESSOR_ARCHITECTURE)
+    || normalizedWindowsArch(executionArch)
+    || null;
+}
+
+function nodePlatform(platformName, executionArch) {
+  if (platformName === "win32") {
+    const arch = normalizedWindowsArch(executionArch);
+    return arch === "arm64" ? "win-arm64" : arch === "x64" ? "win-x64" : null;
+  }
+  if (platformName === "darwin") return executionArch === "arm64" ? "darwin-arm64" : executionArch === "x64" ? "darwin-x64" : null;
+  if (platformName === "linux") return executionArch === "arm64" ? "linux-arm64" : executionArch === "x64" ? "linux-x64" : null;
+  return null;
+}
+
+function platformKey(platformName = process.platform, executionArch = process.arch, environment = process.env) {
+  const arch = platformName === "win32"
+    ? windowsHostArch(environment, executionArch)
+    : normalizedWindowsArch(executionArch);
+  return arch ? `${platformName}-${arch}` : `${platformName}-${executionArch}`;
+}
+
+function platformConfigFor(platformName = process.platform, executionArch = process.arch, environment = process.env) {
+  const key = platformKey(platformName, executionArch, environment);
   const config = PLATFORM_MATRIX[key];
   if (!config) die(`unsupported host ${key}; supported hosts are ${Object.keys(PLATFORM_MATRIX).join(", ")}`);
   if (config.unsupported) die(`unsupported host ${key}: ${config.unsupported}`);
-  return { key, ...config };
+  const selectedNode = nodePlatform(platformName, executionArch) || config.node;
+  return { key, ...config, node: selectedNode };
+}
+
+function hostConfig() {
+  return platformConfigFor();
 }
 
 function printMatrix() {
@@ -523,7 +573,19 @@ function atLeastVersion(version, minimum) {
   return true;
 }
 
-async function usableGraalVm(candidate) {
+function graalReleaseArchitecture(release) {
+  return String(releaseValue(release, "OS_ARCH") || releaseValue(release, "OS_ARCHITECTURE") || "").trim().toLowerCase();
+}
+
+function graalArchitectureAllowed(release, artifactKey) {
+  // Windows ARM64 deliberately reuses the Windows x64 archive under OS
+  // emulation. Reject an ARM64 or unidentifiable JDK instead of silently
+  // accepting a native toolchain that Oracle does not publish for Web Image.
+  if (artifactKey !== "windows-x64") return true;
+  return ["amd64", "x86_64", "x64"].includes(graalReleaseArchitecture(release));
+}
+
+async function usableGraalVm(candidate, { artifactKey = null } = {}) {
   for (const home of javaHomes(candidate)) {
     const releasePath = join(home, "release");
     if (!(await exists(releasePath))) continue;
@@ -531,24 +593,26 @@ async function usableGraalVm(candidate) {
     const javaVersion = releaseValue(release, "JAVA_VERSION");
     const graalVersion = releaseValue(release, "GRAALVM_VERSION");
     if (!/Oracle/i.test(releaseValue(release, "IMPLEMENTOR"))) continue;
+    if (!graalArchitectureAllowed(release, artifactKey)) continue;
     // Validate the GraalVM distribution version, not just JAVA_VERSION: the
     // public 25.2.4 archive is based on JDK 25.0.4.
     if (!atLeastVersion(graalVersion, MIN_GRAALVM_VERSION)) continue;
-    const required = [
-      join(home, "bin", exe("java")),
-      join(home, "lib", "svm", "builder", "svm.jar"),
-      join(home, "lib", "svm", "tools", "svm-wasm", "builder", "svm-wasm.jar"),
-      join(home, "jmods", "org.graalvm.webimage.api.jmod"),
-    ];
-    const nativeImage = [join(home, "bin", exe("native-image")), join(home, "lib", "svm", "bin", exe("native-image"))];
-    const requiredPresent = await Promise.all(required.map((path) => exists(path)));
-    const nativeImagePresent = await Promise.all(nativeImage.map((path) => exists(path)));
+    const requiredPresent = await Promise.all([
+      hasExecutable(join(home, "bin"), "java"),
+      exists(join(home, "lib", "svm", "builder", "svm.jar")),
+      exists(join(home, "lib", "svm", "tools", "svm-wasm", "builder", "svm-wasm.jar")),
+      exists(join(home, "jmods", "org.graalvm.webimage.api.jmod")),
+    ]);
+    const nativeImagePresent = await Promise.all([
+      hasExecutable(join(home, "bin"), "native-image"),
+      hasExecutable(join(home, "lib", "svm", "bin"), "native-image"),
+    ]);
     if (requiredPresent.every(Boolean) && nativeImagePresent.some(Boolean)) return home;
   }
   return null;
 }
 
-async function existingGraalVm() {
+async function existingGraalVm(host) {
   const candidates = [process.env.GRAALVM_HOME, process.env.JAVA_HOME, join(HOME, "toolchain"), join(homedir(), "graalvm")];
   for (const root of [join(homedir(), "graalvm"), join(homedir(), "Library", "Java", "JavaVirtualMachines")]) {
     for (const entry of await readdir(root, { withFileTypes: true }).catch(() => [])) {
@@ -558,7 +622,7 @@ async function existingGraalVm() {
     }
   }
   for (const candidate of candidates) {
-    const home = await usableGraalVm(candidate);
+    const home = await usableGraalVm(candidate, { artifactKey: host.graal });
     if (home) return home;
   }
   return null;
@@ -593,7 +657,7 @@ async function installGraal(host) {
     destination,
     archiveName: artifact.file,
   });
-  const home = await usableGraalVm(destination);
+  const home = await usableGraalVm(destination, { artifactKey: host.graal });
   if (!home) die(`Oracle GraalVM extracted but does not contain a supported Web Image JDK: ${destination}`);
   return home;
 }
@@ -670,7 +734,7 @@ async function main() {
   }
 
   await mkdir(HOME, { recursive: true });
-  let home = has("force-download") ? null : await existingGraalVm();
+  let home = has("force-download") ? null : await existingGraalVm(host);
   if (home) say(`using Oracle GraalVM at ${home}`);
   else home = await installGraal(host);
 
@@ -723,6 +787,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
 export {
   download,
   fetchAndExtract,
+  platformConfigFor,
   sidecarChecksum,
   toolUrl,
 };

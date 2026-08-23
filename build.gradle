@@ -7266,8 +7266,13 @@ tasks.register("graalWebImage", Exec) {
         def onWindows = System.getProperty("os.name").toLowerCase().contains("windows")
         def nativeImage = file("${graalVmHome.get()}/bin/native-image")
         if (onWindows) {
-            def direct = file("${graalVmHome.get()}/lib/svm/bin/native-image.exe")
-            nativeImage = direct.isFile() ? direct : file("${graalVmHome.get()}/bin/native-image.cmd")
+            def candidates = [
+                    file("${graalVmHome.get()}/lib/svm/bin/native-image.exe"),
+                    file("${graalVmHome.get()}/bin/native-image.exe"),
+                    file("${graalVmHome.get()}/bin/native-image.cmd"),
+                    file("${graalVmHome.get()}/bin/native-image.bat")
+            ]
+            nativeImage = candidates.find { it.isFile() } ?: candidates.last()
         }
         if (!nativeImage.isFile()) {
             throw new GradleException("native-image was not found at ${nativeImage}")

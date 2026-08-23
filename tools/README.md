@@ -14,6 +14,12 @@ development lane.
 | `mcweb-install.mjs` | Downloads checksum-verified developer tools, validates/downloads the 26.2 input cache, and optionally builds/runs. |
 | `webimage-patch/` | Source patches used by the Gradle Web Image build. |
 
+The repository-root `run.sh` and `run.ps1` are the only standard local
+build-and-run entrypoints. The repository-root `install.sh` and `install.ps1`
+are source-only GitHub bootstraps for machines that do not already have this
+directory; they install into `~/.mcweb/project` (or `MCWEB_INSTALL_DIR`) and
+refuse to overwrite an unmarked user directory.
+
 The remaining WasmGC/WasmLM helper files are build inputs referenced by
 `build.gradle`; they do not fetch or contain generated runtime bytes.
 

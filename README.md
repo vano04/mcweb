@@ -1,3 +1,33 @@
+# How to run
+
+Unix/macOS/Linux, from any directory with `curl` and `tar`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/vano04/mcweb/main/install.sh | sh
+cd "$HOME/.mcweb/project"
+./run.sh
+```
+
+Windows PowerShell, with a process-only policy bypass (this does not change
+the machine or user execution policy):
+
+```powershell
+$p = Join-Path $env:TEMP 'mcweb-install.ps1'
+Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/vano04/mcweb/main/install.ps1' -OutFile $p
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $p
+Set-Location (Join-Path $env:USERPROFILE '.mcweb\project')
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run.ps1
+```
+
+The two `run` scripts are the standard local flow: they validate or install
+the pinned developer tools, download or validate the official 26.2 inputs,
+build the local Web Image, and start the loopback server. Use `--mc-dir` to
+reuse an existing official Launcher/PrismLauncher layout. On Windows ARM64,
+the installer uses the native ARM64 Node release when available and
+intentionally selects the pinned Windows x64 Oracle GraalVM Web Image builder,
+which runs through Windows x64 emulation. Oracle does not publish a native
+ARM64 Web Image archive; the installer never invents or labels one as native.
+
 # MC-Web local development distribution
 
 This directory is the source-only local launcher for MC-Web. It runs the
@@ -53,7 +83,7 @@ The current toolchain matrix is:
 | macOS x64 | — | receive-only: Oracle 25i2 has no x64 Web Image archive; build elsewhere |
 | Linux x64 / arm64 | native Oracle GraalVM | supported |
 | Windows x64 | native Oracle GraalVM | supported |
-| Windows arm64 | Windows x64 Oracle GraalVM | best effort/unsupported under x64 emulation; not native ARM64 |
+| Windows arm64 | Windows x64 Oracle GraalVM | supported through Windows x64 emulation; not native ARM64 |
 
 The archive URLs and locked checksum pins are kept in
 `tools/mcweb-install.mjs`: Node.js `v24.19.0`, Oracle GraalVM `25.2.4`
