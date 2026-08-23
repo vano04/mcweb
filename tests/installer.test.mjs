@@ -102,6 +102,9 @@ test("README states the public GraalVM baseline and unsupported hosts", async ()
   assert.match(readme, /installer download failed/);
   assert.match(readme, /install\/run failed with exit code/);
   assert.doesNotMatch(readme, /irm\s*\|\s*iex/i);
+  const windowsCodeBlock = readme.match(/```powershell\r?\n([\s\S]*?)\r?\n```/);
+  assert.ok(windowsCodeBlock, "README must contain the Windows bootstrap code block");
+  assert.equal(windowsCodeBlock[1].split(/\r?\n/).length, 1, "Windows bootstrap must be one line");
   assert.doesNotMatch(readme, /raw\.githubusercontent\.com\/vano04\/mcweb\/main\/install\.sh/);
   assert.doesNotMatch(readme, /Invoke-WebRequest/);
   assert.match(readme, /ExecutionPolicy Bypass/);
