@@ -1,0 +1,25 @@
+# Build output.
+.gradle/
+build/
+gradle-local/
+node_modules/
+*.log
+
+# Player-built bundles: Mojang-derived image, loader and audio.
+# Never commit or publish these.
+dist/
+
+# --------------------------------------------------------------------------
+# Mojang-owned inputs. None of these are ever committed or redistributed.
+# Reconstruct them from your own installation:
+#
+#   node tools/stage-mojang-assets.mjs
+#
+# See NOTICE.md.
+# --------------------------------------------------------------------------
+minecraft-26.2-client.jar
+web/assets/*.png
+src/graal/resources/assets/
+
+# macOS Finder metadata.
+.DS_Store
