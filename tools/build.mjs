@@ -32,6 +32,7 @@ import {
   validateRedirect,
   validateRelativePath as safeRelativePath,
 } from "./minecraft-input-policy.mjs";
+import { validateBuildGradle } from "./source-integrity.mjs";
 
 const VERSION = "26.2";
 const EXPECTED_CLIENT_SHA256 = "40896ee9f1e2bec3c934daac7e93d41e9e3d9c2f8ae0ca366d52ffbfd1afa290";
@@ -97,6 +98,12 @@ function validateBuildArgs() {
   if (offline && !downloading) die("--offline requires the CDN download mode; remove --mc-dir/--local-only");
 }
 validateBuildArgs();
+
+// Gradle's Groovy parser reports binary/truncated source as an opaque line-1
+// syntax error. Check the published source before any launcher staging or
+// compiler work so a damaged GitHub clone gets a recovery instruction instead.
+const sourceIntegrity = await validateBuildGradle(PROJECT);
+if (!sourceIntegrity.ok) die(sourceIntegrity.message);
 
 // The checked-in image recipes use Oracle GraalVM's Web Image distribution. The
 // ordinary macOS `java_home` registry often only knows about a system JDK, so
