@@ -15,7 +15,7 @@ development lane.
 | `webimage-patch/` | Source patches used by the Gradle Web Image build. |
 
 The repository-root `run.sh` and `run.ps1` are the only standard local
-build-and-run entrypoints. The repository-root `install.sh` and `install.ps1`
+build-and-run entrypoints. The repository-root `install` and `install.ps1`
 are source-only GitHub bootstraps for machines that do not already have this
 directory; they install into `~/.mcweb/project` (or `MCWEB_INSTALL_DIR`) and
 refuse to overwrite an unmarked user directory.

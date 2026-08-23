@@ -95,6 +95,10 @@ test("installer pins official archives and verifies vendor checksums", async () 
 test("README states the public GraalVM baseline and unsupported hosts", async () => {
   const readme = await readFile(`${ROOT}/README.md`, "utf8");
   assert.match(readme, /^# How to run/);
+  assert.match(readme, /raw\.githubusercontent\.com\/vano04\/mcweb\/main\/install \| sh/);
+  assert.match(readme, /curl\.exe -fsSL [^\n]+install\.ps1[^\n]+-o \$p/);
+  assert.doesNotMatch(readme, /raw\.githubusercontent\.com\/vano04\/mcweb\/main\/install\.sh/);
+  assert.doesNotMatch(readme, /Invoke-WebRequest/);
   assert.match(readme, /ExecutionPolicy Bypass/);
   assert.match(readme, /GraalVM Web Image 25\.1 or newer/);
   assert.match(readme, /25\.2\.4 \(25i2/);
@@ -132,7 +136,7 @@ test("root entrypoints route through one standard build-and-run flow", async () 
   const [unixRun, windowsRun, unixInstall, windowsInstall] = await Promise.all([
     readFile(`${ROOT}/run.sh`, "utf8"),
     readFile(`${ROOT}/run.ps1`, "utf8"),
-    readFile(`${ROOT}/install.sh`, "utf8"),
+    readFile(`${ROOT}/install`, "utf8"),
     readFile(`${ROOT}/install.ps1`, "utf8"),
   ]);
   assert.match(unixRun, /tools\/install\.sh.*--run/);
@@ -150,7 +154,7 @@ test("root entrypoints route through one standard build-and-run flow", async () 
 });
 
 test("Unix root bootstrap dry-run is write-free and pinned", async (t) => {
-  const install = `${ROOT}/install.sh`;
+  const install = `${ROOT}/install`;
   const destination = await tempDir(t);
   const result = await execFileAsync("sh", [install, "--dry-run"], {
     cwd: ROOT,

@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
-import { readFile, readdir } from "node:fs/promises";
+import { readFile, readdir, stat } from "node:fs/promises";
 import { extname, join, relative } from "node:path";
 import test from "node:test";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const TEXT_EXTENSIONS = new Set([".html", ".js", ".mjs", ".java", ".gradle", ".md", ".json", ".css", ".svg", ".properties"]);
+
+async function exists(path) {
+  return !!(await stat(path).catch(() => null));
+}
 
 async function filesUnder(directory) {
   const output = [];
@@ -88,7 +92,8 @@ test("generated or proprietary payloads are absent from the copy", async () => {
 });
 
 test("root install and run entrypoints remain source-only and repository-pinned", async () => {
-  const paths = ["install.sh", "install.ps1", "run.sh", "run.ps1"].map((name) => join(ROOT, name));
+  assert.equal(await exists(join(ROOT, "install.sh")), false, "the Unix root bootstrap is named install");
+  const paths = ["install", "install.ps1", "run.sh", "run.ps1"].map((name) => join(ROOT, name));
   const text = (await Promise.all(paths.map(async (path) => readFile(path, "utf8")))).join("\n");
   assert.match(text, /vano04\/mcweb/);
   assert.match(text, /refs\/heads/);

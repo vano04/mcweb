@@ -16,7 +16,7 @@ die() { echo "mcweb: $*" >&2; exit 1; }
 
 case "${1:-}" in
   --help|-h)
-    echo "Usage: ./install.sh [--dry-run]"
+    echo "Usage: ./install [--dry-run]"
     echo "Set MCWEB_INSTALL_DIR to choose a different destination."
     exit 0
     ;;
@@ -88,7 +88,7 @@ tar -xzf "$ARCHIVE" -C "$EXTRACTED" --strip-components=1 \
 [ -f "$EXTRACTED/run.sh" ] || die "source archive is missing run.sh"
 
 printf '%s\n' '{' '  "schema": 1,' '  "repository": "vano04/mcweb",' \
-  '  "ref": "main",' '  "managedBy": "mcweb/install.sh"' '}' > "$EXTRACTED/.mcweb-install.json"
+  '  "ref": "main",' '  "managedBy": "mcweb/install"' '}' > "$EXTRACTED/.mcweb-install.json"
 
 BACKUP=""
 if [ -e "$INSTALL_DIR" ] || [ -L "$INSTALL_DIR" ]; then

@@ -3,7 +3,7 @@
 Unix/macOS/Linux, from any directory with `curl` and `tar`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/vano04/mcweb/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/vano04/mcweb/main/install | sh
 cd "$HOME/.mcweb/project"
 ./run.sh
 ```
@@ -13,7 +13,7 @@ the machine or user execution policy):
 
 ```powershell
 $p = Join-Path $env:TEMP 'mcweb-install.ps1'
-Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/vano04/mcweb/main/install.ps1' -OutFile $p
+curl.exe -fsSL 'https://raw.githubusercontent.com/vano04/mcweb/main/install.ps1' -o $p
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File $p
 Set-Location (Join-Path $env:USERPROFILE '.mcweb\project')
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run.ps1
