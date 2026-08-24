@@ -56,14 +56,12 @@ export function nativeImageFailureMessage({ command, code, signal, stderr = "", 
       + "  Windows reported STATUS_DLL_NOT_FOUND: a DLL needed by native-image.exe could not be loaded.\n"
       + "  This is a loader/dependency failure, not a native-image Java heap or active-RAM failure.\n"
       + "  The likely dependency class is the MSVC/UCRT runtime; this status alone does not reveal the exact DLL.\n"
-      + "  Oracle's Windows Native Image prerequisite is MSVC 14.x+ with the Windows 11 SDK.\n"
-      + "  Install or repair Visual Studio 2022 Build Tools with the Desktop development with C++ workload\n"
-      + "  and Windows 11 SDK, then open a new PowerShell and retry. Do not copy an untrusted DLL into the JDK.\n"
-      + "  To identify the imported DLLs from an installed VS toolchain, run:\n"
+      + "  Re-run .\\tools\\install.ps1 --build so the verified JDK bin directory and llvm-mingw adapter are restored.\n"
+      + "  If the loader still fails, install Microsoft's official current x64 Visual C++ Redistributable;\n"
+      + "  llvm-mingw replaces the compiler and SDK, not DLLs imported by Oracle's native-image executable.\n"
+      + "  Do not download or copy an unofficial DLL into the JDK. To reproduce the loader failure, run:\n"
       + `    & '${command}' --version\n`
-      + "    where.exe cl.exe\n"
-      + "    where.exe dumpbin.exe\n"
-      + `    dumpbin.exe /DEPENDENTS '${command}'${detail}`;
+      + `    where.exe vcruntime140.dll${detail}`;
   }
   return `native-image preflight failed: ${command} --version ${formatExit(code, signal)}.${detail}`;
 }

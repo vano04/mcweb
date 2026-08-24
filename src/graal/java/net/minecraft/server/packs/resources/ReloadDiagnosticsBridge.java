@@ -17,8 +17,7 @@ public final class ReloadDiagnosticsBridge {
             PreparableReloadListener listener,
             Executor preparationExecutor,
             Executor mainExecutor,
-            SimpleReloadInstance<?> instance,
-            boolean preparationIsAgentBacked
+            SimpleReloadInstance<?> instance
     ) {
         BrowserReloadDiagnostics.listenerCreateStarted(instance, listener);
         try {
@@ -29,14 +28,12 @@ public final class ReloadDiagnosticsBridge {
                     BrowserReloadDiagnostics.listenerExecutor(
                             listener,
                             "prepare",
-                            preparationExecutor,
-                            preparationIsAgentBacked
+                            preparationExecutor
                     ),
                     BrowserReloadDiagnostics.listenerExecutor(
                             listener,
                             "apply",
-                            mainExecutor,
-                            false
+                            mainExecutor
                     )
             );
             return BrowserReloadDiagnostics.trackListenerFuture(instance, listener, future);

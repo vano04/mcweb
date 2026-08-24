@@ -121,11 +121,11 @@ You need:
 - Oracle GraalVM Web Image 25.1 or newer. The clean-machine bootstrap pins
   Oracle GraalVM 25.2.4 (25i2); set `GRAALVM_HOME` explicitly when a manually
   installed JDK is elsewhere. It must be Oracle GraalVM, not a stock OpenJDK.
-- On Windows, Oracle Native Image also requires Visual Studio 2022 Build Tools
-  with MSVC 14.x or newer and the Windows 11 SDK. The Desktop development with
-  C++ workload is sufficient; Windows ARM64 uses these x64 tools through the
-  supported x64 emulation path. The MC-Web installer does not modify system
-  components or copy DLLs into the GraalVM archive.
+- On Windows, the bootstrap downloads the pinned llvm-mingw toolchain and
+  exposes it through the narrow `cl.exe`/`vswhere.exe` adapter expected by
+  Oracle Native Image. Visual Studio and the Windows SDK are not required.
+  Windows ARM64 runs the x64 GraalVM and compiler through the supported x64
+  emulation path.
 - Java 25 available through `JAVA_HOME` (normally the same GraalVM directory).
 - Node.js 20 or newer and a working Gradle wrapper (`./gradlew`).
 - Binaryen 131's `wasm-as` executable on `PATH`, or under
@@ -336,14 +336,13 @@ override, or unauthenticated fallback.
   Binaryen's `wasm-as` on `PATH`.
 - `native-image preflight ... STATUS_DLL_NOT_FOUND` or Windows exit
   `-1073741515 (0xC0000135)`: this is a missing Windows loader dependency, not
-  an image-build OOM. Install or repair Visual Studio 2022 Build Tools with the
-  Desktop development with C++ workload and Windows 11 SDK, open a new
-  PowerShell, then retry. To inspect the imports from the installed toolchain,
-  run `where.exe cl.exe`, `where.exe dumpbin.exe`, and
-  `dumpbin.exe /DEPENDENTS "$env:USERPROFILE\.mcweb\toolchain\lib\svm\bin\native-image.exe"`.
-  The likely dependency class is the MSVC/UCRT runtime, but the status alone
-  does not identify which transitive DLL is missing; do not download or copy an
-  unofficial DLL into the JDK.
+  an image-build OOM. Re-run `.\tools\install.ps1 --build`; the Windows
+  bootstrap verifies and restores the pinned llvm-mingw toolchain and its local
+  `cl.exe`/`vswhere.exe` adapter without Visual Studio, the Windows SDK, admin
+  access, or registry changes. If the loader still fails, install Microsoft's
+  official current x64 Visual C++ Redistributable: llvm-mingw replaces the
+  compiler and SDK, not DLLs imported by Oracle's executable. Do not download
+  or copy an unofficial DLL into the JDK.
 - Native-image runs out of memory: make at least 10 GB available, close other
   applications, or lower the builder settings with Gradle properties such as
   `-PgraalBuilderMemoryGb=8 -PgraalParallelism=4` before retrying.
@@ -369,7 +368,6 @@ excludes the local JAR, staged assets, build output, and packaged runtime. See
 | --- | --- |
 | `src/graal/java` | Browser platform seams: WebGPU, input, audio, storage, networking, and JAR shadows |
 | `src/feature` | GraalVM substitutions for browser-incompatible JDK internals |
-| `src/webimage-patch` | Web Image code-generation patches |
 | `src/main`, `src/drain` | Build-time probe and helper sources |
 | `web/` | Local launcher shell, workers, host scripts, and Service Worker |
 | `tools/build.mjs` | Local-install Wasm build and package helper |
@@ -377,6 +375,6 @@ excludes the local JAR, staged assets, build output, and packaged runtime. See
 | `tools/mc-relay.mjs` | Target-policy WebSocket-to-TCP implementation used by the server |
 | `build.gradle` | Image build and exact-count browser transforms |
 
-MC-Web's browser platform layer is GPLv3; Minecraft and the GraalVM-derived
-patch sources retain their own terms. See [LICENSE](LICENSE) and
+MC-Web's browser platform layer is GPLv3; Minecraft and the GraalVM toolchain
+retain their own terms. See [LICENSE](LICENSE) and
 [NOTICE.md](NOTICE.md).

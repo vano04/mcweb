@@ -18,7 +18,6 @@ import net.minecraft.client.model.geom.ModelPart;
 import net.minecraft.client.renderer.texture.TextureContents;
 import net.minecraft.client.renderer.texture.ReloadableTexture;
 import net.minecraft.resources.Identifier;
-import net.minecraft.TracingExecutor;
 import net.minecraft.client.Minecraft;
 import net.minecraft.server.packs.resources.PreparableReloadListener;
 import net.minecraft.server.packs.resources.ResourceManager;
@@ -28,17 +27,16 @@ import org.lwjgl.system.MemoryUtil;
 /**
  * Bounded, transition-oriented diagnostics for Minecraft's resource reload graph.
  *
- * <p>The threaded WasmLM client can keep rendering while one reload future remains
- * incomplete. Java stack traces are unavailable there, and logging every one of the
+ * <p>Java stack traces are unavailable in the Web Image, and logging every one of the
  * roughly fourteen thousand executor tasks overflows the browser's diagnostic pipe.
  * This probe instead names every listener transition, attributes executor work to the
  * listener and prepare/apply lane that submitted it, and emits a compact snapshot every
- * few seconds. A single stalled run therefore distinguishes an unstarted task, a wedged
- * worker, an undrained main-executor task, an incomplete preparation barrier, a serial
- * dependency on the previous listener, and an exceptional future.
+ * few seconds. A single stalled run therefore distinguishes an unstarted task, an
+ * undrained main-executor task, an incomplete preparation barrier, a serial dependency
+ * on the previous listener, and an exceptional future.
  *
  * <p>The jar transform routes only {@code SimpleReloadInstance}'s lifecycle seams here.
- * With no WasmLM agents, every method preserves Mojang's call directly and records
+ * With diagnostics disabled, every method preserves Mojang's call directly and records
  * nothing, so the shipping WasmGC path is unchanged.
  */
 public final class BrowserReloadDiagnostics {
@@ -50,8 +48,6 @@ public final class BrowserReloadDiagnostics {
     private static final ConcurrentHashMap<SimpleReloadInstance<?>, ReloadProbe> RELOADS =
             new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<PreparableReloadListener, ListenerProbe> LISTENERS =
-            new ConcurrentHashMap<>();
-    private static final ConcurrentHashMap<Runnable, TaskBinding> AGENT_TASKS =
             new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<String, ActiveTask> ACTIVE_TASKS =
             new ConcurrentHashMap<>();
@@ -77,7 +73,7 @@ public final class BrowserReloadDiagnostics {
             Executor preparationExecutor,
             Executor mainExecutor
     ) {
-        if (!McWebRuntimeMode.usesBackgroundAgents() || diagnosticsRequested() == 0) {
+        if (diagnosticsRequested() == 0) {
             return;
         }
         active = true;
@@ -154,17 +150,16 @@ public final class BrowserReloadDiagnostics {
         emit(probe, "listener-create " + listenerProbe.label);
     }
 
-    /** Returns a listener-attributing executor only for the threaded probe run. */
+    /** Returns a listener-attributing executor for the cooperative image. */
     public static Executor listenerExecutor(
             PreparableReloadListener listener,
             String lane,
-            Executor executor,
-            boolean agentBacked
+            Executor executor
     ) {
         ListenerProbe listenerProbe = LISTENERS.get(listener);
         return listenerProbe == null
                 ? executor
-                : new ListenerExecutor(listenerProbe, lane, executor, agentBacked);
+                : new ListenerExecutor(listenerProbe, lane, executor);
     }
 
     /** Tracks the full future returned by the protected state factory. */
@@ -472,56 +467,13 @@ public final class BrowserReloadDiagnostics {
 
 
 
-    /**
-     * Preserves listener attribution through SimpleReloadInstance's own counting
-     * executor, which wraps the listener's Runnable before it reaches the agent pool.
-     */
+    /** Preserves listener attribution through SimpleReloadInstance's task wrapper. */
     public static void submitPreparedTask(
             Executor executor,
             Runnable wrappedCommand,
             Runnable listenerCommand
     ) {
-        TaskBinding binding = AGENT_TASKS.remove(listenerCommand);
-        if (binding != null) {
-            AGENT_TASKS.put(wrappedCommand, binding);
-        }
-        try {
-            executor.execute(wrappedCommand);
-        } catch (RuntimeException | Error failure) {
-            if (binding != null) {
-                AGENT_TASKS.remove(wrappedCommand, binding);
-            }
-            throw failure;
-        }
-    }
-
-    /** Called by the agent pool immediately before running an original task. */
-    public static String agentTaskStarted(Runnable command) {
-        try {
-            TaskBinding binding = AGENT_TASKS.remove(command);
-            if (binding == null) {
-                return className(command);
-            }
-            ActiveTask active = startTask(binding);
-            ACTIVE_TASKS.put(Thread.currentThread().getName(), active);
-            return active.description();
-        } catch (Throwable failure) {
-            emitBare("agent-task-start-probe-failed " + describeFailure(failure));
-            return className(command);
-        }
-    }
-
-    /** Called by the agent pool after the original task returns or throws. */
-    public static void agentTaskFinished(Runnable command, Throwable failure) {
-        try {
-            String thread = Thread.currentThread().getName();
-            ActiveTask active = ACTIVE_TASKS.remove(thread);
-            if (active != null) {
-                finishTask(active, failure);
-            }
-        } catch (Throwable probeFailure) {
-            emitBare("agent-task-finish-probe-failed " + describeFailure(probeFailure));
-        }
+        executor.execute(wrappedCommand);
     }
 
     /** Frame-pump heartbeat; emits at most one snapshot every five seconds. */
@@ -576,7 +528,7 @@ public final class BrowserReloadDiagnostics {
                 + " complete=" + complete + '/' + probe.listeners.size()
                 + " pending=[" + pending + ']'
                 + " active=[" + active + ']'
-                + ' ' + AgentExecutorService.stats());
+                + ' ' + BrowserExecutorService.stats());
     }
 
     private static ActiveTask startTask(TaskBinding binding) {
@@ -615,18 +567,15 @@ public final class BrowserReloadDiagnostics {
         private final ListenerProbe listener;
         private final String lane;
         private final Executor delegate;
-        private final boolean agentBacked;
 
         private ListenerExecutor(
                 ListenerProbe listener,
                 String lane,
-                Executor delegate,
-                boolean agentBacked
+                Executor delegate
         ) {
             this.listener = listener;
             this.lane = lane;
             this.delegate = delegate;
-            this.agentBacked = agentBacked || isAgentBacked(delegate);
         }
 
         @Override
@@ -639,23 +588,6 @@ public final class BrowserReloadDiagnostics {
                     command,
                     System.currentTimeMillis()
             );
-            if (agentBacked) {
-                TaskBinding replaced = AGENT_TASKS.put(command, binding);
-                if (replaced != null) {
-                    emit(listener.reload, "task-identity-reused " + listener.label
-                            + " lane=" + lane + " class=" + binding.taskClass);
-                }
-                try {
-                    delegate.execute(command);
-                } catch (RuntimeException | Error failure) {
-                    AGENT_TASKS.remove(command, binding);
-                    listener.taskFailures.incrementAndGet();
-                    emit(listener.reload, "task-submit-failed " + listener.label
-                            + " lane=" + lane + ' ' + describeFailure(failure));
-                    throw failure;
-                }
-                return;
-            }
             delegate.execute(new TrackedRunnable(binding));
         }
     }
@@ -731,14 +663,6 @@ public final class BrowserReloadDiagnostics {
                 finishTask(active, failure);
             }
         }
-    }
-
-    private static boolean isAgentBacked(Executor executor) {
-        if (executor instanceof AgentExecutorService) {
-            return true;
-        }
-        return executor instanceof TracingExecutor tracing
-                && tracing.service() instanceof AgentExecutorService;
     }
 
     private static boolean isMinecraftThread() {

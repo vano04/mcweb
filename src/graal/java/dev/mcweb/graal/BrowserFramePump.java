@@ -25,9 +25,6 @@ public final class BrowserFramePump {
     private static int reportedFailures;
     private static String currentPhase = "not-started";
     private static String lastScreenClass;
-    private static boolean postReloadGcRequested;
-    private static int postReloadGcAttempts;
-    private static long postReloadGcBefore = -1L;
     private static String lastWorldState;
     private static net.minecraft.client.renderer.ViewArea lastViewArea;
     private static int viewAreaGeneration;
@@ -43,9 +40,6 @@ public final class BrowserFramePump {
     public static void start(Minecraft instance) {
         minecraft = instance;
         BrowserMultiplayerCompat.install(instance);
-        postReloadGcRequested = false;
-        postReloadGcAttempts = 0;
-        postReloadGcBefore = -1L;
         lastGameplayState = null;
         nextGameplayReportFrame = 0L;
         lastBrowserFrameLimit = -1;
@@ -131,42 +125,7 @@ public final class BrowserFramePump {
             if (reloadCompletion != 0) {
                 BrowserGpu.reportProgress("reload:all-done result="
                         + (reloadCompletion > 0 ? "success" : "failure"));
-                if (reloadCompletion > 0 && McWebRuntimeMode.isThreaded()) {
-                    postReloadGcRequested = true;
-                }
             }
-            /*
-             * Collect at the exact reload boundary, before the next interactive
-             * frame. This is intentionally independent of screen class: screen
-             * transitions are not a safe proxy for reload completion and made the
-             * old Accessibility/Title path stutter visibly.
-            */
-            if (postReloadGcRequested && postReloadGcAttempts < 3) {
-                long before = observedCollections();
-                long refusalsBefore = observedAgentRefusals();
-                if (postReloadGcBefore < 0L) {
-                    postReloadGcBefore = before;
-                }
-                postReloadGcAttempts++;
-                BrowserGpu.reportProgress("gc:post-reload-start attempt=" + postReloadGcAttempts);
-                System.gc();
-                long after = observedCollections();
-                long refusalsAfter = observedAgentRefusals();
-                boolean progressed = before >= 0L && after > before;
-                boolean refused = refusalsBefore >= 0L && refusalsAfter > refusalsBefore;
-                BrowserGpu.reportProgress("gc:post-reload-done attempt=" + postReloadGcAttempts
-                        + " before=" + before + " after=" + after
-                        + " progressed=" + progressed + " refused=" + refused);
-                // Keep the flag for at most two later overlay frames when the
-                // collector explicitly refused to park workers. A successful
-                // collection, an ignored System.gc(), or the bounded attempt limit
-                // ends the lifecycle request.
-                postReloadGcRequested = !progressed && refused && postReloadGcAttempts < 3;
-                if (!postReloadGcRequested) {
-                    postReloadGcBefore = -1L;
-                }
-            }
-            AgentExecutorService.servicePrimaryCollectionRequest("frame-boundary");
             // The boolean enables the render section of runTick; every
             // scheduled callback is a real, fully rendered game frame.
             currentPhase = "frame.minecraft-run-tick";
@@ -191,14 +150,12 @@ public final class BrowserFramePump {
             // instead of landing every staged upload in the frame that revealed
             // the sections. No-op off the cooperative lane.
             BrowserMeshPaceExecutor.drainFromFrame(frameStartedNanos);
-            AgentExecutorService.maintain();
+            BrowserExecutorService.maintain();
             // Small budget: this only fires when every worker is busy and work is still
             // queued, which is the starvation the pool cannot resolve on its own. Kept
             // far below the world-load budget so a starved pool costs frame time rather
             // than the frame.
-            if (McWebRuntimeMode.isCooperativeServer()) {
-                AgentExecutorService.drainInlineIfStarved(4);
-            }
+            BrowserExecutorService.drainInlineIfStarved(4);
             BrowserReloadDiagnostics.heartbeat(frameCount);
             if (frameCount % 120 == 1) {
                 BrowserGpu.reportProgress("threads:" + describeThreadIdentity());
@@ -336,17 +293,6 @@ public final class BrowserFramePump {
                 + " reason=" + throttleReason);
     }
 
-    @JS.Coerce
-    @JS(value = "const c=globalThis.mcWebThreadRuntime?.imageCounters?.();"
-            + "return c && typeof c.gcStopped === 'number' && typeof c.gcUncontended === 'number'"
-            + " ? c.gcStopped + c.gcUncontended : -1;", args = {})
-    private static native int observedCollections();
-
-    @JS.Coerce
-    @JS(value = "const c=globalThis.mcWebThreadRuntime?.imageCounters?.();"
-            + "return c && typeof c.gcAgentRefused === 'number' ? c.gcAgentRefused : -1;", args = {})
-    private static native int observedAgentRefusals();
-
     /**
      * Identity of the browser thread as Minecraft's event loop sees it.
      *
@@ -355,7 +301,7 @@ public final class BrowserFramePump {
      * whole client depends on it: {@code Minecraft.execute} runs a task inline
      * only when it holds, and the transformed {@code blockUntilDone} drains the
      * main queue only when it holds. If {@code Thread.currentThread()} does not
-     * return one stable object on the primary WasmLM agent, every deferred task
+     * return one stable object on the browser thread, every deferred task
      * — including every UI click — is queued and never run, and the wait loops
      * spin instead of draining.</p>
      */
@@ -375,7 +321,7 @@ public final class BrowserFramePump {
             state.append(" identity-failed=").append(failure.getClass().getSimpleName());
         }
         try {
-            state.append(' ').append(AgentExecutorService.stats());
+            state.append(' ').append(BrowserExecutorService.stats());
         } catch (Throwable failure) {
             state.append(" pool-failed=").append(failure.getClass().getSimpleName());
         }

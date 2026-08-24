@@ -76,37 +76,6 @@ def graalParallelism = providers.gradleProperty("graalParallelism")
                 : 0)
 def graalVmHome = providers.gradleProperty("graalVmHome")
         .orElse(providers.environmentVariable("GRAALVM_HOME"))
-// The build may be launched by the portable Node bootstrap. In that case the
-// Node executable is not necessarily discoverable through the Gradle daemon's
-// inherited PATH (notably on Windows, where tools/install.ps1 invokes Node by
-// absolute path). Keep the selected executable explicit, while retaining the
-// normal `node` PATH lookup for direct/system-Node builds.
-def mcwebNode = providers.gradleProperty("mcwebNode")
-        .orElse(providers.environmentVariable("MCWEB_NODE"))
-        .orElse("node")
-
-def nodeCommand = {
-    def configured = mcwebNode.get().trim()
-    if (configured.isEmpty()) {
-        throw new GradleException("MCWEB_NODE or -PmcwebNode must not be empty")
-    }
-    // A bare command deliberately retains ProcessBuilder/PATH resolution. A
-    // path-like value is validated before Exec starts so a stale portable
-    // install fails with an actionable message instead of an opaque Gradle
-    // `command 'node'` lookup error.
-    def pathLike = new File(configured).isAbsolute()
-            || configured.contains("/")
-            || configured.contains("\\")
-    if (!pathLike) {
-        return configured
-    }
-    def executable = file(configured)
-    def onWindows = System.getProperty("os.name").toLowerCase().contains("windows")
-    if (!executable.isFile() || (!onWindows && !executable.canExecute())) {
-        throw new GradleException("Configured MC-Web Node executable was not found or is not executable: ${executable}")
-    }
-    return executable.absolutePath
-}
 // Capture transform switches during configuration. Reading Project from a task
 // action is deprecated in Gradle 9 and will be rejected when configuration cache
 // becomes mandatory; Providers preserve the same command-line semantics without
@@ -120,13 +89,8 @@ def browserInitialSpawnDiameter = Integer.parseInt(
 def ap2SafepointEnabled = providers.gradleProperty("mcwebAp2Safepoint")
         .map { it != "0" }
         .getOrElse(true)
-// Web Image compiler backend. `--tool:svm-wasm` defaults to WASMGC, where Java
-// objects are Wasm-GC structs. Wasm-GC references are instance-local and cannot
-// cross a Worker realm, so WASMGC can never host shared-heap Java threads on
-// today's browsers. `-H:Backend=WASM` selects the WasmLM backend, whose Java
-// heap lives in a linear memory that *can* be a SharedArrayBuffer. Threading
-// work must target WASM; see docs/MULTITHREADING-REQUIREMENTS.md.
-def graalBackend = providers.gradleProperty("graalBackend").getOrElse("WASMGC")
+// The public deployment is deliberately fixed to GraalVM's canonical WasmGC
+// backend. It does not expose a backend switch or alternate runtime lane.
 // `-PgraalDebugNames=true` emits the Wasm `name` custom section, so a CPU
 // profile shows Java method names instead of `wasm-function[12345]`. Without it
 // the Java half of a frame — about two thirds of it — is unattributable, which
@@ -193,14 +157,11 @@ sourceSets {
     graal {
         java.srcDir("src/graal/java")
     }
-    // The WasmGC image needs a spurious-wakeup LockSupport because its Unsafe
-    // park/unpark substitutions throw. Threaded WasmLM instead routes the real JDK
-    // LockSupport through the builder-patched Unsafe methods and host Atomics.wait.
     feature {
-        if (graalBackend != "WASMGC") {
-            java.exclude("dev/mcweb/feature/Target_LockSupport_Web.java")
-        }
+        java.srcDir("src/feature/java")
     }
+    // The WasmGC image needs a spurious-wakeup LockSupport because its Unsafe
+    // park/unpark substitutions throw.
     // McwebDrainHolder is compiled in its own source set against the ORIGINAL
     // jar so the jar transform (browserMinecraftJar) can transplant its method
     // without a compile<->transform dependency cycle.
@@ -292,42 +253,6 @@ tasks.named("compileFeatureJava", JavaCompile) {
                 "--module-path", graalModules.absolutePath,
                 "--add-modules", "org.graalvm.nativeimage"
         ])
-    }
-}
-
-// The WasmLM backend ships two blockers for threaded Java: `@JS` bodies compile to
-// stubs (`lowerJSBody` -> `getStub`), and `Thread.start0`/`Thread.isAlive` are
-// substituted away. Both are fixed by rewriting a handful of exactly-counted builder
-// methods and injecting MC-Web classes into the builder module with
-// `--patch-module`; no file in the GraalVM install is touched. See
-// docs/WASMLM-THREADS.md and tools/webimage-patch/.
-def webImagePatchDir = layout.buildDirectory.dir("webimage-patch/classes")
-
-tasks.register("webImagePatch", Exec) {
-    group = "build"
-    description = "Build the GraalVM Web Image builder patch that enables @JS and Thread.start() on WasmLM."
-    inputs.dir(layout.projectDirectory.dir("src/webimage-patch/java"))
-    inputs.file(layout.projectDirectory.file("tools/webimage-patch/McWebImagePatcher.java"))
-    inputs.file(layout.projectDirectory.file("tools/webimage-patch/build.mjs"))
-    inputs.file(layout.projectDirectory.file("tools/webimage-patch/PointstoPatcher.java"))
-    outputs.dir(webImagePatchDir)
-
-    doFirst {
-        if (!graalVmHome.isPresent()) {
-            throw new GradleException(
-                    "Set GRAALVM_HOME or -PgraalVmHome to Oracle GraalVM Web Image 25.1+"
-            )
-        }
-        environment("GRAALVM_HOME", file(graalVmHome.get()).absolutePath)
-        // Node, not bash: this was the one step in the pipeline that needed a
-        // shell, and it made the image unbuildable on Windows. The build helper
-        // exports its actual process.execPath as MCWEB_NODE, so a portable Node
-        // install remains usable even when Gradle inherits a different PATH.
-        commandLine(
-                nodeCommand(),
-                file("tools/webimage-patch/build.mjs").absolutePath,
-                webImagePatchDir.get().asFile.absolutePath
-        )
     }
 }
 
@@ -578,10 +503,10 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
         // in managedBlock never completes. Fix: always call super.pollTask().
         def mainThreadExecutorEntryName =
                 "net/minecraft/server/level/ServerChunkCache\$MainThreadExecutor.class"
-        // The first threaded world-load future is driven by NoiseBasedChunkGenerator's
+        // The first world-load future is driven by NoiseBasedChunkGenerator's
         // background suppliers.  Keep a bounded phase marker around the supplier body:
         // the external watchdog can then distinguish a slow noise computation from a
-        // supplier waiting on a missing completion or a shared-heap lock.
+        // supplier waiting on a missing completion or an executor ordering issue.
         def noiseGeneratorEntryName =
                 "net/minecraft/world/level/levelgen/NoiseBasedChunkGenerator.class"
         def noiseChunkEntryName =
@@ -594,14 +519,14 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                 "net/minecraft/world/level/levelgen/DensityFunctions\$PureTransformer.class"
         // The biome sampler's first long-running density graph is rooted in an
         // Ap2 node.  Its compute method is a recursive, allocation-free walk over
-        // the graph; polling only at the outer NoiseChunk call leaves the agent
-        // invisible to the WasmLM collector until the whole sample returns.
+        // the graph; polling only at the outer NoiseChunk call leaves a long
+        // allocation-free walk invisible until the whole sample returns.
         def ap2EntryName =
                 "net/minecraft/world/level/levelgen/DensityFunctions\$Ap2.class"
         // NoiseRouter.mapAll reaches this private recursive visitor for every node in
         // the density graph.  The graph walk allocates replacement nodes while it
         // recursively calls mapChildren; a poll only at the outer NoiseRouter call
-        // leaves the worker invisible to the WasmLM collector for the whole walk.
+        // leaves the walk without a bounded progress point for the whole traversal.
         def densityFunctionRecursiveVisitorEntryName =
                 "net/minecraft/world/level/levelgen/DensityFunction\$1RecursiveVisitor.class"
         def aquiferEntryName =
@@ -621,12 +546,12 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                 "net/minecraft/server/level/ChunkGenerationTask.class"
         // AbstractConsecutiveExecutor.runAll can remain in one allocation-free
         // pollTask loop while the primary waits for a dependent future.  Give the
-        // shared-heap collector a bounded reachability point at that loop boundary.
+        // collector a bounded reachability point at that loop boundary.
         def abstractConsecutiveExecutorEntryName =
                 "net/minecraft/util/thread/AbstractConsecutiveExecutor.class"
         def generationChunkHolderEntryName =
                 "net/minecraft/server/level/GenerationChunkHolder.class"
-        // The first threaded world-load blocker is inside ServerChunkCache.getChunk.
+        // The first world-load blocker is inside ServerChunkCache.getChunk.
         // Instrument its owner branch and the future returned by
         // getChunkFutureMainThread without changing the queue or wait semantics.
         def serverChunkCacheEntryName =
@@ -657,7 +582,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                 "net/minecraft/client/resources/SkinManager\$1.class"
         def cubeMapTextureEntryName =
                 "net/minecraft/client/renderer/texture/CubeMapTexture.class"
-        // Threaded WasmLM reload probes: instrument Mojang's own barrier and
+        // Reload probes: instrument Mojang's own barrier and
         // listener futures without replacing their implementation.
         def simpleReloadEntryName =
                 "net/minecraft/server/packs/resources/SimpleReloadInstance.class"
@@ -690,7 +615,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                         : org.objectweb.asm.Opcodes.ICONST_3
         // setInitialSpawn() searches an 11x11 spiral with PlayerSpawnFinder
         // before MinecraftServer.runServer() can publish isReady. That is a
-        // desktop startup radius, and it dominates the shared-heap browser's
+        // desktop startup radius, and it dominates the browser's
         // first world-load gate. Keep the real finder and chunk pipeline, but
         // use a bounded 3x3 spiral by default. The odd diameter is separately
         // configurable for comparison; 11 restores vanilla behavior.
@@ -736,7 +661,6 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
         def patchedServerPhase = 0
         def patchedWaitUntilNextTick = 0
         def patchedIntegratedServerWorker = 0
-        def patchedThreadedReconcileHook = 0
         def densityHooksEnabled = (providers.gradleProperty("mcwebDensityHooks").getOrElse("on") != "off")
         def patchedServerBackgroundExecutor = 0
         def patchedEventLoopDrain = 0
@@ -873,7 +797,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                      * ChunkMap already matches an earlier branch, so a branch of its own
                      * would silently never run. MinecraftServer's single capture is NOT
                      * touched here -- it already routes to
-                     * AgentExecutorService.serverExecutor, which is where the same
+                     * BrowserExecutorService.serverExecutor, which is where the same
                      * decision is made for it.
                      *
                      * Split the shared background executor by call site so the server's
@@ -883,7 +807,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                      * availableProcessors()-1 threads and a blocked worker can steal.
                      *
                      * The policy itself now lives in
-                     * AgentExecutorService.serverWorldgenPool(): the real pool when it
+                     * BrowserExecutorService.serverWorldgenPool(): the real pool when it
                      * has two or more workers, inline below that. Inline is depth-first
                      * and docs/Minecraft/world/chunks.md explicitly sanctions it ("a port
                      * can serialize on one worker as long as future-completion order per
@@ -1521,7 +1445,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                         }
                         def serverExecutorCall = serverExecutorCalls.first()
                         serverExecutorCall.owner =
-                                "dev/mcweb/graal/AgentExecutorService"
+                                "dev/mcweb/graal/BrowserExecutorService"
                         serverExecutorCall.name = "serverExecutor"
                         serverExecutorCall.desc =
                                 "(Lnet/minecraft/server/MinecraftServer;)Ljava/util/concurrent/ExecutorService;"
@@ -1606,9 +1530,8 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                         }
                         patchedIntegratedServerAccess += delayedFields.size()
 
-                        // Keep Mojang's wait body for the real WasmLM server thread,
-                        // but expose it behind a public name. The cooperative WasmGC
-                        // lane still needs a bounded browser-safe replacement because
+                        // Keep Mojang's wait body behind a public name. The
+                        // browser still needs a bounded replacement because
                         // it has no server thread to refresh the tick deadline.
                         def waitMethods = classNode.methods.findAll { method ->
                             method.name == "waitUntilNextTick" && method.desc == "()V"
@@ -1841,7 +1764,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                         }
                         patchedInitialSpawnBounds = negativeBounds.size() + positiveBounds.size()
                         // PlayerSpawnFinder.getSpawnPosInChunk synchronously asks the
-                        // threaded browser world for a full chunk before the server
+                        // browser world for a full chunk before the server
                         // can publish ready. Keep the vanilla fallback spawn above;
                         // browser gameplay will load the real origin chunk through the
                         // normal player ticket after login. Replace only this one
@@ -1880,7 +1803,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                 org.objectweb.asm.Opcodes.ALOAD, 0))
                         runEnter.add(new org.objectweb.asm.tree.MethodInsnNode(
                                 org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
+                                "dev/mcweb/graal/BrowserExecutorService",
                                 "reportServerRunEnter",
                                 "(Lnet/minecraft/server/MinecraftServer;)V",
                                 false))
@@ -1902,7 +1825,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                 org.objectweb.asm.Opcodes.ALOAD, 0))
                         readyHook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                 org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
+                                "dev/mcweb/graal/BrowserExecutorService",
                                 "reportServerReady",
                                 "(Lnet/minecraft/server/MinecraftServer;)V",
                                 false))
@@ -1920,7 +1843,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                 org.objectweb.asm.Opcodes.ALOAD, 0))
                         runExit.add(new org.objectweb.asm.tree.MethodInsnNode(
                                 org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
+                                "dev/mcweb/graal/BrowserExecutorService",
                                 "reportServerRunExit",
                                 "(Lnet/minecraft/server/MinecraftServer;)V",
                                 false))
@@ -2001,8 +1924,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                         }
                         // Keep Mojang's original server Thread on the stack and
                         // add the constructed server. The helper starts that
-                        // real thread on shared-heap WasmLM, or registers the
-                        // server with the cooperative WasmGC frame pump.
+                        // browser server with the cooperative frame pump.
                         method.instructions.insertBefore(
                                 startCall,
                                 new org.objectweb.asm.tree.VarInsnNode(
@@ -2053,9 +1975,8 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                         // waitForTasks(); }` -- it drains its *own* queue and then parks.
                         // That is every blocking wait on the server, including the chunk
                         // load inside spawn finding, and it is where world load actually
-                        // stops: the chunk's continuations are on the agent pool, whose
-                        // workers are themselves blocked on other pool tasks, and nothing
-                        // in this loop can run them.
+                        // stops: the chunk's continuations can be waiting on other
+                        // queued tasks, and nothing in this loop can run them.
                         //
                         // Draining the pool from `waitForTasks` fixes all of those at
                         // once, and it is the honest place for it: this method exists to
@@ -2073,7 +1994,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                         waitMethods.first().instructions.insert(
                                 new org.objectweb.asm.tree.MethodInsnNode(
                                         org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                        "dev/mcweb/graal/AgentExecutorService",
+                                        "dev/mcweb/graal/BrowserExecutorService",
                                         "drainInlineForBlockedWait",
                                         "()V",
                                         false
@@ -2121,7 +2042,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                 org.objectweb.asm.Opcodes.ALOAD, 0))
                         probe.add(new org.objectweb.asm.tree.MethodInsnNode(
                                 org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
+                                "dev/mcweb/graal/BrowserExecutorService",
                                 "onBlockingWaitSpin",
                                 "(Lnet/minecraft/util/thread/BlockableEventLoop;)V",
                                 false
@@ -2135,8 +2056,8 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                         classNode.accept(writer)
                         contents = writer.toByteArray()
                     } else if (entry.name == serverChunkCacheEntryName) {
-                        // Keep Mojang's getChunk implementation byte-for-byte in
-                        // threaded mode.  The hook is deliberately at the exact
+                        // Keep Mojang's getChunk implementation byte-for-byte. The
+                        // hook is deliberately at the exact
                         // currentThread/mainThread comparison and immediately after
                         // getChunkFutureMainThread returns: it tells the watchdog
                         // whether the wait is on the Server owner branch, and whether
@@ -2289,8 +2210,8 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                         // posted to that queue, so the real Server's managedBlock can
                         // wait forever even while distance-manager bookkeeping keeps
                         // reporting progress.  This is an executor queue-order repair,
-                        // not a cooperative server tick: the threaded lane still runs
-                        // Mojang's real Server thread and vanilla waitUntilNextTick.
+                        // not a server-tick transform: it only repairs executor queue
+                        // ordering before the browser wait loop.
                         def classNode = new org.objectweb.asm.tree.ClassNode()
                         new org.objectweb.asm.ClassReader(contents).accept(classNode, 0)
                         def pollMethods = classNode.methods.findAll { method ->
@@ -2414,7 +2335,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                             )
                         }
                         def noiseMethod = noiseMethods.first()
-                        // The threaded world-load allocator can request a collection
+                        // The world-load allocator can request a collection
                         // while Mojang is inside the innermost block-density loop.
                         // That loop is allocation-free from Java's point of view and
                         // otherwise has no bounded safepoint edge until the whole
@@ -2455,7 +2376,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                 interpolatedStateCalls.first(),
                                 new org.objectweb.asm.tree.MethodInsnNode(
                                         org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                        "dev/mcweb/graal/AgentExecutorService",
+                                        "dev/mcweb/graal/BrowserExecutorService",
                                         "safepointPoll",
                                         "()V",
                                         false
@@ -2467,7 +2388,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                 org.objectweb.asm.Opcodes.ALOAD, 1))
                         entryHook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                 org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
+                                "dev/mcweb/graal/BrowserExecutorService",
                                 "reportWorldgenEnter",
                                 "(Lnet/minecraft/world/level/chunk/ChunkAccess;)V",
                                 false))
@@ -2487,7 +2408,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                     instruction,
                                     new org.objectweb.asm.tree.MethodInsnNode(
                                             org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                            "dev/mcweb/graal/AgentExecutorService",
+                                            "dev/mcweb/graal/BrowserExecutorService",
                                             "reportWorldgenExit",
                                             "()V",
                                             false
@@ -2542,7 +2463,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                             phaseHook.add(new org.objectweb.asm.tree.LdcInsnNode(phaseCall[3]))
                             phaseHook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                     org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                    "dev/mcweb/graal/AgentExecutorService",
+                                    "dev/mcweb/graal/BrowserExecutorService",
                                     "reportWorldgenBiomesPhase",
                                     "(I)V",
                                     false
@@ -2562,7 +2483,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                         phaseExitHook.add(new org.objectweb.asm.tree.LdcInsnNode(6))
                         phaseExitHook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                 org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
+                                "dev/mcweb/graal/BrowserExecutorService",
                                 "reportWorldgenBiomesPhase",
                                 "(I)V",
                                 false
@@ -2612,7 +2533,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                             phaseHook.add(new org.objectweb.asm.tree.LdcInsnNode(phaseCall[3]))
                             phaseHook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                     org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                    "dev/mcweb/graal/AgentExecutorService",
+                                    "dev/mcweb/graal/BrowserExecutorService",
                                     "reportWorldgenBiomesPhase",
                                     "(I)V",
                                     false
@@ -2633,7 +2554,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                 org.objectweb.asm.Opcodes.ALOAD, 4))
                         biomesEntryHook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                 org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
+                                "dev/mcweb/graal/BrowserExecutorService",
                                 "reportWorldgenBiomesEnter",
                                 "(Lnet/minecraft/world/level/chunk/ChunkAccess;)V",
                                 false))
@@ -2651,7 +2572,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                 biomesReturns.first(),
                                 new org.objectweb.asm.tree.MethodInsnNode(
                                         org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                        "dev/mcweb/graal/AgentExecutorService",
+                                        "dev/mcweb/graal/BrowserExecutorService",
                                         "reportWorldgenBiomesExit",
                                         "()V",
                                         false
@@ -2721,7 +2642,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                             phaseHook.add(new org.objectweb.asm.tree.LdcInsnNode(phaseCall[3]))
                             phaseHook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                     org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                    "dev/mcweb/graal/AgentExecutorService",
+                                    "dev/mcweb/graal/BrowserExecutorService",
                                     "reportWorldgenBiomesPhase",
                                     "(I)V",
                                     false
@@ -2777,7 +2698,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                 phaseHook.add(new org.objectweb.asm.tree.LdcInsnNode(phaseCall[3]))
                                 phaseHook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                         org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                        "dev/mcweb/graal/AgentExecutorService",
+                                        "dev/mcweb/graal/BrowserExecutorService",
                                         "reportWorldgenBiomesPhase",
                                         "(I)V",
                                         false
@@ -2800,7 +2721,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                         maxSurfaceEntryHook.add(new org.objectweb.asm.tree.LdcInsnNode(52))
                         maxSurfaceEntryHook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                 org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
+                                "dev/mcweb/graal/BrowserExecutorService",
                                 "reportWorldgenBiomesPhase",
                                 "(I)V",
                                 false
@@ -2822,7 +2743,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                         maxSurfaceCallHook.add(new org.objectweb.asm.tree.LdcInsnNode(53))
                         maxSurfaceCallHook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                 org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
+                                "dev/mcweb/graal/BrowserExecutorService",
                                 "reportWorldgenBiomesPhase",
                                 "(I)V",
                                 false
@@ -2857,7 +2778,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                         preliminarySurfaceHook.add(new org.objectweb.asm.tree.LdcInsnNode(54))
                         preliminarySurfaceHook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                 org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
+                                "dev/mcweb/graal/BrowserExecutorService",
                                 "reportWorldgenBiomesPhase",
                                 "(I)V",
                                 false
@@ -2880,7 +2801,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                         computeSurfaceEntryHook.add(new org.objectweb.asm.tree.LdcInsnNode(55))
                         computeSurfaceEntryHook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                 org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
+                                "dev/mcweb/graal/BrowserExecutorService",
                                 "reportWorldgenBiomesPhase",
                                 "(I)V",
                                 false
@@ -2901,7 +2822,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                         def computeSurfaceHook = new org.objectweb.asm.tree.InsnList()
                         // The receiver and context are already on the operand
                         // stack. Publish both into locals *before* the safepoint:
-                        // the WasmLM collector's stack walk is guaranteed to see
+                        // the collector's stack walk is guaranteed to see
                         // locals, while a newly inserted call is not allowed to
                         // assume that arbitrary operand-stack values have root
                         // metadata at its call site. The previous order polled
@@ -2914,7 +2835,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                 org.objectweb.asm.Opcodes.ASTORE, 5))
                         computeSurfaceHook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                 org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
+                                "dev/mcweb/graal/BrowserExecutorService",
                                 "safepointPoll",
                                 "()V",
                                 false
@@ -2922,7 +2843,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                         computeSurfaceHook.add(new org.objectweb.asm.tree.LdcInsnNode(56))
                         computeSurfaceHook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                 org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
+                                "dev/mcweb/graal/BrowserExecutorService",
                                 "reportWorldgenBiomesPhase",
                                 "(I)V",
                                 false
@@ -2934,7 +2855,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                 org.objectweb.asm.Opcodes.ALOAD, 6))
                         computeSurfaceHook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                 org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
+                                "dev/mcweb/graal/BrowserExecutorService",
                                 "reportWorldgenBiomesObjects",
                                 "(ILjava/lang/Object;Ljava/lang/Object;)V",
                                 false
@@ -2976,7 +2897,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                         // FunctionContext]. Keep the complete call shape in
                         // locals while the poll can rendezvous with the primary
                         // collector. A newly inserted call site must not rely on
-                        // arbitrary operand-stack values carrying WasmLM root
+                        // arbitrary operand-stack values carrying roots
                         // metadata.
                         def directHook = new org.objectweb.asm.tree.InsnList()
                         directHook.add(new org.objectweb.asm.tree.VarInsnNode(
@@ -2989,7 +2910,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                 org.objectweb.asm.Opcodes.ASTORE, 1))
                         directHook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                 org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
+                                "dev/mcweb/graal/BrowserExecutorService",
                                 "safepointPoll",
                                 "()V",
                                 false
@@ -3079,7 +3000,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                 org.objectweb.asm.Opcodes.ASTORE, 6))
                         resolverHook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                 org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
+                                "dev/mcweb/graal/BrowserExecutorService",
                                 "safepointPoll",
                                 "()V",
                                 false
@@ -3160,7 +3081,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                     org.objectweb.asm.Opcodes.ASTORE, 5))
                             hook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                     org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                    "dev/mcweb/graal/AgentExecutorService",
+                                    "dev/mcweb/graal/BrowserExecutorService",
                                     "safepointPoll",
                                     "()V",
                                     false
@@ -3172,7 +3093,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                     org.objectweb.asm.Opcodes.ALOAD, 6))
                             hook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                     org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                    "dev/mcweb/graal/AgentExecutorService",
+                                    "dev/mcweb/graal/BrowserExecutorService",
                                     "reportWorldgenBiomesObjects",
                                     "(ILjava/lang/Object;Ljava/lang/Object;)V",
                                     false
@@ -3226,7 +3147,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                         // diagnostic/runtime seam. The old hook left `this`
                         // (usually DensityFunctions$Ap2) on the operand stack while
                         // reportWorldgenBiomesObjects could allocate and reach a
-                        // WasmLM collection. The collector's root metadata is
+                        // collection. The collector's root metadata is
                         // guaranteed for locals, not for an arbitrary value left on
                         // the newly inserted call site's operand stack. That was
                         // the exact `pure-transformer-input:receiver=Ap2` NPE seen
@@ -3239,7 +3160,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                 org.objectweb.asm.Opcodes.ASTORE, 5))
                         hook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                 org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
+                                "dev/mcweb/graal/BrowserExecutorService",
                                 "safepointPoll",
                                 "()V",
                                 false
@@ -3251,7 +3172,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                 org.objectweb.asm.Opcodes.ALOAD, 4))
                         hook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                 org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
+                                "dev/mcweb/graal/BrowserExecutorService",
                                 "reportWorldgenBiomesObjects",
                                 "(ILjava/lang/Object;Ljava/lang/Object;)V",
                                 false
@@ -3267,13 +3188,13 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                          *
                          * The standing >2-worker NPE is reported at exactly this site and
                          * at Ap2 below, and seven other explanations have been eliminated
-                         * (allocator pressure, two safepoint-root theories, cross-agent
+                         * (allocator pressure, two safepoint-root theories,
                          * publication, the pool implementation, and same-chunk overlap).
                          * What has never been tested is the hooks themselves: both shuffle
                          * the operand stack into scratch locals around an injected
                          * safepointPoll(). The polls are now redundant anyway -- every
-                         * allocation is a safepoint since McWebLMHeapLock.lock() polls on
-                         * the uncontended path -- so dropping them is a clean bisect.
+                         * allocation is a safepoint on the uncontended path -- so dropping
+                         * them is a clean bisect.
                          */
                         if (densityHooksEnabled) {
                             computeMethod.instructions.insertBefore(computeCalls.first(), hook)
@@ -3313,7 +3234,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                             // double result. Keep the receiver and context in
                             // reference locals 4/5 across the poll, then reload
                             // the original argument locals. This gives the
-                            // WasmLM collector a precise root shape at the new
+                            // collector a precise root shape at the new
                             // call site without leaving references on the operand
                             // stack.
                             hook.add(new org.objectweb.asm.tree.VarInsnNode(
@@ -3326,7 +3247,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                     org.objectweb.asm.Opcodes.ASTORE, 5))
                             hook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                     org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                    "dev/mcweb/graal/AgentExecutorService",
+                                    "dev/mcweb/graal/BrowserExecutorService",
                                     "safepointPoll",
                                     "()V",
                                     false))
@@ -3376,7 +3297,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                         applyMethods.first().instructions.insert(
                                 new org.objectweb.asm.tree.MethodInsnNode(
                                         org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                        "dev/mcweb/graal/AgentExecutorService",
+                                        "dev/mcweb/graal/BrowserExecutorService",
                                         "safepointPoll",
                                         "()V",
                                         false
@@ -3432,7 +3353,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                         createHook.add(new org.objectweb.asm.tree.LdcInsnNode(41))
                         createHook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                 org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
+                                "dev/mcweb/graal/BrowserExecutorService",
                                 "reportWorldgenBiomesPhase",
                                 "(I)V",
                                 false
@@ -3468,7 +3389,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                         disabledHook.add(new org.objectweb.asm.tree.LdcInsnNode(42))
                         disabledHook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                 org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
+                                "dev/mcweb/graal/BrowserExecutorService",
                                 "reportWorldgenBiomesPhase",
                                 "(I)V",
                                 false
@@ -3507,7 +3428,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                         entryHook.add(new org.objectweb.asm.tree.LdcInsnNode(43))
                         entryHook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                 org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
+                                "dev/mcweb/graal/BrowserExecutorService",
                                 "reportWorldgenBiomesPhase",
                                 "(I)V",
                                 false
@@ -3542,7 +3463,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                 phaseHook.add(new org.objectweb.asm.tree.LdcInsnNode(phaseCall[3]))
                                 phaseHook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                         org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                        "dev/mcweb/graal/AgentExecutorService",
+                                        "dev/mcweb/graal/BrowserExecutorService",
                                         "reportWorldgenBiomesPhase",
                                         "(I)V",
                                         false
@@ -3610,7 +3531,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                 org.objectweb.asm.Opcodes.ALOAD, 7))
                         missingHook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                 org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
+                                "dev/mcweb/graal/BrowserExecutorService",
                                 "reportWorldgenRegionMissing",
                                 [
                                         "(Lnet/minecraft/server/level/WorldGenRegion;II",
@@ -3660,12 +3581,12 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                             )
                         }
                         // runUntilWait loops back to this call while a generation
-                        // task is waiting for its next layer.  Poll before each
-                        // iteration so an agent in that allocation-free loop can
-                        // publish its stack to the WasmLM collector.
+                        // task is waiting for its next layer. Poll before each
+                        // iteration so the allocation-free loop has a bounded
+                        // progress point.
                         def safepointHook = new org.objectweb.asm.tree.MethodInsnNode(
                                 org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
+                                "dev/mcweb/graal/BrowserExecutorService",
                                 "safepointPoll",
                                 "()V",
                                 false
@@ -3692,7 +3613,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                     org.objectweb.asm.Opcodes.ALOAD, 2))
                             hook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                     org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                    "dev/mcweb/graal/AgentExecutorService",
+                                    "dev/mcweb/graal/BrowserExecutorService",
                                     "reportGenerationTaskWait",
                                     [
                                             "(Lnet/minecraft/server/level/ChunkGenerationTask;",
@@ -3714,9 +3635,9 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                         // runAll is Mojang's tight ConsecutiveExecutor drain.  It
                         // is normally short, but a persistent generation stream can
                         // keep it in the same allocation-free loop while the Server
-                        // owner is blocked.  Poll immediately before the exact
-                        // private pollTask call; primary calls are no-ops and agent
-                        // calls can rendezvous with the shared-heap collector.
+                        // owner is blocked. Poll immediately before the exact
+                        // private pollTask call so the wait loop has a bounded
+                        // progress point.
                         def classNode = new org.objectweb.asm.tree.ClassNode()
                         new org.objectweb.asm.ClassReader(contents).accept(
                                 classNode,
@@ -3746,7 +3667,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                 pollTaskCalls.first(),
                                 new org.objectweb.asm.tree.MethodInsnNode(
                                         org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                        "dev/mcweb/graal/AgentExecutorService",
+                                        "dev/mcweb/graal/BrowserExecutorService",
                                         "safepointPoll",
                                         "()V",
                                         false
@@ -3819,7 +3740,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                 org.objectweb.asm.Opcodes.ALOAD, 3))
                         failureHook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                 org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
+                                "dev/mcweb/graal/BrowserExecutorService",
                                 "reportGenerationStepFailure",
                                 [
                                         "(Lnet/minecraft/server/level/GenerationChunkHolder;",
@@ -3887,7 +3808,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                 org.objectweb.asm.Opcodes.ILOAD, 7))
                         compareAndSetHook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                 org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
+                                "dev/mcweb/graal/BrowserExecutorService",
                                 "reportGenerationFutureComplete",
                                 [
                                         "(Lnet/minecraft/server/level/GenerationChunkHolder;",
@@ -3913,7 +3834,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                 org.objectweb.asm.Opcodes.ILOAD, 6))
                         completeHook.add(new org.objectweb.asm.tree.MethodInsnNode(
                                 org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
+                                "dev/mcweb/graal/BrowserExecutorService",
                                 "reportGenerationFutureComplete",
                                 [
                                         "(Lnet/minecraft/server/level/GenerationChunkHolder;",
@@ -4029,37 +3950,6 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                 )
                         )
                         patchedIntegratedServerWorker += pauseCalls.size()
-
-                        /*
-                         * Threaded lane: reconcile chunk sends on Mojang's own Server
-                         * thread. `BrowserIntegratedServerCompat.pump` returns early
-                         * unless the server is cooperative, so the reconciliation never
-                         * ran here and two measured four-agent runs both held at exactly
-                         * 25 client chunks of 329 -- the initial 5x5 login batch and
-                         * nothing after it. Appending at every return keeps it on the
-                         * thread that owns ServerChunkCache/ChunkMap/PlayerChunkSender.
-                         */
-                        def tickReturns = tickMethod.instructions.toArray().findAll { instruction ->
-                            instruction.opcode == org.objectweb.asm.Opcodes.RETURN
-                        }
-                        if (tickReturns.isEmpty()) {
-                            throw new GradleException(
-                                    "Expected at least one IntegratedServer.tickServer return"
-                            )
-                        }
-                        tickReturns.each { returnInsn ->
-                            def reconcileHook = new org.objectweb.asm.tree.InsnList()
-                            reconcileHook.add(new org.objectweb.asm.tree.VarInsnNode(
-                                    org.objectweb.asm.Opcodes.ALOAD, 0))
-                            reconcileHook.add(new org.objectweb.asm.tree.MethodInsnNode(
-                                    org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                    "dev/mcweb/graal/BrowserIntegratedServerCompat",
-                                    "afterThreadedServerTick",
-                                    "(Lnet/minecraft/client/server/IntegratedServer;)V",
-                                    false))
-                            tickMethod.instructions.insertBefore(returnInsn, reconcileHook)
-                            patchedThreadedReconcileHook++
-                        }
 
                         def replaceDistanceChain = { optionName, platformName ->
                             def calls = tickMethod.instructions.findAll { instruction ->
@@ -4979,14 +4869,8 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                             )
                         }
                         def method = methods.first()
-                        // Vanilla starts the expensive registry/datapack load by
-                        // passing Util.backgroundExecutor() to WorldLoader.load, then
-                        // blocks the client event loop with managedBlock until that
-                        // future completes. Keep initial boot/menu work cooperative,
-                        // but enable the demand-created WasmLM background executor
-                        // before this accessor so the load itself does not run for
-                        // minutes on the browser thread. No Worker is created here;
-                        // Mojang's first executor submission triggers Thread.start().
+                        // Mark the expensive registry/datapack load before the
+                        // cooperative executor is selected by the normal accessor.
                         def worldBackgroundCalls = method.instructions.findAll { instruction ->
                             instruction instanceof org.objectweb.asm.tree.MethodInsnNode
                                     && instruction.opcode == org.objectweb.asm.Opcodes.INVOKESTATIC
@@ -5008,13 +4892,6 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                 "dev/mcweb/graal/MinecraftInitProgress",
                                 "trace",
                                 "(Ljava/lang/String;)V",
-                                false
-                        ))
-                        enableWorldBackground.add(new org.objectweb.asm.tree.MethodInsnNode(
-                                org.objectweb.asm.Opcodes.INVOKESTATIC,
-                                "dev/mcweb/graal/AgentExecutorService",
-                                "activateWorldCreationParallelism",
-                                "()V",
                                 false
                         ))
                         method.instructions.insertBefore(
@@ -5715,7 +5592,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                     } else if (entry.name == simpleReloadEntryName) {
                         // DIAG: retain Mojang's reload graph exactly, but route its
                         // lifecycle seams through a bounded listener/task probe. The
-                        // helper is a no-op unless the WasmLM agent pool is selected.
+                        // helper is a no-op unless the diagnostic query is selected.
                         def classNode = new org.objectweb.asm.tree.ClassNode()
                         new org.objectweb.asm.ClassReader(contents).accept(classNode, 0)
                         def prepareDesc = [
@@ -5819,9 +5696,6 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                         stateFactoryContext.add(new org.objectweb.asm.tree.VarInsnNode(
                                 org.objectweb.asm.Opcodes.ALOAD, 0
                         ))
-                        stateFactoryContext.add(new org.objectweb.asm.tree.InsnNode(
-                                org.objectweb.asm.Opcodes.ICONST_1
-                        ))
                         prepareMethod.instructions.insertBefore(
                                 stateFactoryCall,
                                 stateFactoryContext
@@ -5836,7 +5710,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                                 "Lnet/minecraft/server/packs/resources/PreparableReloadListener\$PreparationBarrier;",
                                 "Lnet/minecraft/server/packs/resources/PreparableReloadListener;",
                                 "Ljava/util/concurrent/Executor;Ljava/util/concurrent/Executor;",
-                                "Lnet/minecraft/server/packs/resources/SimpleReloadInstance;Z)",
+                                "Lnet/minecraft/server/packs/resources/SimpleReloadInstance;)",
                                 "Ljava/util/concurrent/CompletableFuture;"
                         ].join("")
                         stateFactoryCall.itf = false
@@ -6300,8 +6174,7 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                         // a same-frame drain of the entire mesh queue (204 staged
                         // UberBuffer uploads, ~11.7 MB, in one frame). Swap the
                         // constructor's executor argument for the paced queue
-                        // (threaded lanes get the background agent pool back,
-                        // unchanged).
+                        // and keeps the normal background executor unchanged.
                         classNode.methods.each { method ->
                             if (method.name != "<init>") {
                                 return
@@ -7027,7 +6900,6 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                 || patchedServerPhase != 7
                 || patchedWaitUntilNextTick != 1
                 || patchedIntegratedServerWorker != 16
-                || patchedThreadedReconcileHook < 1
                 || patchedServerBackgroundExecutor != 3
                 || patchedEventLoopDrain != 1
                 || patchedEventLoopWait != 1
@@ -7100,7 +6972,6 @@ def browserMinecraftJar = tasks.register("browserMinecraftJar", Zip) {
                             + "ServerLifecycle=${patchedServerLifecycle}, "
                             + "ServerPhase=${patchedServerPhase}, "
                             + "IntegratedServerWorker=${patchedIntegratedServerWorker}, "
-                            + "ThreadedReconcileHook=${patchedThreadedReconcileHook}, "
                             + "ServerBackgroundExecutor=${patchedServerBackgroundExecutor}, "
                             + "EventLoopDrain=${patchedEventLoopDrain}, "
                             + "EventLoopWait=${patchedEventLoopWait}, "
@@ -7207,19 +7078,38 @@ tasks.named("compileGraalJava") {
     dependsOn(browserMinecraftJar)
 }
 
+def onWindows = System.getProperty("os.name").toLowerCase().contains("windows")
+def windowsPointstoPatchDir = layout.buildDirectory.dir("windows-pointsto-patch/classes")
+
+tasks.register("windowsPointstoPatch", Exec) {
+    group = "build"
+    description = "Stage the exact-counted GraalVM points-to workaround required on Windows."
+    onlyIf { onWindows }
+    inputs.files(
+            file("tools/windows-pointsto-patch/PointstoPatcher.java"),
+            file("tools/windows-pointsto-patch/build.mjs")
+    )
+    outputs.dir(windowsPointstoPatchDir)
+    doFirst {
+        if (!graalVmHome.isPresent()) {
+            throw new GradleException("Set GRAALVM_HOME before staging the Windows builder patch")
+        }
+        environment("GRAALVM_HOME", graalVmHome.get())
+        commandLine(
+                "node",
+                file("tools/windows-pointsto-patch/build.mjs").absolutePath,
+                windowsPointstoPatchDir.get().asFile.absolutePath
+        )
+    }
+}
+
 tasks.register("graalWebImage", Exec) {
     group = "build"
     description = "Compile a Minecraft JAR entry point with GraalVM Web Image."
     dependsOn("compileGraalJava", "featureClasses", browserMinecraftJar)
-    // WasmLM images need the builder patch: without it every `@JS` bridge in this
-    // repo silently compiles to a null-returning stub. WASMGC does not -- except on
-    // Windows, where the same task also produces the points-to patch that gets the
-    // build past GraalVM's @Delete single-callee check.
-    if (graalBackend != "WASMGC"
-            || System.getProperty("os.name").toLowerCase().contains("windows")) {
-        dependsOn("webImagePatch")
+    if (onWindows) {
+        dependsOn("windowsPointstoPatch")
     }
-
     def outputDirectory = layout.buildDirectory.dir("graal")
     def minimalProbeMains = [
             defaultGraalMain,
@@ -7290,7 +7180,6 @@ tasks.register("graalWebImage", Exec) {
         // .cmd is run through cmd.exe, whose command line caps at 8191
         // characters -- over which it fails with exit 255 and no output at all.
         // CreateProcess allows 32767, so invoking the exe directly clears it.
-        def onWindows = System.getProperty("os.name").toLowerCase().contains("windows")
         def nativeImage = file("${graalVmHome.get()}/bin/native-image")
         if (onWindows) {
             def candidates = [
@@ -7373,10 +7262,17 @@ tasks.register("graalWebImage", Exec) {
                 // during constant-pool resolution, before reachability).
                 "-H:+PrintImageHeapPartitionSizes"
         ]
+        if (onWindows) {
+            def pointstoPatch = windowsPointstoPatchDir.get().asFile
+            if (!pointstoPatch.isDirectory()) {
+                throw new GradleException("Windows points-to patch was not staged at ${pointstoPatch}")
+            }
+            nativeImageCommand.add(
+                    "-J--patch-module=org.graalvm.nativeimage.pointsto=${pointstoPatch.absolutePath}"
+            )
+        }
         if (graalDebugNames) {
-            // Applies to both backends, so it sits outside the WasmLM block —
-            // that is where these two lines were first (wrongly) put, and the
-            // WASMGC build silently ignored them.
+            // Applies to the fixed WasmGC backend.
             //
             // Both flags are needed. -H:+DebugNames keeps the symbolic names in
             // the emitted .wat; the wrapper forces `wasm-as -g`, without which
@@ -7386,40 +7282,6 @@ tasks.register("graalWebImage", Exec) {
             nativeImageCommand.add("-H:+UseBinaryen")
             nativeImageCommand.add(
                     "-H:WasmAsPath=${rootDir}/tools/wasm-as-debugnames".toString())
-        }
-        if (graalBackend != "WASMGC") {
-            // Selecting a non-default backend takes three things, none of them
-            // documented together:
-            //   1. `Backend=` must appear in ProvidedHostedOptions in
-            //      $GRAALVM_HOME/lib/svm/tools/svm-wasm/native-image.properties.
-            //      The stock file omits it, so the driver rejects -H:Backend
-            //      as "Unrecognized option" before the builder ever starts.
-            //   2. WebImagePlatformInjector hard-forces WASMGC whenever
-            //      `com.oracle.graalvm.iswebimage` is not set on the builder
-            //      JVM -- without it -H:Backend=WASM is accepted and silently
-            //      ignored (you get a Wasm-GC image with no linear memory).
-            //   3. WasmLM assembles through wat2wasm by default; this repo has
-            //      Binaryen, not wabt, so route it through wasm-as instead.
-            //   4. The builder patch (task `webImagePatch`) supplies the `@JS`
-            //      lowering and the real `Thread.start0` the stock backend lacks.
-            nativeImageCommand.add("-J-Dcom.oracle.graalvm.iswebimage=true")
-            nativeImageCommand.add("-H:Backend=${graalBackend}".toString())
-            nativeImageCommand.add("-H:+UseBinaryen")
-            nativeImageCommand.add(
-                    "-J--patch-module=org.graalvm.extraimage.builder=${webImagePatchDir.get().asFile.absolutePath}".toString()
-            )
-            nativeImageCommand.add(
-                    "-J--patch-module=org.graalvm.nativeimage.builder=${layout.buildDirectory.dir("webimage-patch/svm-classes").get().asFile.absolutePath}".toString()
-            )
-        }
-        // Windows only, and OUTSIDE the WasmLM branch above: WASMGC is the backend
-        // this project ships, and the @Delete check fires there too. macOS and
-        // Linux never reach it, so their builder stays stock.
-        def pointstoPatch = layout.buildDirectory.dir("webimage-patch/pointsto-classes").get().asFile
-        if (onWindows && pointstoPatch.isDirectory()) {
-            nativeImageCommand.add(
-                    "-J--patch-module=org.graalvm.nativeimage.pointsto=${pointstoPatch.absolutePath}".toString()
-            )
         }
         if (!useMinimalImageClasspath) {
             // The real client loads its built-in language, shaders, textures,

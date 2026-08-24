@@ -65,7 +65,7 @@ public final class BrowserSkinTextureCompat {
 
     /**
      * Installs a full-client probe only when {@code ?mcweb_skin_probe=1} is
-     * present. It remains separate from the player-control agent and calls the
+     * present. It remains separate from the player-control worker and calls the
      * public Mojang downloader, so the resulting future covers PNG decode,
      * skin processing, DynamicTexture creation, and TextureManager registration
      * in addition to this class's browser-fetch boundary.

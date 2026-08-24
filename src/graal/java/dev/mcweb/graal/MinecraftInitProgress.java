@@ -16,7 +16,7 @@ public final class MinecraftInitProgress {
             Thread current = Thread.currentThread();
             context = " thread=" + current.getName()
                     + "/" + current.getId()
-                    + " queue=" + AgentExecutorService.queueState();
+                    + " queue=" + BrowserExecutorService.queueState();
         }
         String line = stage + context + " [" + heapStats() + "]";
         System.out.println("[MC-INIT] " + line);

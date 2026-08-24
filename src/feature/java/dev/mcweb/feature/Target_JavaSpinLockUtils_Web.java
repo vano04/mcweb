@@ -11,8 +11,8 @@ import com.oracle.svm.shared.Uninterruptible;
  * <p>Neither Web Image Wasm backend lowers {@code PauseNode}
  * ({@code Thread.onSpinWait}), so the upstream overload fails while compiling.
  * Retrying the existing one-shot atomic fast path preserves the lock contract
- * without introducing that unsupported compiler node. On WasmGC it is merely
- * redundant; on threaded WasmLM it is required for actual contention.
+ * without introducing that unsupported compiler node. The public image is
+ * single-threaded, but the bounded retry preserves the upstream lock contract.
  */
 @TargetClass(JavaSpinLockUtils.class)
 final class Target_JavaSpinLockUtils_Web {

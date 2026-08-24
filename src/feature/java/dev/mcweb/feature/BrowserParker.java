@@ -28,8 +28,7 @@ final class BrowserParker extends Parker {
 
     // Parker.release() is @Uninterruptible (it runs while a thread is being
     // torn down); an override that drops the annotation fails the build with
-    // "violations of @Uninterruptible usage". WasmGC never reached this check
-    // because that backend registers no ParkerFactory of its own; WasmLM does.
+    // "violations of @Uninterruptible usage".
     @Uninterruptible(reason = "Called during thread teardown.")
     @Override
     protected void release() {

@@ -47,8 +47,8 @@ public final class BrowserLiveMeshDispatcher {
     private static final ArrayDeque<Install> INSTALL_QUEUE = new ArrayDeque<>();
     /**
      * The Java callback paths are not all guaranteed to run on the render
-     * thread: a JAR compile hook may run on a WasmLM carrier while a Worker
-     * result or the frame pump is entering the primary instance.  The maps
+     * thread: a JAR compile hook may run while a Worker result or the frame
+     * pump is entering the primary instance.  The maps
      * above are ownership state, not concurrent collections.  Serialize the
      * short state transition around submit/cancel/result/pump so a reset and
      * a late result cannot interleave between the identity checks and map

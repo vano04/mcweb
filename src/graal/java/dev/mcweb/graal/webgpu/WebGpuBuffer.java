@@ -45,8 +45,7 @@ final class WebGpuBuffer extends GpuBuffer {
     private static final long TOTAL_MAPPING_SNAPSHOT_LIMIT = 16L * 1024 * 1024;
 
     // Read-only diagnostics exported through BrowserGpu.installFrameCallback.
-    // The render path is single-threaded on WasmGC; approximate counters are
-    // also sufficient on the experimental WasmLM lane.
+    // The render path is single-threaded on the public WasmGC image.
     private static long directSkippedCalls;
     private static long directSkippedBytes;
     private static long mappedSkippedCalls;
@@ -229,10 +228,8 @@ final class WebGpuBuffer extends GpuBuffer {
     /**
      * Uploads in bounded slices.
      *
-     * <p>On WasmLM the bridge views the existing array in linear memory, so
-     * chunking bounds the browser's synchronous GPU call without creating a
-     * second payload. WasmGC keeps the old base64 fallback, where chunking caps
-     * the transient range-copy/string cost.</p>
+     * <p>The WasmGC bridge keeps each synchronous GPU call bounded; chunking also
+     * caps the transient range-copy/string cost.</p>
      */
     private void writeChunked(final long destinationOffset, final byte[] bytes, final int length) {
         writeArrayChunked(destinationOffset, bytes, 0, length);

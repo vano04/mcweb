@@ -86,10 +86,6 @@ public final class BrowserMinecraftMain {
             stage = "RenderSystem.initRenderThread";
             BrowserGpu.reportProgress(stage);
             RenderSystem.initRenderThread();
-            // Resolve `?mcweb_worldgen_trace` here, on the browser thread. An agent's
-            // Worker sees only its own script URL, so if an agent resolved it first the
-            // page's query string would be invisible and the trace would stay dark.
-            AgentExecutorService.primeWorldgenTrace();
 
             File gameDirectory = new File("/tmp/mcgame");
             gameDirectory.mkdirs();

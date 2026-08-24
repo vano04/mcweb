@@ -34,6 +34,7 @@ import {
 } from "./minecraft-input-policy.mjs";
 import { validateBuildGradle } from "./source-integrity.mjs";
 import { preflightNativeImage } from "./native-image-preflight.mjs";
+import { applyWindowsToolchain, loadWindowsToolchain } from "./windows-toolchain.mjs";
 
 const VERSION = "26.2";
 const EXPECTED_CLIENT_SHA256 = "40896ee9f1e2bec3c934daac7e93d41e9e3d9c2f8ae0ca366d52ffbfd1afa290";
@@ -74,7 +75,7 @@ const downloadOnly = has("download-only");
 const noAudio = has("no-audio");
 // Host-specific native-image flags. Windows with the open-source C toolchain
 // needs "-H:-CheckToolchain"; see tools/oss-toolchain.mjs.
-const graalExtraArgs = flag("graal-extra-args", "");
+const requestedGraalExtraArgs = flag("graal-extra-args", "");
 const graalVmHomeArg = flag("graalvm-home") ?? flag("graalVmHome");
 const outDir = resolve(flag("out", join(PROJECT, "dist", "build")));
 const MCWEB_HOME = process.env.MCWEB_HOME || join(homedir(), ".mcweb");
@@ -105,6 +106,24 @@ validateBuildArgs();
 // compiler work so a damaged GitHub clone gets a recovery instruction instead.
 const sourceIntegrity = await validateBuildGradle(PROJECT);
 if (!sourceIntegrity.ok) die(sourceIntegrity.message);
+
+// The clean Windows installer writes this fail-closed record after preparing
+// the llvm-mingw + Visual-Studio-shaped shim. Direct build.mjs invocations
+// reuse it automatically; machines with a real Visual Studio installation keep
+// the stock environment when the record is absent.
+let windowsToolchain = null;
+if (process.platform === "win32") {
+  try {
+    windowsToolchain = await loadWindowsToolchain(MCWEB_HOME);
+  } catch (error) {
+    die(`${error?.message || error}\n  Re-run .\\tools\\install.ps1 --build to repair the llvm-mingw adapter.`);
+  }
+}
+const toolchainEnvironment = applyWindowsToolchain(process.env, windowsToolchain);
+const graalExtraArgs = [...new Set([
+  windowsToolchain?.graalExtraArgs,
+  requestedGraalExtraArgs,
+].filter(Boolean))].join(" ");
 
 // The checked-in image recipes use Oracle GraalVM's Web Image distribution. The
 // ordinary macOS `java_home` registry often only knows about a system JDK, so
@@ -1018,7 +1037,14 @@ if (graalVm) {
   let nativeImageCheck;
   try {
     nativeImageCheck = await preflightNativeImage(graalVm.home, {
-      env: { ...process.env, GRAALVM_HOME: graalVm.home, JAVA_HOME: graalVm.home },
+      env: {
+        ...toolchainEnvironment.env,
+        GRAALVM_HOME: graalVm.home,
+        JAVA_HOME: graalVm.home,
+        PATH: process.platform === "win32"
+          ? `${join(graalVm.home, "bin")};${toolchainEnvironment.env.PATH || ""}`
+          : toolchainEnvironment.env.PATH,
+      },
       cwd: PROJECT,
     });
   } catch (error) {
@@ -1062,13 +1088,15 @@ if (!noAudio && haveAssets) gradleArgs.push(`-PmcAssetsDir=${install.assetsRoot}
 if (graalExtraArgs) gradleArgs.push(`-PgraalExtraArgs=${graalExtraArgs}`);
 
 const gradleEnv = {
-  ...process.env,
+  ...toolchainEnvironment.env,
   GRAALVM_HOME: graalVm.home,
   JAVA_HOME: graalVm.home,
-  // Gradle's Exec tasks cannot assume the Node wrapper's directory is on the
-  // daemon PATH. Pass the exact Node process that is running this build so a
-  // portable Windows install works under both native and emulated hosts.
-  MCWEB_NODE: process.execPath,
+  PATH: process.platform === "win32"
+    // Gradle's Windows-only points-to staging task is JavaScript. The clean
+    // installer invokes this file through its bundled Node by absolute path,
+    // which does not otherwise make `node` discoverable to child processes.
+    ? `${dirname(process.execPath)};${join(graalVm.home, "bin")};${toolchainEnvironment.env.PATH || ""}`
+    : toolchainEnvironment.env.PATH,
 };
 const binaryenBin = await findBinaryenBin();
 if (binaryenBin) {
@@ -1078,7 +1106,6 @@ if (binaryenBin) {
 }
 
 say(`\nbuilding image (this takes ~9 minutes)\n  ${GRADLEW} ${gradleArgs.join(" ")}\n`);
-say(`node:           ${process.execPath}`);
 await run(GRADLEW,gradleArgs,{ env: gradleEnv });
 if (!noAudio && haveAssets) {
   say("\nstaging audio");

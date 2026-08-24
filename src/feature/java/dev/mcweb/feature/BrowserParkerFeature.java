@@ -27,10 +27,8 @@ import org.graalvm.nativeimage.hosted.Feature;
 public final class BrowserParkerFeature implements Feature {
     @Override
     public void afterRegistration(AfterRegistrationAccess access) {
-        // Only the WasmGC backend leaves these unset. WasmLM (-PgraalBackend=WASM)
-        // ships its own WebImageWasmLMVMThreads, and adding a second value for
-        // the same key aborts the build, so defer to whatever the backend
-        // already registered.
+        // Keep the feature idempotent in case a future GraalVM Web Image
+        // release provides one of these single-threaded browser singletons.
         if (!ImageSingletons.contains(Parker.ParkerFactory.class)) {
             ImageSingletons.add(Parker.ParkerFactory.class, new BrowserParkerFactory());
         }
@@ -50,4 +48,3 @@ public final class BrowserParkerFeature implements Feature {
         }
     }
 }
-

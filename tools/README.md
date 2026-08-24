@@ -10,10 +10,12 @@ development lane.
 | `profile-property-verifier.mjs` | Verifies signed Minecraft profile properties locally. |
 | `build.mjs` | Downloads or validates 26.2 inputs from official Mojang CDNs (or accepts `--mc-dir`), stages title assets, then builds and packages the image. |
 | `native-image-preflight.mjs` | Starts the selected GraalVM `native-image --version` launcher and turns Windows loader failures into actionable MSVC/SDK diagnostics before Gradle. |
+| `oss-toolchain.mjs` | On Windows, prepares the pinned llvm-mingw compiler behind the Visual Studio-shaped `cl.exe`/`vswhere.exe` facade GraalVM expects. No Visual Studio install or Windows SDK is required. |
+| `windows-toolchain.mjs` | Validates and reapplies the local Windows adapter metadata for installer-driven and direct builds. |
+| `windows-pointsto-patch/` | Windows-only, exact-counted GraalVM builder workaround for the `@Delete` multi-callee analysis failure reproduced by this image. |
 | `stage-mojang-assets.mjs` | Validates/reconstructs the same local title assets used automatically by `build.mjs`. |
 | `install.sh` / `install.ps1` | Clean-machine bootstrap wrappers for macOS/Linux and Windows. |
 | `mcweb-install.mjs` | Downloads checksum-verified developer tools, validates/downloads the 26.2 input cache, and optionally builds/runs. |
-| `webimage-patch/` | Source patches used by the Gradle Web Image build. |
 
 The repository-root `run.sh` and `run.ps1` are the only standard local
 build-and-run entrypoints. The repository-root `install` and `install.ps1`
@@ -21,10 +23,9 @@ are source-only GitHub bootstraps for machines that do not already have this
 directory; they install into `~/.mcweb/project` (or `MCWEB_INSTALL_DIR`) and
 refuse to overwrite an unmarked user directory.
 
-The remaining `src/webimage-patch` and `tools/webimage-patch` files are build
-inputs referenced by `build.gradle`; they do not fetch or contain generated
-runtime bytes. The public launcher stages only the canonical `minecraft-client`
-WasmGC pair; experimental shared-memory staging helpers are not included.
+The public launcher stages only the canonical `minecraft-client` WasmGC pair;
+the Gradle build uses the standard GraalVM Web Image lane and has no alternate
+builder or threading lane.
 
 Run the server from this directory with:
 
@@ -52,3 +53,10 @@ the real input-only CDN gate (`--download-only`) without compiling. For
 `build.mjs`, `--dry-run` is strictly no-network/no-write, while
 `--download-only` downloads and verifies game inputs without compiling. No
 account data is fetched.
+
+On Windows, the same bootstrap also downloads the pinned llvm-mingw 20260616
+archive for the machine's execution architecture, verifies its SHA-256, and
+creates a user-local Visual Studio-shaped adapter under `%USERPROFILE%\.mcweb`.
+GraalVM still compiles and runs its normal C layout probes; `cl.exe` translates
+those MSVC-shaped probe arguments to the x86-64 MinGW driver. The adapter does
+not modify the registry or require administrator access.

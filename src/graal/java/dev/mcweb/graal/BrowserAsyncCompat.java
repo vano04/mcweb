@@ -39,10 +39,9 @@ public final class BrowserAsyncCompat {
      * Web Image: its workers call {@code Unsafe.park}/{@code unpark}, which the WasmGC
      * backend substitutes to throw.
      *
-     * <p>{@link AgentExecutorService#pool()} decides what Mojang gets. With WasmLM
-     * thread agents attached it is a real worker pool on other OS threads over the
-     * shared Java heap; with none it is {@link InlineExecutorService}, which runs each
-     * task on the caller and is what the shipping WasmGC image uses.
+     * <p>{@link BrowserExecutorService#pool()} routes work to the inline executor,
+     * which runs each task on the browser thread and avoids unsupported desktop
+     * worker primitives in Web Image.
      */
     public static TracingExecutor inlineTracingExecutor() {
         TracingExecutor current = inlineExecutor;
@@ -87,7 +86,7 @@ public final class BrowserAsyncCompat {
         synchronized (BrowserAsyncCompat.class) {
             current = backgroundExecutor;
             if (current == null) {
-                current = new TracingExecutor(AgentExecutorService.backgroundPool());
+                current = new TracingExecutor(BrowserExecutorService.backgroundPool());
                 backgroundExecutor = current;
             }
             return current;
@@ -112,27 +111,12 @@ public final class BrowserAsyncCompat {
      * explicitly — "a port can serialize on one worker as long as future-completion
      * order per chunk is preserved".
      *
-     * <p>That fallback is now the *degenerate* case rather than the only case.
-     * {@link AgentExecutorService#serverWorldgenPool()} keeps it below two workers and
-     * otherwise hands out the real pool: the reason this port "cannot run that many
-     * worldgen workers yet" — a standing NPE in `DensityFunctions$Ap2` with three
-     * concurrent workers — was the cross-agent class-initialisation race, and that is
-     * fixed in the builder patch.
-     *
-     * <p>Serialising here is not free: it puts every chunk on Mojang's one Server
-     * thread, which is what caps the threaded lane's chunk rate against the WasmGC
-     * inline baseline. It does keep the work off the browser frame either way.
+     * <p>The browser image intentionally serializes this dependency graph on the
+     * inline executor, preserving completion order without desktop worker threads.
      */
     public static TracingExecutor serverBackgroundTracingExecutor() {
-        /*
-         * Deliberately re-derived rather than cached on first call. This seam can be
-         * reached before the agent carriers have attached, when backgroundPool() still
-         * resolves to inline; caching that answer would pin the server to one thread for
-         * the lifetime of the image even after the workers exist. The TracingExecutor
-         * wrapper is only rebuilt when the underlying executor actually changes, so a
-         * settled pool still hands back the same instance.
-         */
-        java.util.concurrent.ExecutorService pool = AgentExecutorService.serverWorldgenPool();
+        /* Keep the wrapper stable after the first call. */
+        java.util.concurrent.ExecutorService pool = BrowserExecutorService.serverWorldgenPool();
         TracingExecutor current = serverBackgroundExecutor;
         if (current != null && serverBackgroundDelegate == pool) {
             return current;
@@ -155,7 +139,7 @@ public final class BrowserAsyncCompat {
         synchronized (BrowserAsyncCompat.class) {
             current = ioExecutor;
             if (current == null) {
-                current = new TracingExecutor(AgentExecutorService.ioPool());
+                current = new TracingExecutor(BrowserExecutorService.ioPool());
                 ioExecutor = current;
             }
             return current;

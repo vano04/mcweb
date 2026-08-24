@@ -62,10 +62,17 @@ source tree and `build.gradle` are the authoritative local build description.
 
 ## Third-party components
 
-- **GraalVM Web Image** (Oracle, GPLv2 + Classpath Exception). `src/webimage-patch`
-  and `tools/webimage-patch` carry patches applied to Substrate VM classes at
-  build time against your own GraalVM install. Those files are derived from
-  Oracle sources and remain under Oracle's licence, not this project's.
+- **GraalVM Web Image** (Oracle, GPLv2 + Classpath Exception). The local build
+  invokes your own GraalVM installation. On Windows only,
+  `tools/windows-pointsto-patch/PointstoPatcher.java` rewrites one
+  exact-counted builder check that otherwise aborts this image during analysis;
+  the resulting class is staged locally and is not distributed as a binary.
 - **Binaryen** (Apache-2.0) — `wasm-as` is required by every WasmGC build and
   must be available in the developer's local toolchain.
+- **llvm-mingw** (LLVM under Apache-2.0 with LLVM exceptions; MinGW-w64 under
+  its upstream permissive licenses) — the checksum-pinned Windows bootstrap
+  downloads it locally as the C compiler used for GraalVM's layout probes.
 - **Node.js** (MIT) — used by the local staging, server, and test scripts.
+- **postject** (MIT) — the Windows bootstrap invokes one exact npm version to
+  embed the local `cl.exe` and `vswhere.exe` JavaScript facades into copies of
+  the verified Node executable.

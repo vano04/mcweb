@@ -289,9 +289,6 @@
     if (name === "writeBufferRaw") {
       return `writeBufferRaw(h=${detail.handle},@${detail.destinationOffset},bytes=${detail.byteLength})`;
     }
-    if (name === "writeTextureRaw") {
-      return `writeTextureRaw(h=${detail.handle},bytes=${detail.byteLength})`;
-    }
     if (name === "reportProgress") return `reportProgress(${detail.stage ?? ""})`;
     return name;
   };
@@ -348,10 +345,9 @@
   globalThis.mcWebEvtCounts = () => Object.fromEntries(_evtCounts);
 
   const resolveBindingName = (value, kind) => {
-    // Older staged images still pass their pre-interning Java String object.
-    // Returning it untouched avoids the recursive Proxy string conversion that
-    // caused the WasmLM stack overflow. Numeric IDs must resolve exactly.
-    if (typeof value !== "number") return value;
+    if (!Number.isInteger(value) || value < 0) {
+      throw new Error(`invalid ${kind} binding name id ${value}`);
+    }
     const name = globalThis.mcWebGpu?._bindingNames?.[value];
     if (typeof name !== "string") throw new Error(`unknown ${kind} binding name ${value}`);
     return name;
@@ -4125,7 +4121,6 @@ struct VsOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32
       .map((stage, index) => [diagnostics.stageMs.slice(-count)[index], stage]),
     reloadProbe: (count = 8000) => ({
       events: diagnostics.reloadProbe.slice(-count),
-      threads: globalThis.mcWebThreadRuntime?.info?.() ?? null,
     }),
     canvasWidth: () => canvas.width,
     canvasHeight: () => canvas.height,
@@ -4279,20 +4274,6 @@ struct VsOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32
       device.queue.writeBuffer(_be.buffer, destinationOffset, _bytes);
     },
 
-    // Bytes straight from the caller, no encoding at all. The OpenJDK lane
-    // hands its uploads over as a typed array, which the RPC copies once into
-    // its SharedArrayBuffer; base64 cost an encode, three string copies and a
-    // decode for data that was always bytes. Same body as the linear-memory
-    // path, which already takes bytes.
-    writeBufferBytes(handle, destinationOffset, bytes) {
-      return this.writeBufferRaw(handle, destinationOffset, bytes);
-    },
-
-    // Texture counterpart of writeBufferBytes: no base64, no strings.
-    writeTextureBytes(handle, bytes, mipLevel, depthOrLayer, x, y, width, height, bytesPerRow, rowsPerImage) {
-      return this.writeTextureRaw(handle, bytes, mipLevel, depthOrLayer, x, y, width, height, bytesPerRow, rowsPerImage);
-    },
-
     writeBufferText(handle, destinationOffset, text, byteLength) {
       const bytes = packedTextToBytes(text, byteLength);
       if (_gpuProbe) {
@@ -4310,11 +4291,7 @@ struct VsOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32
       device.queue.writeBuffer(buffer.buffer, destinationOffset, bytes);
     },
 
-    /**
-     * Typed-array upload path. WasmLM passes a view into its shared Java heap;
-     * WasmGC's raw reader bridge passes the exact decoded scratch view without
-     * materializing a Java String.
-     */
+    /** Typed-array upload path used by the WasmGC array-reader bridge. */
     writeBufferRaw(handle, destinationOffset, bytes) {
       const byteLength = bytes?.byteLength ?? 0;
       const entry = get(handle, "buffer");
@@ -4357,33 +4334,6 @@ struct VsOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32
       device.queue.writeTexture(
         {texture: _te.texture, mipLevel, origin: {x, y, z: depthOrLayer}},
         base64ToBytes(base64),
-        {bytesPerRow, rowsPerImage},
-        {width, height, depthOrArrayLayers: 1}
-      );
-    },
-
-    /** WasmLM texture upload: consume the shared linear-memory view directly. */
-    writeTextureRaw(handle, bytes, mipLevel, depthOrLayer, x, y, width, height, bytesPerRow, rowsPerImage) {
-      const byteLength = bytes?.byteLength ?? 0;
-      markCall("writeTextureRaw", {handle, mipLevel, depthOrLayer, x, y, width, height, bytesPerRow, rowsPerImage, byteLength});
-      const _te = get(handle, "texture");
-      _te._uploads = (_te._uploads || 0) + 1;
-      {
-        const wl = (globalThis.mcWebGpu._texWriteLog ||= {});
-        const key = (_te._label || "?");
-        const rec = (wl[key] ||= {writes: 0, handles: []});
-        rec.writes++;
-        if (!rec.handles.includes(handle)) rec.handles.push(handle);
-      }
-      _te._uploadBytes = (_te._uploadBytes || 0) + byteLength;
-      if (_te._uploadRegions.length < 100) {
-        _te._uploadRegions.push({mipLevel, depthOrLayer, x, y, width, height, bytesPerRow, rowsPerImage});
-      }
-      { const _k = _te._label || "?"; const _u = _uploadByLabel.get(_k) || [0, 0]; _u[0]++; _u[1] += byteLength; _uploadByLabel.set(_k, _u); }
-      if (/panorama/i.test(_te._label)) _panoProbe.uploads.push({hid: _te._hid, label: _te._label, layer: depthOrLayer, w: width, h: height, mip: mipLevel, byteLength});
-      device.queue.writeTexture(
-        {texture: _te.texture, mipLevel, origin: {x, y, z: depthOrLayer}},
-        bytes,
         {bytesPerRow, rowsPerImage},
         {width, height, depthOrArrayLayers: 1}
       );
@@ -5076,12 +5026,7 @@ fn fs_main() -> ClearOutput {
       (this._bindingNames ||= [])[id] = name;
     },
 
-    // New images pass an interned integer id here.  Keep accepting a string as
-    // well: staged WasmLM images are expensive to rebuild and older artifacts
-    // call this same host entry point with the pre-interning String ABI.  Do not
-    // index _bindingNames with that value -- a WasmLM Java String is a Proxy,
-    // and coercing it to a property key re-enters the wasm string bridge until
-    // the Java stack overflows.
+    // New images pass an interned integer id here.
     rpBindTexture(passHandle, nameId, viewHandle, samplerHandle) {
       const name = resolveBindingName(nameId, "texture");
       if (_renderCommandReplayDepth === 0) markCall("rpBindTexture", {passHandle, name});
@@ -5178,10 +5123,6 @@ fn fs_main() -> ClearOutput {
         state._scissor = [0, 0, 32767, 32767];
         state.pass.setScissorRect(0, 0, 32767, 32767);
       }
-    },
-
-    rpCommandStreamRaw(passHandle, bytes, byteLength, end) {
-      return replayRenderPassCommands(this, passHandle, bytes, byteLength, end, "raw");
     },
 
     rpCommandStream64(passHandle, base64, byteLength, end) {
@@ -5858,12 +5799,6 @@ fn fs_main() -> ClearOutput {
         event: text,
       });
       if (entries.length > 8000) entries.splice(0, entries.length - 8000);
-      // The reload probe is most useful precisely when the main thread is stuck
-      // inside the synchronous Create World barrier. Keep the last few events in
-      // the out-of-thread watchdog ring as well; the page-side array above cannot
-      // be read while that renderer is frozen. Do not route through reportProgress:
-      // this path can be hot during the reload and must remain shared-memory-only.
-      globalThis.mcWebThreadRuntime?.diag?.("reload " + text);
       // Keep a compact copy in CDP for the healthy portion of a run. The full
       // reload stream is intentionally not logged here (it is thousands of task
       // events and would overflow the console pipe); these transition records are
@@ -5895,13 +5830,6 @@ fn fs_main() -> ClearOutput {
         return;
       }
       console.log("[MC-INIT]", stage);
-      /*
-       * Mirror into shared linear memory, where a Worker can still read it after this
-       * thread stops returning. Everything else in this method — the console line, the
-       * stage ring, `__mcWebLastStage` — lives on the main thread and disappears with
-       * it, which is why a world-load hang has never had a last known position.
-       */
-      globalThis.mcWebThreadRuntime?.beacon?.(0, stage);
       // Web Image strips *Java* stack traces (getStackTrace() is always empty),
       // but every @JS bridge call crosses into JavaScript, so the JS/wasm stack
       // at the boundary is still available -- and under WasmGC it carries wasm
@@ -5923,21 +5851,6 @@ fn fs_main() -> ClearOutput {
       markCall("reportProgress", {stage});
       setText("jar-status", "running minecraft-26.2-client.jar");
       setText("jar-method", stage);
-    },
-
-    /**
-     * High-frequency probe channel: shared memory only, no console and no stage ring.
-     *
-     * Callers are spin loops that run while this thread is *not* returning to the
-     * browser, so everything `reportProgress` also does — the console line, the stage
-     * ring, the DOM text — is both unreachable and, at this rate, ruinous. The beacon
-     * write is two atomics and a bounded byte copy, which is affordable inside a wait.
-     */
-    reportDiag(text) {
-      globalThis.mcWebThreadRuntime?.diag?.(text);
-      if (String(text ?? "").startsWith("worldgen:step-failure n=")) {
-        globalThis.mcWebThreadRuntime?.stickyDiag?.(text);
-      }
     },
 
     // DIAG: float contents of the small uniform buffers that drive fog and the
@@ -7040,20 +6953,6 @@ fn fs_main() -> ClearOutput {
       installPerfProfiler();
     }
 
-    const launchParams = new URLSearchParams(location.search);
-    if (launchParams.has("mcweb_debug")) {
-      // Keep the allocator counters next to the frame/GC markers while diagnosing
-      // WasmLM pressure. The call is opt-in: it re-enters the image and must not be
-      // part of the normal render loop.
-      setInterval(() => {
-        try {
-          const counters = globalThis.mcWebThreadRuntime?.imageCounters?.();
-          if (counters) console.log("[THREAD-COUNTERS] " + JSON.stringify(counters));
-        } catch (error) {
-          console.warn("[THREAD-COUNTERS] failed", error);
-        }
-      }, 5000);
-    }
     // The pre-runtime auth boundary exposes only the profile name/UUID. This
     // bounded promise normally finished while WebGPU initialised; awaiting it
     // here guarantees Minecraft's GameConfig sees the authenticated identity,
@@ -7065,8 +6964,6 @@ fn fs_main() -> ClearOutput {
     // mcWebServer.launch() derives the server-Worker image from this name so
     // the Worker always runs the image that was just built from this tree.
     globalThis.mcWebImageName = imageName;
-    globalThis.mcWebRuntimeMode = "WASMGC_COOPERATIVE";
-    console.log(`[mcweb-host] runtime mode ${globalThis.mcWebRuntimeMode}`);
     const script = document.createElement("script");
     if (imageName === defaultImage) {
       // graalWebImage patches Config.wasm_path to consume this explicit URL.

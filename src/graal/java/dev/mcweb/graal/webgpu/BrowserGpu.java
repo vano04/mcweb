@@ -84,10 +84,7 @@ public final class BrowserGpu {
         return java.util.Base64.getEncoder().encodeToString(slice);
     }
 
-    /**
-     * Compatibility upload for WasmGC. WasmLM selects the raw linear-memory
-     * methods below because it has no need for the base64 copy path.
-     */
+    /** Base64 compatibility upload for the canonical WasmGC image. */
     @JS.Coerce
     @JS(value = "globalThis.mcWebGpu.writeBuffer64(handle, destinationOffset, base64);",
             args = {"handle", "destinationOffset", "base64"})
@@ -139,97 +136,9 @@ public final class BrowserGpu {
             int byteLength
     );
 
-    /** Whether the current image has the WasmLM linear-memory upload path. */
-    @JS.Coerce
-    @JS(value = "return globalThis.mcWebRuntimeMode === 'WASMLM_THREADED'"
-            + " || globalThis.mcWebRuntimeMode === 'WASMLM_INLINE';", args = {})
-    private static native boolean linearMemoryRuntime();
-
-    /**
-     * Finds the byte-array payload offset for this image's WasmLM object layout.
-     * The result is cached, so this probe allocates only once per image.
-     */
-    @JSRawCall
-    @JS(value = "const memory = getExport('memory');"
-            + "if (!memory) return -1;"
-            + "try {"
-            + "  const view = new Uint8Array(memory.buffer, array >>> 0, 512);"
-            + "  for (let i = 0; i < 509; i++) {"
-            + "    if (view[i] === 0x7b && view[i + 1] === 0x7c && view[i + 2] === 0x7d) return i;"
-            + "  }"
-            + "} catch (error) {}"
-            + "return -1;", args = {"array"})
-    private static native int findByteArrayBase(byte[] array);
-
-    /** Finds the first int payload in a WasmLM {@code int[]} object. */
-    @JSRawCall
-    @JS(value = "const memory = getExport('memory');"
-            + "if (!memory) return -1;"
-            + "try {"
-            + "  const view = new DataView(memory.buffer, array >>> 0, 512);"
-            + "  for (let i = 0; i <= 500; i += 4) {"
-            + "    if (view.getInt32(i, true) === 0x13579bdf"
-            + "      && view.getInt32(i + 4, true) === 0x2468ace0"
-            + "      && view.getInt32(i + 8, true) === 0x0badc0de) return i;"
-            + "  }"
-            + "} catch (error) {}"
-            + "return -1;", args = {"array"})
-    private static native int findIntArrayBase(int[] array);
-
-    /**
-     * Raw WasmLM upload. The Java reference is lowered to the array's linear
-     * memory address; the import wrapper turns it into a Uint8Array view before
-     * calling the host. No JavaScript copy is made here.
-     */
-    @JSRawCall
-    @JS(value = "const memory = getExport('memory');"
-            + "if (!memory) throw new Error('WasmLM memory export is unavailable');"
-            + "const view = new Uint8Array(memory.buffer,"
-            + " (array + base + sourceOffset) >>> 0, length >>> 0);"
-            + "globalThis.mcWebGpu.writeBufferRaw(handle, destinationOffset, view);",
-            args = {"handle", "destinationOffset", "array", "base", "sourceOffset", "length"})
-    private static native void writeBufferRaw(
-            int handle,
-            int destinationOffset,
-            byte[] array,
-            int base,
-            int sourceOffset,
-            int length
-    );
-
-    /** WasmLM-only texture upload over a shared linear-memory view. */
-    @JSRawCall
-    @JS(value = "const memory = getExport('memory');"
-            + "if (!memory) throw new Error('WasmLM memory export is unavailable');"
-            + "const view = new Uint8Array(memory.buffer,"
-            + " (array + base + sourceOffset) >>> 0, length >>> 0);"
-            + "globalThis.mcWebGpu.writeTextureRaw(handle, view, mipLevel, depthOrLayer,"
-            + " x, y, width, height, bytesPerRow, rowsPerImage);",
-            args = {"handle", "array", "base", "sourceOffset", "length", "mipLevel",
-                    "depthOrLayer", "x", "y", "width", "height", "bytesPerRow",
-                    "rowsPerImage"})
-    private static native void writeTextureRaw(
-            int handle,
-            byte[] array,
-            int base,
-            int sourceOffset,
-            int length,
-            int mipLevel,
-            int depthOrLayer,
-            int x,
-            int y,
-            int width,
-            int height,
-            int bytesPerRow,
-            int rowsPerImage
-    );
-
-    /** Selected once: 0 unknown, 1 base64, 2 WasmLM linear memory. */
-    private static volatile int uploadPath;
+    /** Selected once: 0 unknown, 1 base64, 2 direct WasmGC array readers. */
     private static volatile int wasmGcArrayPath = -1;
     private static volatile int packedTextPath = -1;
-    private static volatile int byteArrayBase = -1;
-    private static volatile int intArrayBase = -1;
     private static char[] packedByteChars;
     private static char[] packedWordChars;
 
@@ -247,9 +156,7 @@ public final class BrowserGpu {
                     "upload range offset=" + offset + " length=" + length + " array=" + data.length
             );
         }
-        if (usesLinearMemoryUploads()) {
-            writeBufferRaw(handle, destinationOffset, data, arrayBase(), offset, length);
-        } else if (wasmGcArrayTransportEnabled()) {
+        if (wasmGcArrayTransportEnabled()) {
             int charCount = (length + 1) >>> 1;
             writeBufferWasmGc(
                     handle,
@@ -270,7 +177,7 @@ public final class BrowserGpu {
         }
     }
 
-    /** Uploads a byte-array texture range using linear memory when available. */
+    /** Uploads a byte-array texture range through the canonical WasmGC bridge. */
     static void writeTexture(
             int handle,
             byte[] data,
@@ -294,51 +201,18 @@ public final class BrowserGpu {
                             + " array=" + data.length
             );
         }
-        if (usesLinearMemoryUploads()) {
-            writeTextureRaw(
-                    handle,
-                    data,
-                    arrayBase(),
-                    offset,
-                    length,
-                    mipLevel,
-                    depthOrLayer,
-                    x,
-                    y,
-                    width,
-                    height,
-                    bytesPerRow,
-                    rowsPerImage
-            );
-        } else {
-            writeTexture64(
-                    handle,
-                    encodeBase64(data, offset, length),
-                    mipLevel,
-                    depthOrLayer,
-                    x,
-                    y,
-                    width,
-                    height,
-                    bytesPerRow,
-                    rowsPerImage
-            );
-        }
-    }
-
-    private static boolean usesLinearMemoryUploads() {
-        int path = uploadPath;
-        if (path == 0) {
-            boolean linear = linearMemoryRuntime();
-            uploadPath = linear ? 2 : 1;
-            try {
-                reportProgress("webgpu:buffer-upload-path=" + (linear ? "linear-memory" : "base64"));
-            } catch (Throwable ignored) {
-                // The path choice is functional; diagnostics must not affect it.
-            }
-            return linear;
-        }
-        return path == 2;
+        writeTexture64(
+                handle,
+                encodeBase64(data, offset, length),
+                mipLevel,
+                depthOrLayer,
+                x,
+                y,
+                width,
+                height,
+                bytesPerRow,
+                rowsPerImage
+        );
     }
 
     private static boolean packedTextTransportEnabled() {
@@ -427,47 +301,6 @@ public final class BrowserGpu {
             chars[i * 2 + 1] = (char) (value >>> 16);
         }
         return new String(chars, 0, charCount);
-    }
-
-    private static int arrayBase() {
-        int base = byteArrayBase;
-        if (base >= 0) {
-            return base;
-        }
-        byte[] probe = new byte[64];
-        probe[0] = 0x7b;
-        probe[1] = 0x7c;
-        probe[2] = 0x7d;
-        base = findByteArrayBase(probe);
-        if (base < 0) {
-            throw new IllegalStateException("could not locate the WasmLM byte[] payload");
-        }
-        byteArrayBase = base;
-        try {
-            reportProgress("webgpu:byte-array-base=" + base);
-        } catch (Throwable ignored) {
-            // Diagnostics must not affect the upload path.
-        }
-        return base;
-    }
-
-    private static int intArrayBase() {
-        int base = intArrayBase;
-        if (base >= 0) {
-            return base;
-        }
-        int[] probe = new int[] {0x13579bdf, 0x2468ace0, 0x0badc0de};
-        base = findIntArrayBase(probe);
-        if (base < 0) {
-            throw new IllegalStateException("could not locate the WasmLM int[] payload");
-        }
-        intArrayBase = base;
-        try {
-            reportProgress("webgpu:int-array-base=" + base);
-        } catch (Throwable ignored) {
-            // Diagnostics must not affect the command transport.
-        }
-        return base;
     }
 
     @JS.Coerce
@@ -597,25 +430,8 @@ public final class BrowserGpu {
             + "const protocol = globalThis.mcWebRenderCommands;"
             + "const host = globalThis.mcWebGpu;"
             + "return !disabled && protocol && protocol.VERSION === 1"
-            + " && typeof host?.rpCommandStreamRaw === 'function'"
             + " && typeof host?.rpCommandStream64 === 'function' ? 1 : 0;", args = {})
     private static native int queryRenderPassMode();
-
-    /** WasmLM render-command submission over a synchronous linear-memory view. */
-    @JSRawCall
-    @JS(value = "const memory = getExport('memory');"
-            + "if (!memory) throw new Error('WasmLM memory export is unavailable');"
-            + "const bytes = new Uint8Array(memory.buffer,"
-            + " (words + base) >>> 0, (wordCount * 4) >>> 0);"
-            + "globalThis.mcWebGpu.rpCommandStreamRaw(pass, bytes, wordCount * 4, end);",
-            args = {"pass", "words", "base", "wordCount", "end"})
-    private static native void rpCommandStreamRaw(
-            int pass,
-            int[] words,
-            int base,
-            int wordCount,
-            int end
-    );
 
     /** WasmGC compatibility transport for the same little-endian command words. */
     @JS.Coerce
@@ -669,9 +485,7 @@ public final class BrowserGpu {
             );
         }
         int endFlag = end ? 1 : 0;
-        if (usesLinearMemoryUploads()) {
-            rpCommandStreamRaw(pass, words, intArrayBase(), wordCount, endFlag);
-        } else if (wasmGcArrayTransportEnabled()) {
+        if (wasmGcArrayTransportEnabled()) {
             rpCommandStreamWasmGc(pass, words, wordCount, endFlag);
         } else if (packedTextTransportEnabled()) {
             rpCommandStreamText(
@@ -684,12 +498,10 @@ public final class BrowserGpu {
 
     /**
      * Base64 has a fixed per-pass cost that dominates tiny WasmGC command
-     * buffers. WasmLM never takes this branch: its linear-memory view is the
-     * cheapest transport even for a small pass.
+     * buffers, so the immediate path remains useful for small passes.
      */
     static boolean replaySmallRenderPassImmediately(int wordCount) {
         return wordCount > 0 && wordCount <= 64
-                && !usesLinearMemoryUploads()
                 && !wasmGcArrayTransportEnabled();
     }
 
@@ -939,21 +751,6 @@ public final class BrowserGpu {
     @JS.Coerce
     @JS(value = "globalThis.__mcWebLastStage = stage; if (globalThis.mcWebGpu) globalThis.mcWebGpu.reportProgress(stage);", args = {"stage"})
     public static native void reportProgress(String stage);
-
-    /**
-     * Probe channel for code that runs while this thread is not returning to the browser.
-     *
-     * <p>{@link #reportProgress} writes a console line, a stage-ring entry and two DOM
-     * nodes, all of which live on the main thread's JS heap — unreachable exactly when a
-     * wedge is being diagnosed — and none of which survive being called from inside a
-     * spin loop. This one only writes the shared-memory beacon, on a ring of its own so
-     * a fast probe cannot overwrite the progress history that localises the stall.</p>
-     */
-    @JS.Coerce
-    @JS(value = "const host=globalThis.mcWebGpu;"
-            + "if(host&&typeof host.reportDiag==='function'){host.reportDiag(text);}",
-            args = {"text"})
-    public static native void reportDiag(String text);
 
     /**
      * Dedicated reload-probe channel. Unlike the general progress ring, this retains

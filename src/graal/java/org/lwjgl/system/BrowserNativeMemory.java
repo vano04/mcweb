@@ -31,7 +31,7 @@ public final class BrowserNativeMemory {
     /**
      * Reuse large native backing arrays after their NIO view is freed. These arrays are
      * Java objects in this browser port, so repeatedly allocating a new 16-128 MiB
-     * payload is also repeatedly asking the non-moving WasmLM heap for a large
+     * payload is also repeatedly asking the Web Image heap for a large
      * contiguous object. Keeping a small bounded pool makes the first asset/terrain
      * allocation pay that cost once and lets later churn reuse the same storage.
      *
@@ -564,8 +564,8 @@ public final class BrowserNativeMemory {
      * One-entry locality cache. A single immutable {@link Block} rather than a
      * {@code (base, data)} field pair: two volatile fields can be read across an
      * intervening update and yield one block's array with another block's base, which
-     * silently reads or writes the wrong offset. Under the WasmLM thread agents that is
-     * a live hazard, not a theoretical one.
+     * silently reads or writes the wrong offset. Keeping the pair immutable avoids
+     * that hazard on the browser thread.
      */
     private static volatile Block cache;
 

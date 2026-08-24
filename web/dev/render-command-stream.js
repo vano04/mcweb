@@ -93,7 +93,7 @@
   /**
    * Decode and synchronously replay one little-endian MCRP command buffer.
    *
-   * `bytes` may be a linear-memory view, so neither this function nor a
+   * `bytes` is a short-lived typed-array view, so neither this function nor a
    * handler may retain it after replay returns. The handlers are passed the
    * host and pass handle separately to keep the hot loop allocation-free.
    */

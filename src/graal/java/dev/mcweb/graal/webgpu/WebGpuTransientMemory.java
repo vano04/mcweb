@@ -17,7 +17,7 @@ final class WebGpuTransientMemory implements TransientMemory {
     /**
      * CPU-only transient allocations are valid until the command encoder submit
      * that consumes them. Reusing a small arena keeps each upload from creating
-     * another large Java byte[] in the non-moving WasmLM heap. GPU resources are
+     * another large Java byte[] in the Web Image heap. GPU resources are
      * intentionally not destroyed at every submit: the host graveyard is safe,
      * but per-submit destruction was measured as a severe frame/chunk regression.
      */
@@ -115,7 +115,7 @@ final class WebGpuTransientMemory implements TransientMemory {
         ByteBuffer source = data.duplicate();
         // uploadStaging needs a CPU shadow because copyBufferToTexture is a
         // synchronous browser seam. uploadGpu is device-local by contract and
-        // can stream the source directly from WasmLM linear memory instead.
+        // can stream the source directly through the bounded WasmGC upload bridge.
         int bufferUsage = staging
                 ? mappableUsage(usage)
                 : usage | GpuBuffer.USAGE_COPY_DST;

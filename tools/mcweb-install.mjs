@@ -20,6 +20,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { applyWindowsToolchain, loadWindowsToolchain } from "./windows-toolchain.mjs";
 
 const NODE_VERSION = "24.19.0";
 // Web Image was introduced in Oracle GraalVM 25.1. The public bootstrap is
@@ -28,6 +29,7 @@ const GRAALVM_VERSION = "25.2.4";
 const GRAALVM_ARCHIVE = "25i2-25.0.4";
 const MIN_GRAALVM_VERSION = [25, 1, 0];
 const BINARYEN_VERSION = "131";
+const LLVM_MINGW_VERSION = "20260616";
 const MIN_NODE_MAJOR = 20;
 const HOME = process.env.MCWEB_HOME || join(homedir(), ".mcweb");
 const PROJECT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -104,8 +106,20 @@ const BINARYEN_ARTIFACTS = Object.freeze({
   "x86_64-windows": "2f4edac1703a2f695254d6ff52ede03481e67db1f094915763d863158c17d9bc",
 });
 
+const LLVM_MINGW_ARTIFACTS = Object.freeze({
+  x64: {
+    file: `llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-x86_64.zip`,
+    sha256: "b9b68a4d276e16fa25802aaba458e4638f64b3884c290aaccdc2d87083b6ca35",
+  },
+  arm64: {
+    file: `llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-aarch64.zip`,
+    sha256: "312593669435bd0bfc1a43ac3fba23c8b27e0610bade88b2738e5a01702a99ba",
+  },
+});
+
 const GRAALVM_BASE = "https://gds.oracle.com/download/graal/25i2/archive";
 const BINARYEN_BASE = `https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}`;
+const LLVM_MINGW_BASE = `https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}`;
 const GRAAL_OBJECT_HOST = "objectstorage.uk-london-1.oraclecloud.com";
 const GRAAL_OBJECT_NAMESPACE = "lr0crfzcb4ml";
 const GRAAL_OBJECT_BUCKET = "gds-artifacts";
@@ -150,6 +164,12 @@ const TOOL_URL_RULES = Object.freeze({
     hosts: new Set(["github.com"]),
     redirectHosts: new Set(["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]),
     path: new RegExp(`^/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-[a-z0-9-]+\\.tar\\.gz(?:\\.sha256)?$`),
+    redirectPath: /^\/github-production-release-asset\//,
+  }),
+  "llvm-mingw": Object.freeze({
+    hosts: new Set(["github.com"]),
+    redirectHosts: new Set(["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]),
+    path: new RegExp(`^/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-(?:x86_64|aarch64)\\.zip$`),
     redirectPath: /^\/github-production-release-asset\//,
   }),
 });
@@ -680,6 +700,46 @@ async function installBinaryen(host) {
   return bin;
 }
 
+async function installWindowsToolchain() {
+  if (process.platform !== "win32") return null;
+  if (!has("force-download")) {
+    try {
+      const installed = await loadWindowsToolchain(HOME);
+      if (installed) {
+        say(`using llvm-mingw adapter at ${installed.msvcRoot}`);
+        return installed;
+      }
+    } catch (error) {
+      say(`repairing llvm-mingw adapter: ${error?.message || error}`);
+    }
+  }
+  const architecture = normalizedWindowsArch(process.arch);
+  const artifact = LLVM_MINGW_ARTIFACTS[architecture];
+  if (!artifact) die(`no llvm-mingw toolchain is pinned for Windows ${process.arch}`);
+  const destination = join(HOME, "llvm-mingw");
+  const compiler = join(destination, "bin", "x86_64-w64-mingw32-clang.exe");
+  if (!(await exists(compiler)) || has("force-download")) {
+    await fetchAndExtract({
+      url: `${LLVM_MINGW_BASE}/${artifact.file}`,
+      kind: "llvm-mingw",
+      expectedSha256: artifact.sha256,
+      destination,
+      archiveName: artifact.file,
+    });
+  } else {
+    say(`using llvm-mingw ${LLVM_MINGW_VERSION} at ${destination}`);
+  }
+  await run(process.execPath, [
+    join(PROJECT, "tools", "oss-toolchain.mjs"),
+    "--home", HOME,
+    "--llvm-dir", destination,
+    "--node-dir", dirname(process.execPath),
+  ], { cwd: PROJECT });
+  const toolchain = await loadWindowsToolchain(HOME);
+  if (!toolchain) die("llvm-mingw adapter did not publish windows-toolchain.json");
+  return toolchain;
+}
+
 async function verifyNode() {
   const major = Number(process.versions.node.split(".")[0]);
   if (major < MIN_NODE_MAJOR) die(`Node ${MIN_NODE_MAJOR}+ is required; this process is ${process.version}`);
@@ -727,6 +787,11 @@ async function main() {
       say(`Binaryen ${BINARYEN_VERSION}: ${BINARYEN_BASE}/${binaryenFile} (.sha256)`);
       say(`  expected SHA-256: ${binaryenSha256}`);
     }
+    if (process.platform === "win32") {
+      const llvm = LLVM_MINGW_ARTIFACTS[normalizedWindowsArch(process.arch)];
+      say(`llvm-mingw ${LLVM_MINGW_VERSION}: ${LLVM_MINGW_BASE}/${llvm.file}`);
+      say(`  expected SHA-256: ${llvm.sha256}`);
+    }
     say(`install root: ${HOME}`);
     say("Minecraft 26.2 inputs: official Mojang CDN download into ~/.mcweb/minecraft when --build/--verify is selected.");
     say(`Local fallback: ${officialLauncherGuide()}`);
@@ -742,16 +807,25 @@ async function main() {
   let binaryenBin = binaryen?.bin ?? null;
   if (binaryen) say(`using ${binaryen.version}`);
   else binaryenBin = await installBinaryen(host);
+  const windowsToolchain = await installWindowsToolchain();
   await writeEnvironment(home, binaryenBin);
-  const env = {
+  const pathEntries = [
+    ...(process.platform === "win32" ? [join(home, "bin")] : []),
+    ...(binaryenBin ? [binaryenBin] : []),
+    process.env.PATH || "",
+  ].filter(Boolean);
+  const baseEnv = {
     ...process.env,
     GRAALVM_HOME: home,
     JAVA_HOME: home,
-    ...(binaryenBin ? { MCWEB_BINARYEN_HOME: binaryenBin, PATH: `${binaryenBin}${process.platform === "win32" ? ";" : ":"}${process.env.PATH || ""}` } : {}),
+    PATH: pathEntries.join(process.platform === "win32" ? ";" : ":"),
+    ...(binaryenBin ? { MCWEB_BINARYEN_HOME: binaryenBin } : {}),
   };
+  const { env, graalExtraArgs } = applyWindowsToolchain(baseEnv, windowsToolchain);
 
   say(`toolchain ready: GRAALVM_HOME=${home}`);
   if (binaryenBin) say(`toolchain ready: MCWEB_BINARYEN_HOME=${binaryenBin}`);
+  if (windowsToolchain) say(`toolchain ready: llvm-mingw ${windowsToolchain.compiler}`);
   const mcDir = flag("mc-dir");
   const cacheDir = resolve((flag("cache-dir", join(HOME, "minecraft")) || "").replace(/^~/, homedir()));
   const downloadOnly = has("download-only");
@@ -762,6 +836,7 @@ async function main() {
   else buildArgs.push("--local-only");
   if (has("no-audio")) buildArgs.push("--no-audio");
   if (has("offline")) buildArgs.push("--offline");
+  if (graalExtraArgs) buildArgs.push("--graal-extra-args", graalExtraArgs);
   say(useDownload
     ? `validating Mojang CDN 26.2 inputs in ${cacheDir}`
     : "validating local 26.2 inputs");

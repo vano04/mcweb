@@ -10,10 +10,9 @@ import net.minecraft.world.level.Level;
  *
  * <p>The original class assumes that the listener callbacks arrive on one
  * thread. That assumption is not true while the browser server, worldgen,
- * and client-side loading work share the WasmLM heap: the fields making up a
- * weighted update can otherwise be observed or overwritten halfway through a
- * callback. Keep the hot read lock-free, but make each lifecycle callback an
- * atomic update.</p>
+ * and client-side loading work can interleave callbacks: the fields making up a
+ * weighted update must not be observed halfway through a callback. Keep the hot
+ * read lock-free, but make each lifecycle callback an atomic update.</p>
  */
 public class LevelLoadProgressTracker implements LevelLoadListener {
     private static final int PREPARE_SERVER_WEIGHT = 10;

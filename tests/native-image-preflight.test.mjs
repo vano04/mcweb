@@ -19,10 +19,11 @@ test("Windows loader failure is classified separately from a Java OOM", () => {
     code: WINDOWS_STATUS_DLL_NOT_FOUND,
   });
   assert.match(message, /STATUS_DLL_NOT_FOUND/);
-  assert.match(message, /MSVC 14\.x/);
   assert.match(message, /MSVC\/UCRT runtime/);
-  assert.match(message, /Windows 11 SDK/);
-  assert.match(message, /dumpbin\.exe \/DEPENDENTS/);
+  assert.match(message, /official current x64 Visual C\+\+ Redistributable/);
+  assert.match(message, /llvm-mingw replaces the compiler and SDK/);
+  assert.match(message, /install\.ps1 --build/);
+  assert.match(message, /where\.exe vcruntime140\.dll/);
   assert.doesNotMatch(message, /OutOfMemoryError/);
 });
 

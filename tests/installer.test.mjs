@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import test from "node:test";
 import { download, platformConfigFor, sidecarChecksum, toolUrl } from "../tools/mcweb-install.mjs";
 import { EXPECTED_BUILD_GRADLE_SHA256, inspectBuildGradle } from "../tools/source-integrity.mjs";
+import { applyWindowsToolchain, loadWindowsToolchain } from "../tools/windows-toolchain.mjs";
 
 const execFileAsync = promisify(execFile);
 const ROOT = new URL("..", import.meta.url).pathname;
@@ -20,6 +21,7 @@ const GRAAL_ARM64_FILE = "graalvm-jdk-25i2-25.0.4_linux-aarch64_bin.tar.gz";
 const GRAAL_AMD64_FILE = "graalvm-jdk-25i2-25.0.4_linux-x64_bin.tar.gz";
 const BINARYEN_ARCHIVE_URL = "https://github.com/WebAssembly/binaryen/releases/download/version_131/binaryen-version_131-arm64-macos.tar.gz";
 const BINARYEN_SIDECAR_URL = `${BINARYEN_ARCHIVE_URL}.sha256`;
+const LLVM_MINGW_ARCHIVE_URL = "https://github.com/mstorsjo/llvm-mingw/releases/download/20260616/llvm-mingw-20260616-ucrt-x86_64.zip";
 
 async function tempDir(t) {
   const directory = await mkdtemp(join(tmpdir(), "mcweb-installer-test-"));
@@ -88,9 +90,53 @@ test("installer pins official archives and verifies vendor checksums", async () 
   assert.match(source, /0bc65f9c36ae77bd83aad46a2b4de4b0ec97da1b4ac83fedb59e19f868873dee/);
   assert.match(source, /2b41fffc94c4c7795bce0fdde8847ab1c894903cb20779aedb6ca8628aa9983a/);
   assert.match(source, /d209fadd8a894bdaf3bd3612a23c32a0af184d2f4a979b8c789e6e4f6a4de883/);
+  assert.match(source, /LLVM_MINGW_VERSION = "20260616"/);
+  assert.match(source, /b9b68a4d276e16fa25802aaba458e4638f64b3884c290aaccdc2d87083b6ca35/);
+  assert.match(source, /312593669435bd0bfc1a43ac3fba23c8b27e0610bade88b2738e5a01702a99ba/);
   assert.match(source, /checksumUrl/);
   assert.match(source, /SHA-256/);
   assert.doesNotMatch(source, /minecraft\.wasm\.click|tcp\.wasm\.click|cloudflare/i);
+});
+
+test("Windows builds recover the verified llvm-mingw adapter environment", async (t) => {
+  const home = await tempDir(t);
+  const paths = {
+    llvmDir: join(home, "llvm-mingw"),
+    compiler: join(home, "llvm-mingw", "bin", "x86_64-w64-mingw32-clang.exe"),
+    msvcRoot: join(home, "ossvc"),
+    programFilesX86: join(home, "oss-program-files-x86"),
+    cl: join(home, "ossvc", "VC", "Tools", "MSVC", "14.44.35207", "bin", "Hostx64", "x64", "cl.exe"),
+    vswhere: join(home, "oss-program-files-x86", "Microsoft Visual Studio", "Installer", "vswhere.exe"),
+  };
+  await writeFile(join(home, "windows-toolchain.json"), JSON.stringify({
+    version: 1,
+    kind: "llvm-mingw-msvc-shim",
+    ...paths,
+    graalExtraArgs: "-H:-CheckToolchain",
+  }));
+  const toolchain = await loadWindowsToolchain(home, { requireFiles: false });
+  const applied = applyWindowsToolchain({ PATH: "original" }, toolchain);
+  assert.equal(applied.env["ProgramFiles(x86)"], paths.programFilesX86);
+  assert.equal(applied.env.MCWEB_MSVC_ROOT, paths.msvcRoot);
+  assert.equal(applied.env.MCWEB_CC, undefined,
+    "MCWEB_CC must be introduced by vcvarsall so GraalVM forwards it to cl.exe");
+  assert.equal(applied.graalExtraArgs, "-H:-CheckToolchain");
+
+  const [installer, build, oss, sea, clShim, pointstoPatch] = await Promise.all([
+    readFile(join(ROOT, "tools/mcweb-install.mjs"), "utf8"),
+    readFile(join(ROOT, "tools/build.mjs"), "utf8"),
+    readFile(join(ROOT, "tools/oss-toolchain.mjs"), "utf8"),
+    readFile(join(ROOT, "tools/build-sea-exe.mjs"), "utf8"),
+    readFile(join(ROOT, "tools/msvc-cl-shim.js"), "utf8"),
+    readFile(join(ROOT, "tools/windows-pointsto-patch/PointstoPatcher.java"), "utf8"),
+  ]);
+  assert.match(installer, /installWindowsToolchain/);
+  assert.match(build, /loadWindowsToolchain/);
+  assert.match(oss, /x86_64-w64-mingw32-clang\.exe/);
+  assert.match(sea, /postject@1\.0\.0-alpha\.6/);
+  assert.match(clShim, /MSVC-compatible shim Version 19\.44\.35228 for x64/);
+  assert.match(pointstoPatch, /com\/oracle\/graal\/pointsto\/results\/TypeFlowSimplifier/);
+  assert.match(pointstoPatch, /expected exactly 1 @Delete guarantee/);
 });
 
 test("README states the public GraalVM baseline and unsupported hosts", async () => {
@@ -160,25 +206,21 @@ test("source integrity rejects binary and truncated build.gradle payloads before
   assert.match(truncated.reason, /unexpected|truncated|digest/i);
 });
 
-test("portable Node is propagated to every Gradle Node Exec on Windows", async () => {
+test("the canonical Gradle build has only the narrow Windows Node builder lane", async () => {
   const [build, gradle] = await Promise.all([
     readFile(`${ROOT}/tools/build.mjs`, "utf8"),
     readFile(`${ROOT}/build.gradle`, "utf8"),
   ]);
-  // Simulate the Windows ARM bootstrap's absolute portable executable. The
-  // build helper must pass process.execPath; Gradle must select that path before
-  // falling back to a normal system `node` lookup.
+  // The removed WasmLM builder patch must stay gone. Windows alone invokes one
+  // Node helper to patch the exact Graal points-to guarantee reproduced there.
   const portableWindowsNode = String.raw`C:\Users\vano\.mcweb\node\node.exe`;
   assert.match(portableWindowsNode, /\\node\.exe$/);
-  assert.match(build, /MCWEB_NODE:\s*process\.execPath/);
-  assert.match(gradle, /environmentVariable\("MCWEB_NODE"\)/);
-  assert.match(gradle, /gradleProperty\("mcwebNode"\)/);
-  assert.match(gradle, /\.orElse\("node"\)/);
-  assert.match(gradle, /def nodeCommand\s*=\s*\{/);
-  assert.match(gradle, /new File\(configured\)\.isAbsolute\(\)/);
-  assert.match(gradle, /Configured MC-Web Node executable was not found or is not executable/);
-  assert.match(gradle, /commandLine\(\s*nodeCommand\(\)/);
-  assert.doesNotMatch(gradle, /commandLine\(\s*"node"/);
+  assert.doesNotMatch(build, /MCWEB_NODE/);
+  assert.match(build, /dirname\(process\.execPath\)/);
+  assert.doesNotMatch(gradle, /MCWEB_NODE|mcwebNode|nodeCommand/);
+  assert.doesNotMatch(gradle, /tasks\.register\("webImagePatch"/);
+  assert.match(gradle, /tasks\.register\("windowsPointstoPatch"/);
+  assert.match(gradle, /org\.graalvm\.nativeimage\.pointsto/);
 });
 
 test("root entrypoints route through one standard build-and-run flow", async () => {
@@ -473,12 +515,15 @@ test("CDN cache lock recovers only a stale lock owned by a dead process", async 
 test("developer-tool URLs are exact HTTPS vendor paths and reject unsafe variants", () => {
   assert.equal(toolUrl(NODE_ARCHIVE_URL, "node"), NODE_ARCHIVE_URL);
   assert.equal(toolUrl(GRAAL_ARCHIVE_URL, "graal"), GRAAL_ARCHIVE_URL);
+  assert.equal(toolUrl(LLVM_MINGW_ARCHIVE_URL, "llvm-mingw"), LLVM_MINGW_ARCHIVE_URL);
   assert.throws(() => toolUrl(GRAAL_ARCHIVE_URL.replace("25i2/archive", "25i1/archive"), "graal"), /pinned vendor path/);
   assert.throws(() => toolUrl(NODE_ARCHIVE_URL.replace("https://", "http://"), "node"), /HTTPS/);
   assert.throws(() => toolUrl(NODE_ARCHIVE_URL.replace("nodejs.org/", "nodejs.org:8443/"), "node"), /HTTPS/);
   assert.throws(() => toolUrl(NODE_ARCHIVE_URL.replace("https://", "https://user:pass@"), "node"), /userinfo/);
   assert.throws(() => toolUrl(`${NODE_ARCHIVE_URL}#fragment`, "node"), /userinfo\/fragment/);
   assert.throws(() => toolUrl("https://nodejs.org/dist/v24.19.0/other.tar.gz", "node"), /pinned vendor path/);
+  assert.throws(() => toolUrl(LLVM_MINGW_ARCHIVE_URL.replace("20260616", "latest"), "llvm-mingw"), /pinned vendor path/);
+  assert.throws(() => toolUrl(LLVM_MINGW_ARCHIVE_URL.replace("mstorsjo", "someone-else"), "llvm-mingw"), /pinned vendor path/);
 });
 
 test("Oracle Graal regional redirects are exact object paths for the selected archive", () => {

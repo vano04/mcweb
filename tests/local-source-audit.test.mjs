@@ -123,17 +123,23 @@ test("the public launcher exposes only the canonical WasmGC runtime lane", async
   for (const path of [
     "tools/wasm-share-memory.mjs",
     "tools/stage-wasmlm-browser.mjs",
+    "tools/webimage-patch",
+    "src/webimage-patch",
     "src/graal/java/dev/mcweb/graal/WasmLMBootstrapProbeMain.java",
     "src/graal/java/dev/mcweb/graal/WasmLMUtilProbeMain.java",
     "src/graal/java/dev/mcweb/graal/ThreadConformanceMain.java",
     "src/graal/java/dev/mcweb/graal/WorkerPoolProbeMain.java",
   ]) assert.equal(await exists(join(ROOT, path)), false, `${path} must not be shipped`);
-  assert.doesNotMatch(host, /mcweb_server_image|mcweb_threads|mcWebWasmLMThreads|WASMLM_(?:INLINE|THREADED)/);
+  assert.doesNotMatch(host, /mcweb_server_image|mcweb_threads|mcWebWasmLMThreads/);
   assert.match(host, /const serverImage = "minecraft-client"/);
-  assert.match(host, /mcWebRuntimeMode = "WASMGC_COOPERATIVE"/);
-  assert.doesNotMatch(gradle, /wasmLMThreadArtifacts|stage-wasmlm-browser|wasm-share-memory/);
-  // Keep the builder patch source: Windows invokes webImagePatch even for the
-  // standard WASMGC image to apply its points-to compatibility fix.
-  assert.match(gradle, /src\/webimage-patch\/java/);
+  assert.doesNotMatch(host, /mcWebRuntimeMode|mcWebThreadRuntime|rpCommandStreamRaw|writeTextureRaw/);
+  assert.doesNotMatch(gradle, /graalBackend|wasmLMThreadArtifacts|stage-wasmlm-browser|wasm-share-memory/);
+  assert.doesNotMatch(gradle, /webImagePatch|webimage-patch|MCWEB_PATCH_CLASS_INIT/);
+  assert.match(gradle, /windowsPointstoPatch/);
+  assert.match(gradle, /org\.graalvm\.nativeimage\.pointsto/);
+  assert.match(gradle, /--features=dev\.mcweb\.feature\.BrowserParkerFeature/);
   assert.match(toolsReadme, /canonical `minecraft-client`\s+WasmGC pair/);
+  const paths = await filesUnder(join(ROOT, "src"));
+  const source = (await Promise.all(paths.map(async (path) => readFile(path, "utf8")))).join("\n");
+  assert.doesNotMatch(source, /WasmLM|WASMLM|wasmlm|mcWebRuntimeMode|mcWebThreadRuntime/);
 });

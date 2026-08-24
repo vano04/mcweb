@@ -135,7 +135,7 @@ public final class BrowserIntegratedServerCompat {
      * Primary-side pool draining is only safe once world loading owns the wait.
      * The client also uses {@code managedBlock} while opening the Create World
      * screen; stealing registry-load tasks there makes the primary execute the
-     * same reload graph concurrently with the agents.
+     * same reload graph concurrently with the browser thread.
      */
     private static long terrainWarmupUntilNanos;
     private static String serverPhase = "idle";
@@ -258,7 +258,7 @@ public final class BrowserIntegratedServerCompat {
 
     /**
      * Entry marker for the real vanilla Server phases. This is called from the
-     * transformed MinecraftServer methods, including the WasmLM Server thread.
+     * transformed MinecraftServer methods.
      */
     public static void reportServerPhase(MinecraftServer current, String phase) {
         server = current instanceof IntegratedServer integrated ? integrated : server;
@@ -267,7 +267,7 @@ public final class BrowserIntegratedServerCompat {
                 + " thread=" + Thread.currentThread().getName()
                 + " id=" + Thread.currentThread().getId()
                 + " sameThread=" + current.isSameThread()
-                + " mode=" + McWebRuntimeMode.name());
+                + " backend=wasmgc");
     }
 
     /** Static setInitialSpawn has no server receiver; retain its owning thread marker. */
@@ -276,7 +276,7 @@ public final class BrowserIntegratedServerCompat {
         BrowserGpu.reportProgress("server:" + phase
                 + " thread=" + Thread.currentThread().getName()
                 + " id=" + Thread.currentThread().getId()
-                + " mode=" + McWebRuntimeMode.name());
+                + " backend=wasmgc");
     }
 
     /**
@@ -384,9 +384,8 @@ public final class BrowserIntegratedServerCompat {
                 + " current=" + current.getName() + '/' + current.getId()
                 + " owner=" + owner.getName() + '/' + owner.getId()
                 + " serverSame=" + (server != null && server.isSameThread())
-                + " runtimeServer=" + McWebRuntimeMode.server();
+                + " runtimeServer=" + "COOPERATIVE";
         BrowserGpu.reportProgress(marker);
-        BrowserGpu.reportDiag(marker + " pool=" + AgentExecutorService.stats());
     }
 
     /**
@@ -405,9 +404,6 @@ public final class BrowserIntegratedServerCompat {
         // It is the first Server-owned observation after worldgen work is queued,
         // so it can lease the bounded spare without putting a hot compensation
         // check into every client registry managedBlock iteration.
-        if (McWebRuntimeMode.isThreaded()) {
-            AgentExecutorService.serverBlockingWait();
-        }
         long observation = chunkFutureObservations.incrementAndGet();
         if (observation > 8L && (observation & 0xFFFFL) != 0L) {
             return;
@@ -444,7 +440,6 @@ public final class BrowserIntegratedServerCompat {
                 + Thread.currentThread().getId()
                 + " serverSame=" + (server != null && server.isSameThread());
         BrowserGpu.reportProgress(marker);
-        BrowserGpu.reportDiag(marker + " pool=" + AgentExecutorService.stats());
     }
 
     private static void reportChunkFutureCompletion(
@@ -464,13 +459,6 @@ public final class BrowserIntegratedServerCompat {
                     + (failure == null
                             ? ""
                             : " failure=" + BrowserMinecraftMain.describeFailure(failure)));
-            BrowserGpu.reportDiag("chunk:future-complete n=" + observation
-                    + " pos=" + x + ',' + z
-                    + " status=" + status
-                    + " success=" + (failure == null)
-                    + " thread=" + Thread.currentThread().getName() + '/'
-                    + Thread.currentThread().getId()
-                    + " pool=" + AgentExecutorService.queueState());
         } catch (Throwable ignored) {
             // Future diagnostics must never replace the result Minecraft is awaiting.
         }
@@ -478,12 +466,6 @@ public final class BrowserIntegratedServerCompat {
 
     /** Whether a primary-thread wait is part of integrated-server world loading. */
     public static void pump() {
-        // WasmLM runs Mojang's original runServer() on the dedicated Server thread.
-        // The browser frame thread may continue rendering, but it must not tick the
-        // server, drain its executor, or poll ServerChunkCache from here.
-        if (!McWebRuntimeMode.isCooperativeServer()) {
-            return;
-        }
         IntegratedServer current = server;
         if (current == null) {
             return;
@@ -501,18 +483,11 @@ public final class BrowserIntegratedServerCompat {
                  * first; this one could not, because it is inside one Wasm call that has
                  * to carry its own budget in.
                  *
-                 * The WasmGC lane survives without it only by accident: its background
-                 * executor is inline, so chunk work completes on the caller and progress
-                 * does not depend on the drain. With real agents the continuations land
-                 * on the server's own queue, `runAllTasks` returns in microseconds
-                 * against an expired deadline, and `prepareLevels` spins forever.
-                 * Measured: the beacon ring ends at `levelload:start PREPARE_GLOBAL_SPAWN`
-                 * / `levelload:focus [0, 0]` with the pool idle (`queued=0 busy=0/3`),
-                 * and `integrated-server:initialized` never arrives.
+                 * The inline executor completes work on the caller, so this deadline
+                 * keeps the cooperative drain bounded while allowing init to advance.
                  */
                 grantTaskDeadline(current, System.nanoTime() + INIT_TASK_BUDGET_NANOS);
-                BrowserGpu.reportProgress("integrated-server:init-begin threaded="
-                        + McWebRuntimeMode.name());
+                BrowserGpu.reportProgress("integrated-server:init-begin backend=wasmgc");
                 boolean started = current.initServer();
                 if (!started) {
                     throw new IllegalStateException("Integrated server initialization returned false");
@@ -700,13 +675,6 @@ public final class BrowserIntegratedServerCompat {
         if (!(current instanceof IntegratedServer integrated)) {
             return;
         }
-        if (McWebRuntimeMode.server() == McWebRuntimeMode.Server.THREADED) {
-            // WasmLM has a real server Thread. Preserve Mojang's deadline and
-            // managed-block behavior there; only the WasmGC lane needs the
-            // bounded cooperative replacement below.
-            integrated.mcwebWaitUntilNextTickVanilla();
-            return;
-        }
         // Grant a fresh deadline so haveTime() holds and the chunk source is polled.
         grantTaskDeadline(integrated, System.nanoTime() + WAIT_TICK_BUDGET_NANOS);
         net.minecraft.server.level.ServerChunkCache chunkSource =
@@ -715,12 +683,8 @@ public final class BrowserIntegratedServerCompat {
          * Drive the chunk pipeline directly, bounded — and ONLY the chunk source.
          *
          * Two failure modes this avoids:
-         *  - Mojang's runAllTasks() loops while the server's pollTask() returns true,
-         *    but pollTaskInternal only polls the chunk source when the server's own
-         *    main task queue is empty. The agent pool keeps refilling that queue, so
-         *    an unbounded runAllTasks() livelocks on main-queue tasks and never
-         *    advances generation (measured: no server:wait-tick marker, frozen at
-         *    levelload:focus).
+         *  - Mojang's runAllTasks() can spend the whole slice on main-queue tasks
+         *    instead of advancing the chunk source.
          *  - Draining the server's main queue here runs arbitrary server tasks, and
          *    some of them block: a CompletableFuture.join() spins on the no-op
          *    LockSupport.park outside any managedBlock, so nothing can report or
@@ -740,24 +704,9 @@ public final class BrowserIntegratedServerCompat {
                 grantTaskDeadline(integrated, System.nanoTime() + WAIT_TICK_BUDGET_NANOS);
             }
         }
-        if ((waitUntilNextTicks++ & 0xF) == 0) {
-            BrowserGpu.reportDiag("server:wait-tick n=" + waitUntilNextTicks
-                    + " pending=" + chunkSource.getPendingTasksCount()
-                    + " " + AgentExecutorService.queueState());
-        }
-        // The chunk pipeline's continuations run on the agent pool; if every worker is
-        // blocked on another task, draining here is what keeps prepareLevels advancing.
-        // Budget is large: the reload barrier parks workers on SimpleReloadInstance
-        // lambdas that wait on generation futures deep in the queue, and a small budget
-        // never reaches them. Also trigger pool growth: growIfStalled is driven from the
-        // frame pump, which does not run during initServer, so the pool cannot rescue
-        // itself without this nudge.
-        AgentExecutorService.maintain();
-        AgentExecutorService.drainInlineWhileWaiting(512);
+        BrowserExecutorService.drainInlineWhileWaiting(512);
     }
 
-    /** Iterations of the patched {@code waitUntilNextTick}; reported into the beacon. */
-    private static int waitUntilNextTicks;
     /** Tasks polled per bounded {@code waitUntilNextTick} drain (see above). */
     private static final int MAX_WAIT_TICK_POLLS = 512;
 
@@ -970,72 +919,6 @@ public final class BrowserIntegratedServerCompat {
      * actually has, which is what selects the frame task budget.</p>
      */
     /**
-     * Threaded lane: reconcile chunk sends from Mojang's own {@code Server thread}.
-     *
-     * <p>{@link #pump} — and with it {@link #reconcileChunkSends} — returns immediately
-     * unless the server is cooperative, so on the threaded lane the reconciliation
-     * simply never ran. Measured consequence: two four-agent runs both entered a world
-     * and then held at <em>exactly</em> 25 client chunks of 329, which is Mojang's
-     * initial 5x5 login batch and nothing afterwards. An exact repeat of 25 is a stall
-     * in the send path, not slow generation — worldgen throughput would creep past it.
-     *
-     * <p>This is called from the tail of the transformed {@code IntegratedServer
-     * .tickServer}, so it runs on the thread that owns {@code ServerChunkCache},
-     * {@code ChunkMap} and {@code PlayerChunkSender}. Everything it touches is
-     * server-owned; nothing here reads client state, which the cooperative path could
-     * do safely only because it *was* the client thread.
-     */
-    public static void afterThreadedServerTick(IntegratedServer current) {
-        if (current == null || !McWebRuntimeMode.isThreaded()) {
-            return;
-        }
-        // Do NOT gate on `reconcileChunks`. It is only assigned in register(), and
-        // register() never runs on the threaded lane — `integrated-server:registered`
-        // is absent from a full threaded stage list, while `integrated-server:
-        // thread-start` is present. The first version of this hook gated on it and so
-        // returned on every tick without ever reconciling anything.
-        if (threadedReconcileState == 0) {
-            threadedReconcileState = chunkReconciliationDisabled() ? 1 : 2;
-            BrowserGpu.reportProgress("chunk-reconcile:threaded-init enabled="
-                    + (threadedReconcileState == 2));
-        }
-        if (threadedReconcileState != 2) {
-            return;
-        }
-        // The threaded lane also never ran register(), so the server reference the
-        // rest of this class keys off is unset; publish it from the owning thread.
-        server = current;
-        try {
-            // Players are the real precondition: the reconciler seeds its per-player
-            // known-set from the login batch and does nothing without one. This
-            // deliberately replaces the cooperative path's LevelLoadingScreen check,
-            // which would read client state from the Server thread.
-            if (current.getPlayerList() == null || current.getPlayerList().getPlayers().isEmpty()) {
-                return;
-            }
-            reconcileChunkSends(current);
-            if (++threadedReconcileTicks % 100 == 0) {
-                BrowserGpu.reportProgress("chunk-reconcile:threaded"
-                        + " tracked=" + viewTracked
-                        + " delivered=" + viewDelivered
-                        + " admitted=" + admittedChunks
-                        + " ticks=" + threadedReconcileTicks);
-            }
-        } catch (Throwable failure) {
-            // A reconciliation fault must never take down Mojang's server tick.
-            if (threadedReconcileFailures++ < 3) {
-                BrowserGpu.reportProgress("chunk-reconcile:threaded-failed "
-                        + failure.getClass().getName() + ":" + failure.getMessage());
-            }
-        }
-    }
-
-    private static int threadedReconcileTicks;
-    private static int threadedReconcileFailures;
-    /** 0 = undecided, 1 = disabled by query flag, 2 = armed. */
-    private static int threadedReconcileState;
-
-    /**
      * Destination level for the integrated player, with Overworld as the
      * pre-login fallback. The private integrated server normally has one local
      * player; Minecraft's task drain still iterates every level itself.
@@ -1173,8 +1056,7 @@ public final class BrowserIntegratedServerCompat {
         }
         queuedChunks.keySet().removeIf(uuid -> !activePlayers.contains(uuid));
         queuedChunkDimensions.keySet().removeIf(uuid -> !activePlayers.contains(uuid));
-        if (viewWasIncomplete && !viewIncomplete && !viewCompletionDebtReset
-                && !McWebRuntimeMode.isThreaded()) {
+        if (viewWasIncomplete && !viewIncomplete && !viewCompletionDebtReset) {
             /*
              * Terrain generation in a newly entered dimension can leave the absolute tick schedule
              * several seconds behind even though each individual overrun stays
@@ -1846,37 +1728,20 @@ public final class BrowserIntegratedServerCompat {
      * server.</p>
      */
     public static boolean pumpAndIsReady(MinecraftServer expected) {
-        if (McWebRuntimeMode.isThreaded()) {
-            AgentExecutorService.servicePrimaryCollectionRequest("world-ready-wait");
-            // This is the client-side observation point during vanilla doWorldLoad.
-            // The real Server thread owns initServer/runServer and will set isReady;
-            // no frame-thread pump or executor stealing is permitted in this path.
-            if (expected != null && !expected.isReady()
-                    && (readyWaitPumps++ & 0x3F) == 0) {
-                BrowserGpu.reportProgress("world-load:ready-wait threaded n="
-                        + readyWaitPumps + " " + AgentExecutorService.queueState());
-            }
-            return expected != null && expected.isReady();
-        }
         if (server == expected && !expected.isReady()) {
             /*
-             * This wait is inside one Wasm call, so the frame pump is not running and
-             * neither is anything it drives - including the agent pool's stall rescue.
-             * If every pool worker is parked inside a task that waits on another task,
-             * nothing outside this loop can break it, so the loop does it itself.
-             * See AgentExecutorService.drainInlineIfStarved.
+             * This wait is inside one Wasm call, so the frame pump is not running.
+             * Drain the inline executor here so world creation can make progress
+             * before control returns to the browser.
              */
-            AgentExecutorService.maintain();
-            AgentExecutorService.drainInlineWhileWaiting(256);
+            BrowserExecutorService.maintain();
+            BrowserExecutorService.drainInlineWhileWaiting(256);
             /*
-             * The beacon is the only view of this loop when the browser thread stops
-             * returning, so make it say whether the loop is running at all and what the
-             * pool looks like. Without this, "wedged inside pumpAndIsReady" and "wedged
-             * somewhere inside pump()" produce the identical silence.
+             * Keep a bounded progress marker while this synchronous wait is active.
              */
             if ((readyWaitPumps++ & 0x3F) == 0) {
                 BrowserGpu.reportProgress("world-load:ready-wait n=" + readyWaitPumps
-                        + " " + AgentExecutorService.queueState());
+                        + " " + BrowserExecutorService.queueState());
             }
             pump();
         }
@@ -1884,10 +1749,9 @@ public final class BrowserIntegratedServerCompat {
         return expected.isReady();
     }
 
-    /** Emits one marker for both a real WasmLM server thread and the cooperative path. */
+    /** Emits one marker when the integrated server becomes ready. */
     private static void reportReadyIfNeeded(MinecraftServer expected) {
-        if (McWebRuntimeMode.isCooperativeServer()
-                && expected != null && expected.isReady() && readyReportedServer != expected) {
+        if (expected != null && expected.isReady() && readyReportedServer != expected) {
             readyReportedServer = expected;
             BrowserGpu.reportProgress("integrated-server:ready");
         }
@@ -1901,12 +1765,12 @@ public final class BrowserIntegratedServerCompat {
      *
      * <p>The world-load wedge: spawn finding calls {@code getChunk}, which blocks
      * in {@code managedBlock} until the chunk future completes. The generation
-     * work runs on the agent pool; its completion callback lands in the
+     * work completes cooperatively; its completion callback lands in the
      * {@code MainThreadExecutor}'s queue. {@code managedBlock}'s own
      * {@code pollTask()} processes that queue — but only while the loop runs.
      * Once the primary falls through to {@code CompletableFuture.join()}, the
      * join-spin calls {@code park()} → {@code parkDrain()}, which drains the
-     * agent pool (empty) but never touches the {@code MainThreadExecutor}'s
+     * idle executor but never touches the {@code MainThreadExecutor}'s
      * queue. The callback sits there forever.
      *
      * <p>Polling the chunk source from here processes the callback, completing
@@ -1937,7 +1801,7 @@ public final class BrowserIntegratedServerCompat {
                 BrowserGpu.reportProgress("park-chunk-poll #" + parkChunkPolls
                         + " polled=" + polled
                         + " pending=" + chunkSource.getPendingTasksCount()
-                        + " " + AgentExecutorService.queueState());
+                        + " " + BrowserExecutorService.queueState());
             }
         } catch (Throwable ignored) {
             // A park drain must never break the wait it is servicing.

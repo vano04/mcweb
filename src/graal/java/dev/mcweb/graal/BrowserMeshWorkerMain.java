@@ -62,7 +62,6 @@ public final class BrowserMeshWorkerMain {
             Bootstrap.validate();
             net.minecraft.world.level.chunk.storage.RegionFileVersion.configure("lz4");
             RenderSystem.initRenderThread();
-            AgentExecutorService.primeWorldgenTrace();
 
             // Match the proven client launcher's class/resource preflight. In
             // particular, initializing Minecraft and DataFixers before the

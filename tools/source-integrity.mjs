@@ -5,7 +5,7 @@ import { join } from "node:path";
 // build.gradle is part of the executable source distribution. Keep its digest
 // pinned so a truncated or binary GitHub upload fails before Gradle parses it.
 // CRLF checkouts are normalized to LF before hashing for Windows Git clients.
-export const EXPECTED_BUILD_GRADLE_SHA256 = "9f0d5304f1e71210d4587dc255c3c1087f3a6b1c8ff4818d8e85f8bee4f3fe50";
+export const EXPECTED_BUILD_GRADLE_SHA256 = "a585114d6a57b0fafa7439ce2f7a536b6191784a7149118114fe8a4ac0220978";
 
 const SOURCE_URL = "https://github.com/vano04/mcweb";
 

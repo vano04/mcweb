@@ -45,11 +45,6 @@ import org.graalvm.webimage.api.JS;
  * held meshing to ~11 sections/s and left hoplite.gg's 265 chunks, all of
  * which had arrived within 8 s, still being drawn 24 s after world entry.
  *
- * <p>The threaded WasmLM lane keeps its real
- * agent pool: its uploads are linear-memory views ({@code writeBufferRaw}) with
- * no per-byte string cost, and its walk signature is GC pauses, not upload
- * bursts.
- *
  * <p>{@code ?mcweb_mesh_pace=N} overrides the per-frame task budget
  * ({@code 0} = drain everything, reproducing the pre-pacing behavior for
  * A/B runs).
@@ -82,15 +77,9 @@ public final class BrowserMeshPaceExecutor extends AbstractExecutorService {
     }
 
     /**
-     * The dispatcher's executor. Only the cooperative WasmGC lane gets the
-     * paced queue; every other lane keeps whatever background executor the
-     * port already provides (real agents on threaded WasmLM, inline
-     * elsewhere — both have cheap uploads or no walk-stutter signature).
+     * The dispatcher's executor for the cooperative WasmGC image.
      */
     public static TracingExecutor tracing() {
-        if (McWebRuntimeMode.runtime() != McWebRuntimeMode.Runtime.WASMGC_COOPERATIVE) {
-            return BrowserAsyncCompat.backgroundTracingExecutor();
-        }
         return TRACING;
     }
 
@@ -99,12 +88,9 @@ public final class BrowserMeshPaceExecutor extends AbstractExecutorService {
      * {@link BrowserFramePump}, after {@code runTick}: the meshes completed
      * here stage their uploads for the next frame's
      * {@code uploadTerrainBuffersToGpu}, so a burst spreads across frames
-     * instead of landing inside one. No-op off the cooperative lane.
+     * instead of landing inside one.
      */
     public static void drainFromFrame(long frameStartedNanos) {
-        if (McWebRuntimeMode.runtime() != McWebRuntimeMode.Runtime.WASMGC_COOPERATIVE) {
-            return;
-        }
         INSTANCE.drain(frameStartedNanos);
     }
 
