@@ -160,17 +160,17 @@ test("README states the public GraalVM baseline and unsupported hosts", async ()
   assert.doesNotMatch(readme, /Invoke-WebRequest/);
   assert.match(readme, /ExecutionPolicy Bypass/);
   assert.match(readme, /GraalVM Web Image 25\.1 or newer/);
-  assert.match(readme, /25\.2\.4 \(25i2/);
-  assert.match(readme, /receive-only/);
-  assert.match(readme, /supported through Windows x64 emulation/);
+  assert.match(readme, /Oracle GraalVM `25\.2\.4`, release `25i2`/);
+  assert.match(readme, /receive-only/i);
+  assert.match(readme, /supported through Windows x64 emulation/i);
   assert.match(readme, /10 GB of RAM/);
-  assert.match(readme, /d209fadd8a894bdaf3bd3612a23c32a0af184d2f4a979b8c789e6e4f6a4de883/);
 });
 
 test("README separates CDN download mode from the optional local launcher mode", async () => {
   const readme = await readFile(`${ROOT}/README.md`, "utf8");
-  assert.match(readme, /`--download`[\s\S]{0,180}cannot be combined with `--mc-dir`/);
-  assert.match(readme, /When no `--mc-dir` or\s+`--local-only` is supplied, CDN download is the default/);
+  assert.match(readme, /`--download` and `--download-only` use the CDN cache/);
+  assert.match(readme, /They cannot be combined\s+with `--mc-dir`/);
+  assert.match(readme, /When no `--mc-dir` or\s+`--local-only` is supplied, CDN download\s+is the default/);
 });
 
 test("build preflight requires public Web Image but labels the old toolchain legacy", async () => {

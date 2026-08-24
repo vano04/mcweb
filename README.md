@@ -1,13 +1,47 @@
-# How to run
+# How to run MC-Web locally
 
-Start with an inspectable copy of this repository. Choose one:
+MC-Web builds Minecraft 26.2 as a browser WebAssembly image. The build uses
+your licensed Minecraft files and keeps them on your computer. This repository
+contains the browser platform code, not Minecraft code or assets.
 
-- Clone it with `git clone https://github.com/vano04/mcweb.git`, then enter the
-  new `mcweb` directory.
-- Or [download the repository ZIP](https://github.com/vano04/mcweb/archive/refs/heads/main.zip),
-  extract it, and open a terminal in the extracted `mcweb-main` directory.
+The local Node process serves the browser page and the Minecraft TCP relay. It
+binds to `127.0.0.1` by default.
 
-On macOS Apple Silicon or Linux, run the three local steps from that directory:
+## Before you start
+
+Use one of these build hosts:
+
+| Host | Support |
+| --- | --- |
+| macOS on Apple silicon | Native build |
+| macOS on Intel | Receive-only. Build on another supported computer. |
+| Linux on x64 or arm64 | Native build |
+| Windows on x64 | Native build |
+| Windows on arm64 | Supported through Windows x64 emulation |
+
+You also need a WebGPU browser and at least 10 GB of RAM available to the
+build. A computer with 16 GB of RAM leaves more room for the operating system.
+Close memory-heavy applications before you build.
+
+The image build usually takes 9 to 15 minutes after the installer downloads
+the inputs.
+
+## Get the source
+
+Clone the repository:
+
+```sh
+git clone https://github.com/vano04/mcweb.git
+cd mcweb
+```
+
+If you do not use Git, download the
+[main branch ZIP](https://github.com/vano04/mcweb/archive/refs/heads/main.zip).
+Extract it, then open a terminal in `mcweb-main`.
+
+## Install, build, and run on macOS or Linux
+
+Run each command from the repository root:
 
 ```sh
 ./install
@@ -15,7 +49,22 @@ On macOS Apple Silicon or Linux, run the three local steps from that directory:
 sh ./run.sh
 ```
 
-On Windows PowerShell, run the same three steps with a process-only policy bypass:
+The commands do separate jobs:
+
+1. `./install` downloads and verifies Node.js, Oracle GraalVM, Binaryen, and
+   the Minecraft 26.2 inputs. It writes the toolchain and input cache under
+   `~/.mcweb`.
+2. `./build.sh` builds the browser image. A successful build prints
+   `BUILD SUCCESSFUL` and writes the output under `build/web-graal` and
+   `dist/build`.
+3. `./run.sh` starts the page and the integrated Minecraft relay. It does not
+   rebuild the image.
+
+Open <http://127.0.0.1:4199/> after `run.sh` prints the local URL.
+
+## Install, build, and run on Windows
+
+Run these commands in Windows PowerShell 5.1 or newer:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
@@ -23,363 +72,208 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run.ps1
 ```
 
-`install` downloads and verifies all developer dependencies plus the official
-26.2 inputs into `~/.mcweb`. `build` produces and packages the browser image.
-`run` does not rebuild: it serves that image at <http://127.0.0.1:4199/> and
-starts the integrated, auth-aware WebSocket-to-Minecraft TCP relay in the same
-loopback Node process. Set `MC_RELAY_ALLOW` to an exact comma-separated
-`host:port` list when you do not want the default public-server wildcard.
+The policy bypass applies only to each PowerShell process. It does not change
+the execution policy for your user or computer.
 
-The PowerShell policy bypass applies only to that process; it does not change
-the machine or user execution policy. Use `--mc-dir` with `install` and `build`
-to reuse an existing official Launcher/PrismLauncher layout. On Windows ARM64,
-the installer uses native ARM64 Node and the pinned x64 Oracle GraalVM builder
-through Windows x64 emulation.
+On Windows, `install.ps1` also installs llvm-mingw under
+`%USERPROFILE%\.mcweb`. MC-Web presents llvm-mingw to GraalVM through local
+`cl.exe` and `vswhere.exe` adapters. You do not need Visual Studio or the
+Windows SDK.
 
-# MC-Web local development distribution
+Windows arm64 uses native arm64 Node.js. Oracle does not publish an arm64 Web
+Image builder for Windows, so MC-Web runs the x64 GraalVM builder through
+Windows emulation.
 
-This directory is the source-only local launcher for MC-Web. It runs the
-developer's own licensed Minecraft Java client in a browser; it is not a
-reimplementation or a Minecraft-like engine. By default the build obtains the
-published 26.2 client JAR, libraries, asset index, title assets, and sounds from
-Mojang's official CDN endpoints, verifies every published digest/size, and keeps
-the resulting cache under `~/.mcweb/minecraft`. A local Launcher/Prism install
-can still be supplied with `--mc-dir`; generated loader/Wasm/image outputs stay
-local and are never uploaded.
+Open <http://127.0.0.1:4199/> after `run.ps1` prints the local URL.
 
-The launcher footer contains the one pointer to the official deployment. This
-copy is for building and running the local development lane.
+## Use an existing Launcher installation
 
-## Install, build, and run
+By default, `install` downloads the public Minecraft 26.2 files from Mojang's
+CDNs. It verifies every published hash and size. The installer never reads an
+account token during this step.
 
-Clone this directory first, then run the platform wrapper. It installs only
-developer tools into `~/.mcweb` (or `MCWEB_HOME`): Node.js, Oracle GraalVM Web
-Image, and Binaryen. Each archive is checked against the SHA-256 checksum
-published by its official vendor. No administrator access is required.
+To use files from the official Launcher or PrismLauncher, pass `--mc-dir` to
+both `install` and `build`.
+
+On macOS:
 
 ```sh
-# macOS Apple Silicon / Linux
-./install             # dependencies and verified 26.2 inputs
-./build.sh            # browser image -> build/web-graal and dist/build
-./run.sh              # localhost page and integrated relay on port 4199
+./install --mc-dir "$HOME/Library/Application Support/minecraft"
+./build.sh --mc-dir "$HOME/Library/Application Support/minecraft"
 ```
+
+On Windows:
 
 ```powershell
-# Windows PowerShell 5.1+
-.\install.ps1         # dependencies and verified 26.2 inputs
-.\build.ps1           # browser image -> build\web-graal and dist\build
-.\run.ps1             # localhost page and integrated relay on port 4199
+.\install.ps1 --mc-dir "$env:APPDATA\.minecraft"
+.\build.ps1 --mc-dir "$env:APPDATA\.minecraft"
 ```
 
-If Node 20+ is already installed, the wrappers reuse it. Otherwise they place
-the pinned portable Node release under `~/.mcweb/node`. The shared installer
-then places GraalVM under `~/.mcweb/toolchain` and Binaryen under
-`~/.mcweb/binaryen`, validates the tools, and downloads or validates the
-verified 26.2 CDN cache. The root `install` wrappers stop there. The root
-`build` wrappers invoke the long image build. The root `run` wrappers require
-an existing image and never trigger a rebuild. `--platform-matrix` on the
-lower-level `tools/install.*` wrappers prints the supported host mapping.
+`--download` and `--download-only` use the CDN cache. They cannot be combined
+with `--mc-dir`. When no `--mc-dir` or `--local-only` is supplied, CDN download
+is the default.
 
-The installer never signs in, copies account files, or handles tokens. It pulls
-only public game inputs from Mojang's official HTTPS CDNs, like PrismLauncher.
-Use `--mc-dir` when you prefer an already-downloaded official Launcher or
-PrismLauncher layout; use `--cache-dir` to choose the local CDN cache location.
+Use these options when needed:
 
-The current toolchain matrix is:
+- `--no-audio` omits the sound files and builds a silent image.
+- `--cache-dir PATH` changes the CDN cache directory.
+- `--offline` allows only an existing verified cache.
+- `--local-only` requires a detected local Launcher installation.
 
-| Host | Builder | Note |
-| --- | --- | --- |
-| macOS arm64 | native Oracle GraalVM macOS aarch64 | supported |
-| macOS x64 | — | receive-only: Oracle 25i2 has no x64 Web Image archive; build elsewhere |
-| Linux x64 / arm64 | native Oracle GraalVM | supported |
-| Windows x64 | native Oracle GraalVM | supported |
-| Windows arm64 | Windows x64 Oracle GraalVM | supported through Windows x64 emulation; not native ARM64 |
-
-The archive URLs and locked checksum pins are kept in
-`tools/mcweb-install.mjs`: Node.js `v24.19.0`, Oracle GraalVM `25.2.4`
-(`25i2`, the public Web Image baseline is 25.1+), and Binaryen `131`. Oracle's
-25i2 archive is based on JDK `25.0.4`; that number in the archive filename is
-not the GraalVM release. The installer fails closed when a platform has no
-supported Oracle builder; it does not pretend a plain OpenJDK is equivalent.
-
-The pinned Oracle archive filenames and SHA-256 values are:
-
-| Platform | Archive | SHA-256 |
-| --- | --- | --- |
-| macOS arm64 | `graalvm-jdk-25i2-25.0.4_macos-aarch64_bin.tar.gz` | `1b5937aa3076707459cfc815a1699761f943d2d1c9cbe03388e36d5e47eb27c3` |
-| Linux x64 | `graalvm-jdk-25i2-25.0.4_linux-x64_bin.tar.gz` | `7100d99cbfec68b03b669cc60c7e8592bbcda1732e8eaebc460fe0b75849a894` |
-| Linux arm64 | `graalvm-jdk-25i2-25.0.4_linux-aarch64_bin.tar.gz` | `0bc65f9c36ae77bd83aad46a2b4de4b0ec97da1b4ac83fedb59e19f868873dee` |
-| Windows x64 | `graalvm-jdk-25i2-25.0.4_windows-x64_bin.zip` | `2b41fffc94c4c7795bce0fdde8847ab1c894903cb20779aedb6ca8628aa9983a` |
-
-Binaryen 131 uses its official GitHub `.sha256` sidecars. The macOS x64
-archive (receive-only on this project) is pinned to
-`d209fadd8a894bdaf3bd3612a23c32a0af184d2f4a979b8c789e6e4f6a4de883`.
-
-## Build requirements
-
-You need:
-
-- Network access to Mojang's official HTTPS CDNs for the 26.2 client JAR,
-  libraries, asset index, title objects, and (unless `--no-audio`) sound
-  objects. The build checks each published SHA-1/size and the pinned client
-  SHA-256 `40896ee9f1e2bec3c934daac7e93d41e9e3d9c2f8ae0ca366d52ffbfd1afa290`.
-- Oracle GraalVM Web Image 25.1 or newer. The clean-machine bootstrap pins
-  Oracle GraalVM 25.2.4 (25i2); set `GRAALVM_HOME` explicitly when a manually
-  installed JDK is elsewhere. It must be Oracle GraalVM, not a stock OpenJDK.
-- On Windows, the bootstrap downloads the pinned llvm-mingw toolchain and
-  exposes it through the narrow `cl.exe`/`vswhere.exe` adapter expected by
-  Oracle Native Image. Visual Studio and the Windows SDK are not required.
-  Windows ARM64 runs the x64 GraalVM and compiler through the supported x64
-  emulation path.
-- Java 25 available through `JAVA_HOME` (normally the same GraalVM directory).
-- Node.js 20 or newer and a working Gradle wrapper (`./gradlew`).
-- Binaryen 131's `wasm-as` executable on `PATH`, or under
-  `~/.mcweb/binaryen/bin` / `~/tools/binaryen/bin`.
-- An optional local official Launcher/PrismLauncher installation with the
-  matching 26.2 libraries and asset store when using `--mc-dir` instead of CDN
-  download.
-- A WebGPU-capable browser for running the result.
-
-Plan for at least **10 GB of RAM available to the build**. A machine with 16 GB
-or more physical RAM is more comfortable; close memory-heavy applications so
-the native-image builder does not fall into swap. A full image build takes about
-9 minutes after inputs are present, and the first asset/library staging pass can
-take longer.
-
-## Build the Wasm binary
-
-Run these commands from this directory. The default command downloads into the
-ignored user cache `~/.mcweb/minecraft`; no Minecraft-owned file is written into
-the source checkout.
+For direct control, run `node tools/build.mjs`. For example:
 
 ```sh
-# Optional when the helper cannot find your Oracle GraalVM automatically.
-# The bootstrap writes this path to ~/.mcweb/toolchain.env. For a manual
-# install, use the JDK's Contents/Home on macOS or the JDK directory on Linux.
-export GRAALVM_HOME="$HOME/.mcweb/toolchain/Contents/Home"
-export JAVA_HOME="$GRAALVM_HOME"
-"$GRAALVM_HOME/bin/java" -version
-wasm-as --version
-
-# Download and hash-check official 26.2 inputs, stage title/panorama files into
-# ignored local paths, then run the GraalVM Web Image build. --out is local.
-node tools/build.mjs --out dist/build
-
-# Optional local-launcher fallback or offline reuse of a verified CDN cache.
-node tools/build.mjs --mc-dir "$HOME/Library/Application Support/minecraft" --out dist/build
 node tools/build.mjs --download --cache-dir "$HOME/.mcweb/minecraft" --offline --out dist/build
 ```
 
-`tools/build.mjs` checks the Oracle Web Image API, `svm.jar`, `svm-wasm.jar`,
-and `native-image` before it stages libraries or starts Gradle. It passes the
-same selected home as `GRAALVM_HOME`, `JAVA_HOME`, and `-PgraalVmHome`. If
-auto-detection does not find it, pass `--graalvm-home /path/to/Contents/Home`;
-the helper never downloads a JDK. A manually selected, project-compatible
-Oracle 25.0.4 development install may be accepted for legacy reproduction,
-but the shareable/bootstrap requirement remains Web Image 25.1+.
-
-`tools/build.mjs` performs the complete build. It validates the asset index and
-all seven panorama objects, reconstructs the two JAR-backed title textures and
-panorama files under the ignored staging paths, stages the local classpath,
-links the verified 26.2 client JAR at the build's ignored project-root path, and
-runs `./gradlew buildGraalWeb` with
-`dev.mcweb.graal.BrowserMinecraftMain`, then packages the browser pair. The
-important outputs are:
+The build writes these files:
 
 ```text
 build/web-graal/graal/minecraft-client.js
 build/web-graal/graal/minecraft-client.js.wasm
-build/web-graal/mcweb-audio/                 # present when audio was staged
+build/web-graal/mcweb-audio/
 dist/build/graal/minecraft-client.js
 dist/build/graal/minecraft-client.js.wasm
 dist/build/build-manifest.json
 ```
 
-The `.wasm` file in `build/web-graal/graal/` is the file served by the local
-launcher. `dist/build/build-manifest.json` records the input JAR hash and the
-output Wasm hash for your local build. Use `node tools/build.mjs --download
---no-audio --dry-run` first to print the CDN plan without network downloads or
-writes. Use `node tools/build.mjs --download --no-audio --download-only` for a
-real input-only gate; it populates the verified cache and stops before Gradle.
-With `--offline`, only a previously committed verified cache is accepted. A
-local `--mc-dir ... --dry-run` remains a no-download validation path.
-The standalone `node tools/stage-mojang-assets.mjs` command remains available
-for explicitly reconstructing the same ignored staging set.
+`run.sh` and `run.ps1` serve
+`build/web-graal/graal/minecraft-client.js.wasm`. The build manifest records
+the input JAR hash and the output Wasm hash.
 
-The resolver accepts only the official launcher's vanilla
-`versions/26.2/26.2.json` layout. If your launcher data directory is elsewhere,
-pass that vanilla root explicitly with `--mc-dir`; the JAR must still be the
-exact 26.2 client listed above.
+## Sign in for online play
 
-The build script supports `--no-audio` when you only need a silent runtime,
-`--cache-dir` to select the local cache, `--offline` to prohibit network use,
-and `--local-only` to require a detected launcher installation. `--download`
-and `--download-only` are CDN modes and cannot be combined with `--mc-dir`;
-the local-launcher path is a separate mode. When no `--mc-dir` or
-`--local-only` is supplied, CDN download is the default. The downloader never
-sends account credentials and never uploads the resulting cache or generated
-image.
+The local Node process looks for an active Microsoft account in the official
+Launcher file. On macOS, it tries PrismLauncher if the official file is absent
+or unusable.
 
-## Run locally
+MC-Web accepts these files:
 
-After the build finishes, start the original one-process Node command from this
-directory:
+- The official Launcher `launcher_accounts.json` file must name one active
+  Microsoft account. That account needs an unexpired access token and a
+  Minecraft profile.
+- The PrismLauncher `accounts.json` file must contain exactly one active MSA
+  account. That account needs an unexpired token and a Minecraft profile.
 
-```sh
-MC_WEB_PORT=4199 node tools/dev-server.mjs
-```
+The page can send a file that you select to the loopback Node process. MC-Web
+validates the file in memory. It does not write the file, return the token to
+the browser, or send the token to a public host.
 
-Open <http://127.0.0.1:4199/>. The same process serves `build/web-graal`, the
-launcher shell, the authenticated `/mcweb/*` routes, and the WebSocket-to-TCP
-Minecraft gateway. It binds to loopback (`127.0.0.1`) by default; do not expose
-this process to a network you do not control.
+Find the account file for your operating system:
 
-The launcher reads a supported local account store, verifies its active
-Microsoft profile, unexpired session, ownership, and live profile with
-Minecraft Services, then keeps the access token in the Node process. When the
-file is not at the normal location, the page can send one player-selected copy
-to the same loopback Node process at `/mcweb/auth/launcher-accounts`; the raw
-document is validated in memory and never written, returned to the page, or
-sent to a public host. It never sends that token to a public page. Online mode
-remains authenticated: the gateway performs Mojang session join, RSA/AES login
-encryption, compression framing, and signed profile-property verification. The
-file is autodetected at the platform's normal locations. The official Launcher
-path is tried first; if it is absent or unusable, macOS also tries the
-PrismLauncher path. Use
-`MCWEB_LAUNCHER_ACCOUNTS=/absolute/path/to/account-file.json` for a configured
-official Launcher or PrismLauncher path; an explicit override is fail-closed
-and never falls back to another file.
+- On Windows, press **Win+R** and enter `%APPDATA%\.minecraft`. Select
+  `%APPDATA%\.minecraft\launcher_accounts.json`.
+- On macOS, open
+  `~/Library/Application Support/minecraft/launcher_accounts.json`. If that
+  file has no reusable token, use
+  `~/Library/Application Support/PrismLauncher/accounts.json`.
+- On Linux, use `~/.minecraft/launcher_accounts.json`.
 
-### Find a local Launcher account file
-
-This self-hosted build accepts exactly these two formats:
-
-- **Official Minecraft Launcher:** the top-level object has an `accounts`
-  object map and a nonempty `activeAccountLocalId` that names an account in that
-  map. The selected account must be a
-  Microsoft/Xbox account with an unexpired string `accessToken` and a valid
-  `minecraftProfile` containing the UUID and name.
-- **PrismLauncher:** the top-level object has a numeric `formatVersion` and an
-  `accounts` array. Exactly one account must have `active: true`, `type: "MSA"`,
-  an unexpired numeric Unix-seconds `ygg.exp`, a nonempty `ygg.token`, and a
-  valid `profile` containing the UUID and name. Prism's refresh-token fields
-  are not used.
-
-The browser file picker accepts either document. Choose the file under **Use a
-local Launcher JSON file**, then wait for the local Node process to report live
-entitlement/profile validation. The selected file is sent only to the loopback
-Node process. It is never uploaded to a hosted service, written to disk by
-MC-Web, returned to the browser, or placed in browser storage. Only the
-validated profile name, UUID, and provider label are safe to display. Do not
-paste account-file contents into a public page or copy a token into a command.
-
-- **Windows:** press **Win+R**, enter `%APPDATA%\.minecraft`, and press Enter.
-  The file is `%APPDATA%\.minecraft\launcher_accounts.json`.
-- **macOS:** in Finder choose **Go → Go to Folder…**, enter
-  `~/Library/Application Support/minecraft`, and open
-  `~/Library/Application Support/minecraft/launcher_accounts.json`.
-  If the official file has no reusable `accessToken`, open the PrismLauncher
-  alternative at `~/Library/Application Support/PrismLauncher/accounts.json`.
-- **Linux:** open `~/.minecraft` in your file manager (or use `Ctrl+L`), then
-  use `~/.minecraft/launcher_accounts.json`.
-
-Some current official Launcher files omit a reusable `accessToken` even after
-the game has been launched. In that case, autodiscovery falls through to the
-PrismLauncher file on macOS; otherwise use that file explicitly or sign in
-again with the official Launcher. For a nonstandard location, set
-`MCWEB_LAUNCHER_ACCOUNTS=/absolute/path/to/account-file.json` before starting
-Node. No other account format is accepted. If a replacement upload is rejected,
-the previous in-memory session is cleared and must be validated again.
-
-## Minecraft server target policy
-
-The default `MC_RELAY_ALLOW=*` policy allows all syntactically valid public
-Minecraft `host:port` targets. This is still a local capability: the gateway
-requires a same-origin browser WebSocket, the Node process is loopback-bound by
-default, and the official Microsoft/Minecraft entitlement and online-session
-checks remain in force.
-
-To restrict the gateway to an exact comma-separated list, set the variable
-before starting Node:
+For a different location, set `MCWEB_LAUNCHER_ACCOUNTS` before you run MC-Web:
 
 ```sh
-MC_RELAY_ALLOW=play.example.net:25565,lan.example.net:25565 \
-  MC_WEB_PORT=4199 node tools/dev-server.mjs
+MCWEB_LAUNCHER_ACCOUNTS=/absolute/path/to/launcher_accounts.json ./run.sh
 ```
 
-Each entry must be one exact `host:port` target. IPv6 targets use brackets, for
-example `MC_RELAY_ALLOW='[2001:db8::20]:25565'`. A malformed list, a mixed `*`
-plus exact list, an invalid host, or an invalid port fails closed and allows no
-targets. The page and gateway both enforce the same policy.
+Do not paste an account file or token into a public page or command.
 
-Under `*`, literal loopback, private, link-local, carrier-grade NAT,
-documentation, multicast, and cloud metadata destinations are rejected. DNS
-names resolving to any unsafe address are rejected too. If you intentionally
-need a private server, explicitly list its exact host and port in
-`MC_RELAY_ALLOW`; this is the documented opt-in boundary. Exact allowlisting
-does not remove the loopback bind or same-origin browser requirement.
+## Choose which Minecraft servers the relay can reach
 
-The browser cannot open raw TCP itself, so all server traffic goes through this
-same local gateway. It does not use a hosted relay, SRV redirect, arbitrary URL
-override, or unauthenticated fallback.
+The default `MC_RELAY_ALLOW=*` setting permits syntactically valid public
+Minecraft `host:port` targets. The relay rejects loopback, private,
+link-local, multicast, carrier-grade NAT, documentation, and cloud metadata
+addresses under this setting. It also rejects DNS names that resolve to those
+addresses.
 
-## Troubleshooting
+To allow only selected servers on macOS or Linux, set a comma-separated list:
 
-- `this jar is not the 26.2 client`: check the SHA-256 output and pass the
-  matching official Launcher installation. `--allow-unknown-jar` is an unsupported
-  experiment because the transforms are version-specific.
-- `no Minecraft 26.2 installation found`: check network access to the official
-  Mojang CDNs, or pass `--mc-dir` for a local Launcher/Prism cache. `--offline`
-  requires a previously committed `~/.mcweb/minecraft/.mcweb-download.json`.
-- `library ... is missing a valid SHA-1/size`: the published manifest is
-  incomplete or changed; the downloader fails closed instead of accepting an
-  unverified classpath.
-- `no supported Oracle GraalVM Web Image JDK found`: install Oracle GraalVM
-  25.1+ (the bootstrap pins 25.2.4/25i2), then set `GRAALVM_HOME` and
-  `JAVA_HOME` to its JDK home, or pass `--graalvm-home`. The build helper does
-  not download a JDK. For a separate `wasm-as not found` error, install/put
-  Binaryen's `wasm-as` on `PATH`.
-- `native-image preflight ... STATUS_DLL_NOT_FOUND` or Windows exit
-  `-1073741515 (0xC0000135)`: this is a missing Windows loader dependency, not
-  an image-build OOM. Re-run `.\install.ps1`, then `.\build.ps1`; the Windows
-  installer verifies and restores the pinned llvm-mingw toolchain and its local
-  `cl.exe`/`vswhere.exe` adapter without Visual Studio, the Windows SDK, admin
-  access, or registry changes. If the loader still fails, install Microsoft's
-  official current x64 Visual C++ Redistributable: llvm-mingw replaces the
-  compiler and SDK, not DLLs imported by Oracle's executable. Do not download
-  or copy an unofficial DLL into the JDK.
-- Native-image runs out of memory: make at least 10 GB available, close other
-  applications, or lower the builder settings with Gradle properties such as
-  `-PgraalBuilderMemoryGb=8 -PgraalParallelism=4` before retrying.
-- The launcher reports missing artifacts: the build must finish before Node is
-  started; confirm `build/web-graal/graal/minecraft-client.js.wasm` exists.
-- A server is refused: inspect `MC_RELAY_ALLOW`, use an exact `host:port` entry
-  for a private destination, and remember that Minecraft server addresses are
-  not arbitrary URLs or SRV records.
+```sh
+MC_RELAY_ALLOW=play.example.net:25565,backup.example.net:25565 ./run.sh
+```
 
-## Sharing and licensing boundary
+On Windows PowerShell, set the same variable before `run.ps1`:
 
-Share the source files in this directory, build instructions, and your own
-changes. Do **not** commit or redistribute `minecraft-26.2-client.jar`, launcher
-libraries, account files/tokens, staged textures, sounds, generated JavaScript,
-the `.wasm` binary, or the packaged `dist/build` output. These are generated or
-Mojang-owned inputs derived from the recipient's own installation. `.gitignore`
-excludes the local JAR, staged assets, build output, and packaged runtime. See
-[NOTICE.md](NOTICE.md) and [LICENSE](LICENSE) for the applicable terms.
+```powershell
+$env:MC_RELAY_ALLOW = 'play.example.net:25565,backup.example.net:25565'
+.\run.ps1
+```
 
-## Layout
+Use brackets around an IPv6 address:
 
-| Path | Purpose |
+```sh
+MC_RELAY_ALLOW='[2001:db8::20]:25565' ./run.sh
+```
+
+To reach a private server, list its exact host and port. An exact entry permits
+that destination, but the Node process still binds to loopback and requires a
+same-origin browser connection.
+
+The browser cannot open raw TCP. All Minecraft traffic passes through the
+local Node relay. MC-Web has no hosted relay or unauthenticated fallback.
+
+## Toolchain versions
+
+The installer pins these tools:
+
+- Node.js `v24.19.0`
+- Oracle GraalVM `25.2.4`, release `25i2`, based on JDK `25.0.4`
+- Binaryen `131`
+- llvm-mingw `20260616` on Windows
+
+The build requires Oracle GraalVM Web Image 25.1 or newer. A stock OpenJDK does
+not include Web Image. `tools/mcweb-install.mjs` contains the archive names and
+SHA-256 pins. Binaryen uses the checksum files from its release.
+
+The installer verifies the Minecraft 26.2 client with this SHA-256:
+
+```text
+40896ee9f1e2bec3c934daac7e93d41e9e3d9c2f8ae0ca366d52ffbfd1afa290
+```
+
+## Troubleshoot a failed build
+
+- If the installer reports `this jar is not the 26.2 client`, use the vanilla
+  26.2 Launcher files. The bytecode transforms do not support another version.
+- If the installer cannot find Minecraft 26.2, check access to Mojang's CDNs.
+  You can also pass `--mc-dir` to a vanilla Launcher directory.
+- If `--offline` fails, run `install` without `--offline` to create a verified
+  cache first.
+- If the installer cannot find Oracle GraalVM Web Image, run `install` again.
+  For a manual JDK, set both `GRAALVM_HOME` and `JAVA_HOME` to the Oracle JDK.
+- If `wasm-as` is missing, run `install` again or put Binaryen 131 on `PATH`.
+- On Windows, if native-image exits with `0xC0000135`, run `install.ps1` again.
+  If it still fails, install Microsoft's current x64 Visual C++
+  Redistributable. Do not copy an unofficial DLL into the JDK.
+- If native-image runs out of memory, make at least 10 GB available. Close
+  other applications, then retry the build.
+- If `run` reports a missing image, run `build.sh` or `build.ps1` first. Confirm
+  that `build/web-graal/graal/minecraft-client.js.wasm` exists.
+- If the relay refuses a server, check `MC_RELAY_ALLOW`. Private servers need
+  an exact `host:port` entry.
+
+## Keep generated files private
+
+You can share this source code and your own changes. Do not commit or
+redistribute these files:
+
+- `minecraft-26.2-client.jar`
+- Launcher libraries, account files, or tokens
+- Staged Minecraft textures or sounds
+- Generated JavaScript or Wasm files
+- The packaged `dist/build` directory
+
+`.gitignore` excludes these local files. See [NOTICE.md](NOTICE.md) and
+[LICENSE](LICENSE) for the license terms. MC-Web's browser platform code is
+GPLv3. Minecraft and GraalVM keep their own terms.
+
+## Repository layout
+
+| Path | Contents |
 | --- | --- |
-| `src/graal/java` | Browser platform seams: WebGPU, input, audio, storage, networking, and JAR shadows |
-| `src/feature` | GraalVM substitutions for browser-incompatible JDK internals |
-| `src/main`, `src/drain` | Build-time probe and helper sources |
-| `web/` | Local launcher shell, workers, host scripts, and Service Worker |
-| `tools/build.mjs` | Local-install Wasm build and package helper |
-| `tools/dev-server.mjs` | Static server plus the local auth-aware gateway |
-| `tools/mc-relay.mjs` | Target-policy WebSocket-to-TCP implementation used by the server |
-| `build.gradle` | Image build and exact-count browser transforms |
-
-MC-Web's browser platform layer is GPLv3; Minecraft and the GraalVM toolchain
-retain their own terms. See [LICENSE](LICENSE) and
-[NOTICE.md](NOTICE.md).
+| `src/graal/java` | Browser implementations for WebGPU, input, audio, storage, and networking |
+| `src/feature` | GraalVM substitutions for JDK code that cannot run in the browser |
+| `web/` | The page, workers, and browser host code |
+| `tools/build.mjs` | The image builder and packager |
+| `tools/dev-server.mjs` | The local HTTP server and authentication routes |
+| `tools/mc-relay.mjs` | The WebSocket-to-TCP Minecraft relay |
+| `build.gradle` | The image build and exact-count bytecode transforms |
