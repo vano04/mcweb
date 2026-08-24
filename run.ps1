@@ -16,7 +16,7 @@ if ($NodeCommand) {
 }
 if (-not $Node) { $Node = Join-Path $McwebHome 'node\node.exe' }
 if (-not (Test-Path -LiteralPath $Node -PathType Leaf)) {
-  throw 'mcweb: Node 20+ is not installed; run .\install.ps1 first'
+  throw 'mcweb: Node 20+ is not installed; run .\build.ps1 first'
 }
 $Loader = Join-Path $PSScriptRoot 'build\web-graal\graal\minecraft-client.js'
 $Wasm = "$Loader.wasm"

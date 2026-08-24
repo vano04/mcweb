@@ -152,8 +152,7 @@ test("README states the public GraalVM baseline and unsupported hosts", async ()
   assert.doesNotMatch(readme, /irm\s*\|\s*iex/i);
   const windowsCodeBlock = readme.match(/```powershell\r?\n([\s\S]*?)\r?\n```/);
   assert.ok(windowsCodeBlock, "README must contain the Windows workflow code block");
-  assert.equal(windowsCodeBlock[1].split(/\r?\n/).length, 3, "Windows workflow must have install, build, and run steps");
-  assert.match(windowsCodeBlock[1], /install\.ps1/);
+  assert.equal(windowsCodeBlock[1].split(/\r?\n/).length, 2, "Windows workflow must have build and run steps");
   assert.match(windowsCodeBlock[1], /build\.ps1/);
   assert.match(windowsCodeBlock[1], /run\.ps1/);
   assert.doesNotMatch(windowsCodeBlock[1], /curl/i);
@@ -225,19 +224,13 @@ test("the canonical Gradle build has only the narrow Windows Node builder lane",
   assert.match(gradle, /org\.graalvm\.nativeimage\.pointsto/);
 });
 
-test("root entrypoints keep install, build, and run as separate operations", async () => {
-  const [unixInstall, windowsInstall, unixBuild, windowsBuild, unixRun, windowsRun] = await Promise.all([
-    readFile(`${ROOT}/install`, "utf8"),
-    readFile(`${ROOT}/install.ps1`, "utf8"),
+test("root entrypoints keep build and run as separate operations", async () => {
+  const [unixBuild, windowsBuild, unixRun, windowsRun] = await Promise.all([
     readFile(`${ROOT}/build.sh`, "utf8"),
     readFile(`${ROOT}/build.ps1`, "utf8"),
     readFile(`${ROOT}/run.sh`, "utf8"),
     readFile(`${ROOT}/run.ps1`, "utf8"),
   ]);
-  assert.match(unixInstall, /tools\/install\.sh.*--verify/);
-  assert.match(windowsInstall, /tools\\install\.ps1/);
-  assert.match(windowsInstall, /--verify/);
-  assert.match(windowsInstall, /ExecutionPolicy Bypass/);
   assert.match(unixBuild, /tools\/install\.sh.*--build/);
   assert.match(windowsBuild, /tools\\install\.ps1/);
   assert.match(windowsBuild, /--build/);

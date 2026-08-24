@@ -12,7 +12,7 @@ if command -v node >/dev/null 2>&1; then
 fi
 [ -n "$NODE" ] || NODE="$MCWEB_HOME/node/bin/node"
 [ -x "$NODE" ] || {
-  echo "mcweb: Node 20+ is not installed; run ./install first" >&2
+  echo "mcweb: Node 20+ is not installed; run ./build.sh first" >&2
   exit 1
 }
 [ -f "$SCRIPT_DIR/build/web-graal/graal/minecraft-client.js" ] \

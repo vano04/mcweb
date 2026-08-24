@@ -102,11 +102,10 @@ test("generated or proprietary payloads are absent from the copy", async () => {
   }
 });
 
-test("root install, build, and run entrypoints remain source-only", async () => {
-  const paths = ["install", "install.ps1", "build.sh", "build.ps1", "run.sh", "run.ps1"]
+test("root build and run entrypoints remain source-only", async () => {
+  const paths = ["build.sh", "build.ps1", "run.sh", "run.ps1"]
     .map((name) => join(ROOT, name));
   const text = (await Promise.all(paths.map(async (path) => readFile(path, "utf8")))).join("\n");
-  assert.match(text, /--verify/);
   assert.match(text, /--build/);
   assert.match(text, /dev-server\.mjs/);
   assert.doesNotMatch(text, /https?:\/\//);

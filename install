@@ -1,5 +1,0 @@
-#!/bin/sh
-# Install and verify every local dependency and the pinned Minecraft inputs.
-set -eu
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-exec sh "$SCRIPT_DIR/tools/install.sh" --verify "$@"

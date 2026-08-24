@@ -39,35 +39,32 @@ If you do not use Git, download the
 [main branch ZIP](https://github.com/vano04/mcweb/archive/refs/heads/main.zip).
 Extract it, then open a terminal in `mcweb-main`.
 
-## Install, build, and run on macOS or Linux
+## Build and run on macOS or Linux
 
 Run each command from the repository root:
 
 ```sh
-./install
 ./build.sh
 sh ./run.sh
 ```
 
 The commands do separate jobs:
 
-1. `./install` downloads and verifies Node.js, Oracle GraalVM, Binaryen, and
-   the Minecraft 26.2 inputs. It writes the toolchain and input cache under
-   `~/.mcweb`.
-2. `./build.sh` builds the browser image. A successful build prints
+1. `./build.sh` installs and verifies Node.js, Oracle GraalVM, Binaryen, and
+   the Minecraft 26.2 inputs under `~/.mcweb`, then builds the browser image.
+   A successful build prints
    `BUILD SUCCESSFUL` and writes the output under `build/web-graal` and
    `dist/build`.
-3. `./run.sh` starts the page and the integrated Minecraft relay. It does not
+2. `./run.sh` starts the page and the integrated Minecraft relay. It does not
    rebuild the image.
 
 Open <http://127.0.0.1:4199/> after `run.sh` prints the local URL.
 
-## Install, build, and run on Windows
+## Build and run on Windows
 
 Run these commands in Windows PowerShell 5.1 or newer:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run.ps1
 ```
@@ -75,7 +72,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run.ps1
 The policy bypass applies only to each PowerShell process. It does not change
 the execution policy for your user or computer.
 
-On Windows, `install.ps1` also installs llvm-mingw under
+On Windows, `build.ps1` also installs llvm-mingw under
 `%USERPROFILE%\.mcweb`. MC-Web presents llvm-mingw to GraalVM through local
 `cl.exe` and `vswhere.exe` adapters. You do not need Visual Studio or the
 Windows SDK.
@@ -88,24 +85,22 @@ Open <http://127.0.0.1:4199/> after `run.ps1` prints the local URL.
 
 ## Use an existing Launcher installation
 
-By default, `install` downloads the public Minecraft 26.2 files from Mojang's
+By default, `build` downloads the public Minecraft 26.2 files from Mojang's
 CDNs. It verifies every published hash and size. The installer never reads an
 account token during this step.
 
 To use files from the official Launcher or PrismLauncher, pass `--mc-dir` to
-both `install` and `build`.
+the build command.
 
 On macOS:
 
 ```sh
-./install --mc-dir "$HOME/Library/Application Support/minecraft"
 ./build.sh --mc-dir "$HOME/Library/Application Support/minecraft"
 ```
 
 On Windows:
 
 ```powershell
-.\install.ps1 --mc-dir "$env:APPDATA\.minecraft"
 .\build.ps1 --mc-dir "$env:APPDATA\.minecraft"
 ```
 
@@ -236,12 +231,12 @@ The installer verifies the Minecraft 26.2 client with this SHA-256:
   26.2 Launcher files. The bytecode transforms do not support another version.
 - If the installer cannot find Minecraft 26.2, check access to Mojang's CDNs.
   You can also pass `--mc-dir` to a vanilla Launcher directory.
-- If `--offline` fails, run `install` without `--offline` to create a verified
+- If `--offline` fails, run `build` without `--offline` to create a verified
   cache first.
-- If the installer cannot find Oracle GraalVM Web Image, run `install` again.
+- If the installer cannot find Oracle GraalVM Web Image, run `build` again.
   For a manual JDK, set both `GRAALVM_HOME` and `JAVA_HOME` to the Oracle JDK.
-- If `wasm-as` is missing, run `install` again or put Binaryen 131 on `PATH`.
-- On Windows, if native-image exits with `0xC0000135`, run `install.ps1` again.
+- If `wasm-as` is missing, run `build` again or put Binaryen 131 on `PATH`.
+- On Windows, if native-image exits with `0xC0000135`, run `build.ps1` again.
   If it still fails, install Microsoft's current x64 Visual C++
   Redistributable. Do not copy an unofficial DLL into the JDK.
 - If native-image runs out of memory, make at least 10 GB available. Close
