@@ -7,31 +7,34 @@ Start with an inspectable copy of this repository. Choose one:
 - Or [download the repository ZIP](https://github.com/vano04/mcweb/archive/refs/heads/main.zip),
   extract it, and open a terminal in the extracted `mcweb-main` directory.
 
-On macOS or Linux, run the local wrapper from that directory:
+On macOS Apple Silicon or Linux, run the three local steps from that directory:
 
 ```sh
+./install
+./build.sh
 sh ./run.sh
 ```
 
-On Windows PowerShell, run the local wrapper with a process-only policy bypass:
+On Windows PowerShell, run the same three steps with a process-only policy bypass:
 
 ```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run.ps1
 ```
 
-These wrappers call the inspectable local `tools/install.sh` or
-`tools\install.ps1`, install the pinned developer tools, build the local Web
-Image, and start the loopback server. The policy bypass applies only to this
-PowerShell process; it does not change the machine or user execution policy.
+`install` downloads and verifies all developer dependencies plus the official
+26.2 inputs into `~/.mcweb`. `build` produces and packages the browser image.
+`run` does not rebuild: it serves that image at <http://127.0.0.1:4199/> and
+starts the integrated, auth-aware WebSocket-to-Minecraft TCP relay in the same
+loopback Node process. Set `MC_RELAY_ALLOW` to an exact comma-separated
+`host:port` list when you do not want the default public-server wildcard.
 
-The two `run` scripts are the standard local flow: they validate or install
-the pinned developer tools, download or validate the official 26.2 inputs,
-build the local Web Image, and start the loopback server. Use `--mc-dir` to
-reuse an existing official Launcher/PrismLauncher layout. On Windows ARM64,
-the installer uses the native ARM64 Node release when available and
-intentionally selects the pinned Windows x64 Oracle GraalVM Web Image builder,
-which runs through Windows x64 emulation. Oracle does not publish a native
-ARM64 Web Image archive; the installer never invents or labels one as native.
+The PowerShell policy bypass applies only to that process; it does not change
+the machine or user execution policy. Use `--mc-dir` with `install` and `build`
+to reuse an existing official Launcher/PrismLauncher layout. On Windows ARM64,
+the installer uses native ARM64 Node and the pinned x64 Oracle GraalVM builder
+through Windows x64 emulation.
 
 # MC-Web local development distribution
 
@@ -47,7 +50,7 @@ local and are never uploaded.
 The launcher footer contains the one pointer to the official deployment. This
 copy is for building and running the local development lane.
 
-## Clean-machine bootstrap
+## Install, build, and run
 
 Clone this directory first, then run the platform wrapper. It installs only
 developer tools into `~/.mcweb` (or `MCWEB_HOME`): Node.js, Oracle GraalVM Web
@@ -55,25 +58,27 @@ Image, and Binaryen. Each archive is checked against the SHA-256 checksum
 published by its official vendor. No administrator access is required.
 
 ```sh
-# macOS/Linux; --dry-run is write-free even when Node is absent
-sh tools/install.sh --dry-run
-sh tools/install.sh --build
+# macOS Apple Silicon / Linux
+./install             # dependencies and verified 26.2 inputs
+./build.sh            # browser image -> build/web-graal and dist/build
+./run.sh              # localhost page and integrated relay on port 4199
 ```
 
 ```powershell
-# Windows PowerShell; --dry-run is write-free even when Node is absent
-.\tools\install.ps1 --dry-run
-.\tools\install.ps1 --build
+# Windows PowerShell 5.1+
+.\install.ps1         # dependencies and verified 26.2 inputs
+.\build.ps1           # browser image -> build\web-graal and dist\build
+.\run.ps1             # localhost page and integrated relay on port 4199
 ```
 
 If Node 20+ is already installed, the wrappers reuse it. Otherwise they place
 the pinned portable Node release under `~/.mcweb/node`. The shared installer
 then places GraalVM under `~/.mcweb/toolchain` and Binaryen under
-`~/.mcweb/binaryen`, validates the tools, downloads or validates the verified
-26.2 CDN cache, and builds only when `--build` is present. Use `--run` instead
-of `--build` to build and start the local server, or `--verify` to validate
-without compiling. `--platform-matrix` prints the supported native/emulated
-host mapping.
+`~/.mcweb/binaryen`, validates the tools, and downloads or validates the
+verified 26.2 CDN cache. The root `install` wrappers stop there. The root
+`build` wrappers invoke the long image build. The root `run` wrappers require
+an existing image and never trigger a rebuild. `--platform-matrix` on the
+lower-level `tools/install.*` wrappers prints the supported host mapping.
 
 The installer never signs in, copies account files, or handles tokens. It pulls
 only public game inputs from Mojang's official HTTPS CDNs, like PrismLauncher.
@@ -336,8 +341,8 @@ override, or unauthenticated fallback.
   Binaryen's `wasm-as` on `PATH`.
 - `native-image preflight ... STATUS_DLL_NOT_FOUND` or Windows exit
   `-1073741515 (0xC0000135)`: this is a missing Windows loader dependency, not
-  an image-build OOM. Re-run `.\tools\install.ps1 --build`; the Windows
-  bootstrap verifies and restores the pinned llvm-mingw toolchain and its local
+  an image-build OOM. Re-run `.\install.ps1`, then `.\build.ps1`; the Windows
+  installer verifies and restores the pinned llvm-mingw toolchain and its local
   `cl.exe`/`vswhere.exe` adapter without Visual Studio, the Windows SDK, admin
   access, or registry changes. If the loader still fails, install Microsoft's
   official current x64 Visual C++ Redistributable: llvm-mingw replaces the

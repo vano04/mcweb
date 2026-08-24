@@ -102,15 +102,15 @@ test("generated or proprietary payloads are absent from the copy", async () => {
   }
 });
 
-test("root install and run entrypoints remain source-only and repository-pinned", async () => {
-  assert.equal(await exists(join(ROOT, "install.sh")), false, "the Unix root bootstrap is named install");
-  const paths = ["install", "install.ps1", "run.sh", "run.ps1"].map((name) => join(ROOT, name));
+test("root install, build, and run entrypoints remain source-only", async () => {
+  const paths = ["install", "install.ps1", "build.sh", "build.ps1", "run.sh", "run.ps1"]
+    .map((name) => join(ROOT, name));
   const text = (await Promise.all(paths.map(async (path) => readFile(path, "utf8")))).join("\n");
-  assert.match(text, /vano04\/mcweb/);
-  assert.match(text, /refs\/heads/);
-  assert.match(text, /codeload\.github\.com/);
-  assert.match(text, /mcweb-install\.json/);
-  assert.doesNotMatch(text, /minecraft-26\.2-client\.jar|\.wasm|\.ogg/);
+  assert.match(text, /--verify/);
+  assert.match(text, /--build/);
+  assert.match(text, /dev-server\.mjs/);
+  assert.doesNotMatch(text, /https?:\/\//);
+  assert.doesNotMatch(text, /\.ogg/);
   assert.doesNotMatch(text, /minecraft\.wasm\.click|tcp\.wasm\.click|cloudflare/i);
 });
 

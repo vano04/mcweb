@@ -17,11 +17,10 @@ development lane.
 | `install.sh` / `install.ps1` | Clean-machine bootstrap wrappers for macOS/Linux and Windows. |
 | `mcweb-install.mjs` | Downloads checksum-verified developer tools, validates/downloads the 26.2 input cache, and optionally builds/runs. |
 
-The repository-root `run.sh` and `run.ps1` are the only standard local
-build-and-run entrypoints. The repository-root `install` and `install.ps1`
-are source-only GitHub bootstraps for machines that do not already have this
-directory; they install into `~/.mcweb/project` (or `MCWEB_INSTALL_DIR`) and
-refuse to overwrite an unmarked user directory.
+The repository root exposes the standard three-step interface:
+`install`/`install.ps1` provision and verify dependencies and inputs,
+`build.sh`/`build.ps1` build the image, and `run.sh`/`run.ps1` serve the built
+image with the integrated localhost relay. The run step never rebuilds.
 
 The public launcher stages only the canonical `minecraft-client` WasmGC pair;
 the Gradle build uses the standard GraalVM Web Image lane and has no alternate
@@ -40,9 +39,9 @@ it. The process remains loopback-bound and same-origin by default, and wildcard
 mode rejects local, link-local, metadata, and other unsafe destinations unless
 that exact private target is explicitly allowlisted.
 
-For a clean machine, run `sh tools/install.sh --build` (or
-`.\tools\install.ps1 --build` on Windows) to download and build. The wrapper's
-`--dry-run` mode only inspects the platform matrix and
+For a clean machine, run `./install` followed by `./build.sh` (or
+`.\install.ps1` followed by `.\build.ps1` on Windows). The lower-level
+installer's `--dry-run` mode only inspects the platform matrix and
 official archive/checksum URLs. The default `--build` path downloads the 26.2
 client JAR, matching libraries, asset index, title objects, and sounds from the
 official Mojang HTTPS CDNs into `~/.mcweb/minecraft`, with bounded retries,

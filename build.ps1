@@ -1,6 +1,4 @@
-# Install and verify every local dependency and the pinned Minecraft inputs.
-# Invoke with a process-only policy bypass when required:
-#   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+# Build and package the local browser image, installing missing dependencies.
 $ErrorActionPreference = 'Stop'
 if ($PSVersionTable.PSVersion.Major -lt 5) {
   throw 'mcweb: Windows PowerShell 5.1 or newer is required'
@@ -9,5 +7,5 @@ $Installer = Join-Path $PSScriptRoot 'tools\install.ps1'
 if (-not (Test-Path -LiteralPath $Installer -PathType Leaf)) {
   throw "mcweb: tools/install.ps1 was not found beside $PSScriptRoot"
 }
-& $Installer --verify @args
+& $Installer --build @args
 exit $LASTEXITCODE

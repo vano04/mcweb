@@ -151,8 +151,10 @@ test("README states the public GraalVM baseline and unsupported hosts", async ()
   assert.doesNotMatch(readme, /New-TemporaryFile/);
   assert.doesNotMatch(readme, /irm\s*\|\s*iex/i);
   const windowsCodeBlock = readme.match(/```powershell\r?\n([\s\S]*?)\r?\n```/);
-  assert.ok(windowsCodeBlock, "README must contain the Windows bootstrap code block");
-  assert.equal(windowsCodeBlock[1].split(/\r?\n/).length, 1, "Windows bootstrap must be one line");
+  assert.ok(windowsCodeBlock, "README must contain the Windows workflow code block");
+  assert.equal(windowsCodeBlock[1].split(/\r?\n/).length, 3, "Windows workflow must have install, build, and run steps");
+  assert.match(windowsCodeBlock[1], /install\.ps1/);
+  assert.match(windowsCodeBlock[1], /build\.ps1/);
   assert.match(windowsCodeBlock[1], /run\.ps1/);
   assert.doesNotMatch(windowsCodeBlock[1], /curl/i);
   assert.doesNotMatch(readme, /Invoke-WebRequest/);
@@ -223,44 +225,29 @@ test("the canonical Gradle build has only the narrow Windows Node builder lane",
   assert.match(gradle, /org\.graalvm\.nativeimage\.pointsto/);
 });
 
-test("root entrypoints route through one standard build-and-run flow", async () => {
-  const [unixRun, windowsRun, unixInstall, windowsInstall] = await Promise.all([
-    readFile(`${ROOT}/run.sh`, "utf8"),
-    readFile(`${ROOT}/run.ps1`, "utf8"),
+test("root entrypoints keep install, build, and run as separate operations", async () => {
+  const [unixInstall, windowsInstall, unixBuild, windowsBuild, unixRun, windowsRun] = await Promise.all([
     readFile(`${ROOT}/install`, "utf8"),
     readFile(`${ROOT}/install.ps1`, "utf8"),
+    readFile(`${ROOT}/build.sh`, "utf8"),
+    readFile(`${ROOT}/build.ps1`, "utf8"),
+    readFile(`${ROOT}/run.sh`, "utf8"),
+    readFile(`${ROOT}/run.ps1`, "utf8"),
   ]);
-  assert.match(unixRun, /tools\/install\.sh.*--run/);
-  assert.match(windowsRun, /tools\\install\.ps1/);
-  assert.match(windowsRun, /--run/);
-  assert.match(windowsInstall, /\[switch\]\$Run/);
-  assert.match(windowsInstall, /Usage: \.\\install\.ps1 \[-DryRun\] \[-Run\]/);
+  assert.match(unixInstall, /tools\/install\.sh.*--verify/);
+  assert.match(windowsInstall, /tools\\install\.ps1/);
+  assert.match(windowsInstall, /--verify/);
   assert.match(windowsInstall, /ExecutionPolicy Bypass/);
-  assert.match(windowsInstall, /RunScript/);
-  assert.match(windowsInstall, /\$RunExitCode = \$LASTEXITCODE/);
-  for (const source of [unixInstall, windowsInstall]) {
-    assert.match(source, /vano04\/mcweb/);
-    assert.match(source, /refs\/heads/);
-    assert.match(source, /(?:REF|Ref)\s*=?.*main/);
-    assert.match(source, /codeload\.github\.com/);
-    assert.match(source, /mcweb-install\.json/);
-    assert.match(source, /refus(?:e|ing).*overwrite/i);
-    assert.doesNotMatch(source, /minecraft-26\.2-client\.jar|\.wasm|\.ogg/);
+  assert.match(unixBuild, /tools\/install\.sh.*--build/);
+  assert.match(windowsBuild, /tools\\install\.ps1/);
+  assert.match(windowsBuild, /--build/);
+  for (const source of [unixRun, windowsRun]) {
+    assert.match(source, /dev-server\.mjs/);
+    assert.match(source, /MCWEB_DISABLE_LOCAL_BUILD/);
+    assert.match(source, /minecraft-client\.js/);
+    assert.match(source, /4199/);
+    assert.doesNotMatch(source, /--build|--run|tools[\\/]install/);
   }
-});
-
-test("Unix root bootstrap dry-run is write-free and pinned", async (t) => {
-  const install = `${ROOT}/install`;
-  const destination = await tempDir(t);
-  const result = await execFileAsync("sh", [install, "--dry-run"], {
-    cwd: ROOT,
-    env: { ...process.env, MCWEB_INSTALL_DIR: join(destination, "project") },
-    timeout: 5000,
-    maxBuffer: 1024 * 1024,
-  });
-  assert.match(result.stdout, /https:\/\/github\.com\/vano04\/mcweb\/archive\/refs\/heads\/main\.tar\.gz/);
-  assert.match(result.stdout, /no downloads or writes/);
-  assert.equal(await exists(join(destination, "project")), false);
 });
 
 test("bootstrap wrappers stay local and do not fetch a hosted installer", async () => {
