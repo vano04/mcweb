@@ -139,6 +139,7 @@ test("build preflight requires public Web Image but labels the old toolchain leg
   assert.match(build, /native-image/);
   assert.match(build, /executableNames/);
   assert.match(build, /OS_ARCH/);
+  assert.match(build, /preflightNativeImage/);
   assert.match(gradle, /native-image\.exe/);
   assert.match(gradle, /native-image\.cmd/);
 });

@@ -9,6 +9,7 @@ development lane.
 | `mc-relay.mjs` | Target-policy WebSocket-to-TCP gateway with official Launcher online auth. |
 | `profile-property-verifier.mjs` | Verifies signed Minecraft profile properties locally. |
 | `build.mjs` | Downloads or validates 26.2 inputs from official Mojang CDNs (or accepts `--mc-dir`), stages title assets, then builds and packages the image. |
+| `native-image-preflight.mjs` | Starts the selected GraalVM `native-image --version` launcher and turns Windows loader failures into actionable MSVC/SDK diagnostics before Gradle. |
 | `stage-mojang-assets.mjs` | Validates/reconstructs the same local title assets used automatically by `build.mjs`. |
 | `install.sh` / `install.ps1` | Clean-machine bootstrap wrappers for macOS/Linux and Windows. |
 | `mcweb-install.mjs` | Downloads checksum-verified developer tools, validates/downloads the 26.2 input cache, and optionally builds/runs. |

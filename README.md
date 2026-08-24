@@ -121,6 +121,11 @@ You need:
 - Oracle GraalVM Web Image 25.1 or newer. The clean-machine bootstrap pins
   Oracle GraalVM 25.2.4 (25i2); set `GRAALVM_HOME` explicitly when a manually
   installed JDK is elsewhere. It must be Oracle GraalVM, not a stock OpenJDK.
+- On Windows, Oracle Native Image also requires Visual Studio 2022 Build Tools
+  with MSVC 14.x or newer and the Windows 11 SDK. The Desktop development with
+  C++ workload is sufficient; Windows ARM64 uses these x64 tools through the
+  supported x64 emulation path. The MC-Web installer does not modify system
+  components or copy DLLs into the GraalVM archive.
 - Java 25 available through `JAVA_HOME` (normally the same GraalVM directory).
 - Node.js 20 or newer and a working Gradle wrapper (`./gradlew`).
 - Binaryen 131's `wasm-as` executable on `PATH`, or under
@@ -329,6 +334,16 @@ override, or unauthenticated fallback.
   `JAVA_HOME` to its JDK home, or pass `--graalvm-home`. The build helper does
   not download a JDK. For a separate `wasm-as not found` error, install/put
   Binaryen's `wasm-as` on `PATH`.
+- `native-image preflight ... STATUS_DLL_NOT_FOUND` or Windows exit
+  `-1073741515 (0xC0000135)`: this is a missing Windows loader dependency, not
+  an image-build OOM. Install or repair Visual Studio 2022 Build Tools with the
+  Desktop development with C++ workload and Windows 11 SDK, open a new
+  PowerShell, then retry. To inspect the imports from the installed toolchain,
+  run `where.exe cl.exe`, `where.exe dumpbin.exe`, and
+  `dumpbin.exe /DEPENDENTS "$env:USERPROFILE\.mcweb\toolchain\lib\svm\bin\native-image.exe"`.
+  The likely dependency class is the MSVC/UCRT runtime, but the status alone
+  does not identify which transitive DLL is missing; do not download or copy an
+  unofficial DLL into the JDK.
 - Native-image runs out of memory: make at least 10 GB available, close other
   applications, or lower the builder settings with Gradle properties such as
   `-PgraalBuilderMemoryGb=8 -PgraalParallelism=4` before retrying.

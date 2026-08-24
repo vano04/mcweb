@@ -33,6 +33,7 @@ import {
   validateRelativePath as safeRelativePath,
 } from "./minecraft-input-policy.mjs";
 import { validateBuildGradle } from "./source-integrity.mjs";
+import { preflightNativeImage } from "./native-image-preflight.mjs";
 
 const VERSION = "26.2";
 const EXPECTED_CLIENT_SHA256 = "40896ee9f1e2bec3c934daac7e93d41e9e3d9c2f8ae0ca366d52ffbfd1afa290";
@@ -1010,6 +1011,20 @@ if (downloadOnly) {
 const graalVm = dryRun ? null : await resolveGraalVm();
 if (graalVm) {
   say(`graalvm:        ${graalVm.home} (Oracle ${graalVm.graalVersion}${graalVm.legacy ? "; legacy project-compatible toolchain explicitly selected" : ""})`);
+  // Start the exact harmless launcher that the Gradle task will invoke before
+  // staging a long image command. Windows can return STATUS_DLL_NOT_FOUND
+  // without producing any stderr, so surfacing it here is much more useful than
+  // reporting a generic Gradle/native-image exit code after several minutes.
+  let nativeImageCheck;
+  try {
+    nativeImageCheck = await preflightNativeImage(graalVm.home, {
+      env: { ...process.env, GRAALVM_HOME: graalVm.home, JAVA_HOME: graalVm.home },
+      cwd: PROJECT,
+    });
+  } catch (error) {
+    die(error?.message || String(error));
+  }
+  say(`native-image:   ${nativeImageCheck.output.split(/\r?\n/, 1)[0] || "version command succeeded"}`);
 }
 
 // Stage the classpath in one directory so the build gets an explicit, ordered set
