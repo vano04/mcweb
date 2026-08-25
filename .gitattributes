@@ -1,0 +1,5 @@
+* text=auto
+*.gradle text eol=lf
+*.mjs text eol=lf
+*.ps1 text eol=lf
+*.sh text eol=lf

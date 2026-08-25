@@ -1,0 +1,13 @@
+#!/bin/sh
+# wasm-as wrapper that forces the Wasm `name` section on.
+#
+# `-H:+DebugNames` alone does not survive to the binary in this toolchain: the
+# .wat that Web Image emits carries symbolic names, but Binaryen's wasm-as drops
+# them unless it is given -g, and the resulting profile shows every Java frame
+# as `wasm-function[12345]`. Selected with
+# `-H:WasmAsPath=tools/wasm-as-debugnames`, wired to `-PgraalDebugNames=true`.
+#
+# Diagnostic builds only — the name section is large and ships nothing useful.
+: "${MCWEB_WASM_AS:=wasm-as}"
+
+exec "$MCWEB_WASM_AS" -g "$@"

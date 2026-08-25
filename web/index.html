@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="robots" content="noindex, nofollow, noarchive">
+  <link rel="stylesheet" href="/site.css">
+  <link rel="icon" href="/mcweb-icon.svg" type="image/svg+xml">
+  <meta name="description" content="Build and play Minecraft in your browser from this computer.">
+  <title>MC-Web | Self-hosted</title>
+</head>
+<body>
+  <canvas id="minecraft-canvas" hidden tabindex="0" aria-label="Minecraft WebGPU surface"></canvas>
+  <pre id="failure" hidden></pre>
+  <main class="local-page dev-page">
+    <div id="dev-shell" class="local-shell dev-shell">
+      <p class="kicker">MC-WEB / SELF-HOSTED</p>
+      <h1>Play Minecraft<br>from this computer.</h1>
+      <p class="local-lede">MC-Web builds Minecraft for your browser and runs it from the local server on this computer. Sign in, build the game if needed, install it in this browser, and play. Your account credentials and game files stay on this computer.</p>
+
+      <section class="local-card dev-card">
+        <h2>1. Verify your Minecraft account</h2>
+        <p>Use the Microsoft account that owns Minecraft: Java Edition. MC-Web supports the <strong>official Minecraft Launcher</strong> and <strong>PrismLauncher</strong>.</p>
+        <ol class="setup-steps">
+          <li>Sign in with Microsoft here, or open your launcher and sign in.</li>
+          <li>For launcher sign-in, return here so the local server can check the account.</li>
+          <li>Continue when the account status says <strong>verified</strong>.</li>
+        </ol>
+        <div class="auth-actions">
+          <button id="microsoft-sign-in" class="pixel-button pixel-button-red" type="button" disabled>SIGN IN WITH MICROSOFT</button>
+          <span>OR USE A LAUNCHER .JSON FILE</span>
+        </div>
+        <details class="build-help account-help">
+          <summary>ACCOUNT NOT FOUND?</summary>
+          <p>If the account status does not change, choose the launcher's account file below.</p>
+          <div class="launcher-paths" aria-label="Supported Minecraft launcher account file locations">
+            <div class="launcher-path">
+              <h3>Windows</h3>
+              <p>Press <kbd>Win</kbd>+<kbd>R</kbd>, enter <code>%APPDATA%\.minecraft</code>, and press Enter. Choose this file:</p>
+              <code>%APPDATA%\.minecraft\launcher_accounts.json</code>
+            </div>
+            <div class="launcher-path">
+              <h3>macOS</h3>
+              <p>In Finder, choose <strong>Go → Go to Folder…</strong> and enter <code>~/Library/Application Support/minecraft</code>. Choose this file:</p>
+              <code>~/Library/Application Support/minecraft/launcher_accounts.json</code>
+              <p class="fine-print">For PrismLauncher, choose:</p>
+              <code>~/Library/Application Support/PrismLauncher/accounts.json</code>
+            </div>
+            <div class="launcher-path">
+              <h3>Linux</h3>
+              <p>Open <code>~/.minecraft</code> in your file manager. Choose this file:</p>
+              <code>~/.minecraft/launcher_accounts.json</code>
+            </div>
+          </div>
+          <div class="launcher-upload">
+            <label for="launcher-accounts-file">Choose the launcher account file</label>
+            <input id="launcher-accounts-file" type="file" accept=".json,application/json">
+            <p class="fine-print">Choose <code>launcher_accounts.json</code> from the official Launcher or <code>accounts.json</code> from PrismLauncher.</p>
+          </div>
+          <p class="fine-print">This page sends the selected file only to this loopback Node process for validation. The process does not write the file, keep it, or send it to a public host. The account token never enters browser storage.</p>
+          <details class="build-help file-format-help">
+            <summary>SUPPORTED FILE FORMATS</summary>
+            <p>The official Launcher file needs an <code>accounts</code> map, <code>activeAccountLocalId</code>, an unexpired <code>accessToken</code>, and <code>minecraftProfile</code>. The PrismLauncher file needs a numeric <code>formatVersion</code>, one active <code>MSA</code> account, an unexpired <code>ygg.token</code> and <code>ygg.exp</code>, and a <code>profile</code>.</p>
+            <p>If the official Launcher file has no reusable token, sign in again or choose the PrismLauncher file. For a custom path, set <code>MCWEB_LAUNCHER_ACCOUNTS</code> before you start the local server.</p>
+          </details>
+        </details>
+        <p id="dev-status" class="dev-status" role="status" aria-live="polite">Account: waiting for the local server.</p>
+        <p id="receiver-status" class="dev-status" role="status" aria-live="polite">Local server: connecting.</p>
+        <p id="gateway-status" class="dev-status" role="status" aria-live="polite">Multiplayer: available after account verification.</p>
+        <div id="dev-result" class="dev-result" hidden>
+          <strong id="dev-result-title">Minecraft account status</strong>
+          <p id="dev-result-detail"></p>
+        </div>
+      </section>
+
+      <section class="local-card dev-card">
+        <h2>2. Build, install, and play</h2>
+        <p>Follow the first available action below. If this browser already has the current build, go straight to <strong>Play Minecraft</strong>.</p>
+        <ol class="setup-steps">
+          <li>If no browser build is ready, click <strong>Build game for browser</strong>. The first build takes longer because it downloads the build tools.</li>
+          <li>When the build finishes, click <strong>Install in this browser</strong>.</li>
+          <li>When <strong>Account</strong> says verified and <strong>Browser</strong> says installed, click <strong>Play Minecraft</strong>.</li>
+        </ol>
+        <p id="build-status" class="dev-status" role="status" aria-live="polite">Build: checking for a browser build.</p>
+        <div id="build-progress" class="dev-progress" hidden><span id="build-progress-bar"></span></div>
+        <p id="build-progress-label" class="fine-print" hidden></p>
+        <button id="build-locally" class="pixel-button pixel-button-red" type="button" disabled>BUILD GAME FOR BROWSER</button>
+        <details id="build-help" class="build-help">
+          <summary>BUILD FROM THE TERMINAL</summary>
+          <p>If the build button is unavailable, run the command for your operating system from the <code>public/mcweb</code> checkout.</p>
+          <div class="dev-command-group">
+            <p class="dev-command-label">macOS</p>
+            <div class="dev-command"><code>node tools/build.mjs --mc-dir "$HOME/Library/Application Support/minecraft" --out dist/build</code><button class="dev-copy" type="button" data-copy="node tools/build.mjs --mc-dir &quot;$HOME/Library/Application Support/minecraft&quot; --out dist/build">COPY</button></div>
+            <p class="dev-command-label">Linux</p>
+            <div class="dev-command"><code>node tools/build.mjs --mc-dir "$HOME/.minecraft" --out dist/build</code><button class="dev-copy" type="button" data-copy="node tools/build.mjs --mc-dir &quot;$HOME/.minecraft&quot; --out dist/build">COPY</button></div>
+            <p class="dev-command-label">Windows PowerShell</p>
+            <div class="dev-command"><code>node tools/build.mjs --mc-dir "$env:APPDATA\.minecraft" --out dist/build</code><button class="dev-copy" type="button" data-copy="node tools/build.mjs --mc-dir &quot;$env:APPDATA\.minecraft&quot; --out dist/build">COPY</button></div>
+          </div>
+          <p class="fine-print">When the command finishes, return to this page. The local server finds <code>build/web-graal/graal/minecraft-client.js.wasm</code> on this computer. You do not need to upload it.</p>
+        </details>
+        <p id="runtime-status" class="dev-status" role="status" aria-live="polite">Browser: waiting for a build.</p>
+        <div id="runtime-progress" class="dev-progress" hidden><span id="runtime-progress-bar"></span></div>
+        <p id="runtime-progress-label" class="fine-print" hidden></p>
+        <button id="install-locally" class="pixel-button pixel-button-red" type="button" disabled>INSTALL IN THIS BROWSER</button>
+        <button id="delete-local-install" class="pixel-button" type="button" hidden>REMOVE FROM THIS BROWSER</button>
+        <button id="dev-play-button" class="pixel-button pixel-button-red" type="button" disabled>PLAY MINECRAFT</button>
+        <p id="dev-play-note" class="fine-print">Installation copies two verified build files from the local server into this browser. The files do not leave this computer.</p>
+        <div class="pack-manager">
+          <button id="pack-toggle" class="pack-toggle" type="button" aria-expanded="false"
+                  aria-controls="pack-body">ADD RESOURCE PACKS</button>
+          <div id="pack-body" class="pack-body" hidden>
+            <div id="pack-drop" class="pack-drop">
+              <p class="pack-hint">Drop a resource-pack .zip or folder here.</p>
+              <div class="pack-actions">
+                <button id="pack-pick-file" class="pack-mini" type="button">CHOOSE .ZIP</button>
+                <button id="pack-pick-dir" class="pack-mini" type="button">CHOOSE FOLDER</button>
+              </div>
+            </div>
+            <input id="pack-file-input" type="file" accept=".zip,application/zip" multiple hidden>
+            <input id="pack-dir-input" type="file" webkitdirectory hidden>
+            <p id="pack-status" class="fine-print"></p>
+            <ul id="pack-list" class="pack-list"></ul>
+            <p class="fine-print">MC-Web stores the packs in this browser. Enable them from Minecraft's Resource Packs screen after you start the game.</p>
+          </div>
+        </div>
+        <details id="runtime-diagnostics" class="runtime-diagnostics">
+          <summary>BOOT DIAGNOSTICS</summary>
+          <p id="runtime-diagnostics-summary" class="fine-print">No persisted boot phases yet.</p>
+          <ol id="runtime-diagnostics-log" aria-live="polite"></ol>
+          <button id="clear-runtime-diagnostics" class="pixel-button" type="button">CLEAR BOOT DIAGNOSTICS</button>
+        </details>
+      </section>
+
+      <p class="local-disclaimer">NOT AN OFFICIAL MINECRAFT PRODUCT OR SERVICE. NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR MICROSOFT.</p>
+      <div class="local-note" aria-label="MC-Web links">
+        <span>Official deployment: <a href="https://minecraft.wasm.click/">https://minecraft.wasm&#46;click</a></span>
+        <span>GitHub: <a href="https://github.com/vano04/mcweb">https://github.com/vano04/mcweb</a></span>
+      </div>
+    </div>
+  </main>
+  <script src="/dev/stream-compat.js"></script>
+  <script src="/dev/local-persistence.js"></script>
+  <script src="/dev/microsoft-auth.js"></script>
+  <script src="/dev/dev.js"></script>
+  <script src="/dev/runtime-bootstrap.js"></script>
+</body>
+</html>
